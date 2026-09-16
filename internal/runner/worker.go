@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/mutator"
 	"github.com/szhekpisov/gomutants/internal/patch"
+	"github.com/szhekpisov/gomutants/internal/schemata"
 )
 
 // maxSubprocRSSBytes caps per-mutant subprocess group memory. A mutation that
@@ -415,6 +417,23 @@ type Worker struct {
 	// CLI boundary and cannot reach here. Set by the pool after
 	// construction, mirroring tags.
 	testFlags []string
+
+	// schemata, when non-nil, holds the mutants compiled into prebuilt test
+	// binaries. Those run straight from the binary with the mutant selected
+	// by environment variable, skipping the per-mutant compile and link.
+	// Mutants the plan declined take the overlay path below unchanged. Set
+	// by the pool after construction, mirroring tags.
+	schemata *schemata.Plan
+}
+
+// invocation is one command that decides a mutant's fate: either a
+// `go test` run against a per-mutant overlay, or a prebuilt schema test
+// binary with the mutant selected through the environment.
+type invocation struct {
+	path string // Executable; "go" on the overlay path.
+	args []string
+	dir  string   // Working directory.
+	env  []string // Extra environment entries, appended last.
 }
 
 // NewWorker creates a worker with stable temp file paths.
@@ -441,9 +460,29 @@ func NewWorker(id int, tmpDir string, policy TimeoutPolicy, sourceCache map[stri
 	}, nil
 }
 
-// Test applies a mutation and runs go test, returning the updated mutant.
+// Test applies a mutation and runs the tests, returning the updated mutant.
+//
+// A mutant the schemata plan compiled into a prebuilt test binary skips the
+// staging below entirely: the mutation is already in the binary, inert until
+// its id is named in the environment. Everything else — routing, the
+// per-mutant deadline, the RSS watchdog, classification — is shared, so the
+// two paths cannot disagree about a verdict.
 func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	start := time.Now()
+
+	if w.schemata.Schematized(m.ID) {
+		// Computed once and threaded into both the invocations' own
+		// -test.timeout and the context deadline, for the same reason the
+		// overlay path below does it: two calls could not desync today, but
+		// nothing would catch it if they ever did.
+		timeout := w.computeTimeout(m)
+		if invs, ok := w.schemaInvocations(ctx, m, timeout); ok {
+			return w.runInvocations(ctx, m, invs, timeout, start)
+		}
+		// The binary could not be built (a covering package with no tests,
+		// a compile that only fails when linked). Fall through: the overlay
+		// path still produces an honest verdict.
+	}
 
 	// 1. Get original source.
 	original, ok := w.sourceCache[m.File]
@@ -486,8 +525,6 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	// sizes it from the sum of all covering tests' durations (across
 	// packages), so the whole cross-package run is bounded as one unit.
 	timeout := w.computeTimeout(m)
-	testCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
 
 	// 6. Run each covering package's invocation in turn, short-circuiting on
 	// the first non-Lived outcome (a kill, timeout, or compile failure). A
@@ -495,8 +532,17 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	// cmd.Start failure surfaces as NotViable or InfraError from
 	// runMutantTest, which the non-Lived check below returns just like any
 	// other terminal outcome.
-	for _, args := range w.testInvocations(m, shortFlagFromEnv(), timeout) {
-		status := w.runMutantTest(testCtx, args)
+	return w.runInvocations(ctx, m, w.testInvocations(m, shortFlagFromEnv(), timeout), timeout, start)
+}
+
+// runInvocations executes a mutant's invocations under one shared deadline,
+// short-circuiting on the first non-Lived outcome.
+func (w *Worker) runInvocations(ctx context.Context, m mutator.Mutant, invs []invocation, timeout time.Duration, start time.Time) mutator.Mutant {
+	testCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	for _, inv := range invs {
+		status := w.runMutantTest(testCtx, inv)
 		// Parent-context cancel (Ctrl-C, upstream deadline) propagates via
 		// exec.CommandContext as a non-nil cmd.Wait error that is neither
 		// memKilled nor the test's own timeout, which classifyTestOutcome
@@ -527,8 +573,8 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 //
 // Extracted from Worker.Test so the integration path can drive it once per
 // covering package while sharing a single per-mutant deadline.
-func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.MutantStatus {
-	cmd, stdout, stderr := w.makeTestCmd(testCtx, args)
+func (w *Worker) runMutantTest(testCtx context.Context, inv invocation) mutator.MutantStatus {
+	cmd, stdout, stderr := w.makeCmd(testCtx, inv)
 
 	if err := startCommandFunc(cmd); err != nil {
 		status := setupErrorStatus(err)
@@ -592,22 +638,30 @@ func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.M
 // buffers) can be asserted on directly. Without extraction the cmd is
 // local to Test and the SysProcAttr / Env mutations are invisible to tests.
 func (w *Worker) makeTestCmd(ctx context.Context, args []string) (*exec.Cmd, *cappedBuffer, *cappedBuffer) {
-	cmd := execCommandContext(ctx, "go", args...)
-	cmd.Dir = w.projectDir
+	return w.makeCmd(ctx, invocation{path: "go", args: args, dir: w.projectDir})
+}
+
+// makeCmd is makeTestCmd generalized over the executable, so a prebuilt
+// schema test binary gets the same process-group, GOMAXPROCS and
+// output-capping treatment as `go test`.
+func (w *Worker) makeCmd(ctx context.Context, inv invocation) (*exec.Cmd, *cappedBuffer, *cappedBuffer) {
+	cmd := execCommandContext(ctx, inv.path, inv.args...)
+	cmd.Dir = inv.dir
 	// Put go test + its compiler + test-binary descendants in their own
 	// process group so we can kill the whole tree if RSS runs away.
 	// applyProcessGroup is platform-specific (Setpgid on Unix,
 	// CREATE_NEW_PROCESS_GROUP on Windows).
 	applyProcessGroup(cmd)
-	if w.childGOMAXPROCS > 0 {
+	if w.childGOMAXPROCS > 0 || len(inv.env) > 0 {
 		// exec auto-sets PWD=cmd.Dir only when cmd.Env is nil (see Go's
 		// exec.go ~L1220). When we set Env explicitly the child inherits the
 		// parent's stale PWD, which breaks module-relative paths. Mirror the
 		// auto-PWD behavior plus our GOMAXPROCS cap.
-		cmd.Env = append(os.Environ(),
-			"PWD="+cmd.Dir,
-			fmt.Sprintf("GOMAXPROCS=%d", w.childGOMAXPROCS),
-		)
+		cmd.Env = append(os.Environ(), "PWD="+cmd.Dir)
+		if w.childGOMAXPROCS > 0 {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("GOMAXPROCS=%d", w.childGOMAXPROCS))
+		}
+		cmd.Env = append(cmd.Env, inv.env...)
 	}
 	stdout := &cappedBuffer{}
 	stderr := &cappedBuffer{}
@@ -689,7 +743,7 @@ func (w *Worker) buildTestArgs(m mutator.Mutant, short bool, timeout time.Durati
 // same-named tests and run every package even after one already killed the
 // mutant. The mutant's own package is ordered first so the cheapest, most
 // likely killer runs before any cross-package suite.
-func (w *Worker) testInvocations(m mutator.Mutant, short bool, timeout time.Duration) [][]string {
+func (w *Worker) testInvocations(m mutator.Mutant, short bool, timeout time.Duration) []invocation {
 	groups := map[string][]string{}
 	if w.testMap != nil {
 		for _, ref := range w.testMap.TestRefsFor(m.CoverageFile, m.Line) {
@@ -701,20 +755,25 @@ func (w *Worker) testInvocations(m mutator.Mutant, short bool, timeout time.Dura
 	// only covering package is the mutant's own, the general loop below
 	// produces the same single invocation, so no special-case is needed.)
 	if len(groups) == 0 {
-		return [][]string{w.buildTestArgs(m, short, timeout)}
+		return []invocation{w.goInvocation(w.buildTestArgs(m, short, timeout))}
 	}
 
 	base := w.baseTestArgs(short, timeout)
-	invs := make([][]string, 0, len(groups))
+	invs := make([]invocation, 0, len(groups))
 	for _, pkg := range orderRoutePackages(groups, m.Pkg) {
 		args := append(slices.Clone(base),
 			fmt.Sprintf("-run=%s", coverage.RunPattern(groups[pkg])), pkg)
 		// User flags trail the package here for the same reason as in
 		// buildTestArgs.
 		args = append(args, w.testFlags...)
-		invs = append(invs, args)
+		invs = append(invs, w.goInvocation(args))
 	}
 	return invs
+}
+
+// goInvocation wraps `go test` arguments as an invocation.
+func (w *Worker) goInvocation(args []string) invocation {
+	return invocation{path: "go", args: args, dir: w.projectDir}
 }
 
 // orderRoutePackages returns the covering packages with the mutant's own
@@ -786,4 +845,67 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled
+}
+
+// schemaInvocations builds the commands for a mutant that lives in a
+// prebuilt test binary. Routing is identical to the overlay path — one
+// invocation per covering package, the mutant's own package first — but
+// each one execs the package's schema binary directly instead of `go test`,
+// with the mutant selected through GOMUTANTS_ACTIVE.
+//
+// It reports false when any needed binary is missing, so the caller can
+// fall back rather than lose a verdict.
+func (w *Worker) schemaInvocations(ctx context.Context, m mutator.Mutant, timeout time.Duration) ([]invocation, bool) {
+	groups := map[string][]string{}
+	if w.testMap != nil {
+		for _, ref := range w.testMap.TestRefsFor(m.CoverageFile, m.Line) {
+			groups[ref.Pkg] = append(groups[ref.Pkg], ref.Name)
+		}
+	}
+	pkgs := orderRoutePackages(groups, m.Pkg)
+	if len(groups) == 0 {
+		// No routing information: run the whole of the mutant's own package.
+		pkgs = []string{m.Pkg}
+	}
+
+	invs := make([]invocation, 0, len(pkgs))
+	for _, pkg := range pkgs {
+		bin, dir, err := w.schemata.Binary(ctx, pkg)
+		if err != nil {
+			return nil, false
+		}
+		invs = append(invs, invocation{
+			path: bin,
+			args: schemaTestArgs(groups[pkg], shortFlagFromEnv(), timeout, w.testCPU),
+			dir:  dir,
+			env:  []string{schemata.ActiveEnv + "=" + strconv.Itoa(m.ID)},
+		})
+	}
+	return invs, true
+}
+
+// schemaTestArgs mirrors baseTestArgs for a prebuilt binary. The `go test`
+// spellings become the testing package's own `-test.` flags; the build-time
+// ones (-vet, -tags, -overlay) were already applied when the binary was
+// compiled.
+//
+// The user's --test-flags are deliberately absent: they are `go test`
+// arguments with no general translation to binary flags, which is why
+// schemata is switched off whenever they are set.
+func schemaTestArgs(tests []string, short bool, timeout time.Duration, testCPU int) []string {
+	args := []string{
+		"-test.count=1",
+		"-test.failfast",
+		fmt.Sprintf("-test.timeout=%s", timeout),
+	}
+	if pattern := coverage.RunPattern(tests); pattern != "" {
+		args = append(args, "-test.run="+pattern)
+	}
+	if testCPU > 0 {
+		args = append(args, fmt.Sprintf("-test.cpu=%d", testCPU))
+	}
+	if short {
+		args = append(args, "-test.short")
+	}
+	return args
 }

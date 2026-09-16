@@ -827,6 +827,35 @@ attributable delta is ~30–60 mutants — real but smaller than the raw
 cross-median number suggests. Cause not bisected. uuid, cobra, and
 model/labels don't show this shift.
 
+## Mutant schemata (`--schemata`)
+
+Measured on a **different host** from every other table on this page — Apple
+M4 (10 cores), macOS, go1.26.2 darwin/arm64, 8 workers, `--cache=off` — so
+these numbers are internally comparable but must not be read against the
+M1 Pro rows above.
+
+| Target | Mutants | Per-mutant builds | `--schemata` | Speedup | Schematized |
+|---|---:|---:|---:|---:|---:|
+| `./testdata/simple/` | 68 | 14.5 s | **1.7 s** | **8.5x** | 62 / 68 (91%) |
+| `./internal/report/` | 348 | 59.0 s | **8.7 s** | **6.8x** | 298 / 348 (86%) |
+
+Both runs produced byte-identical verdicts. For `internal/report` that is
+305 killed, 12 lived, 28 not viable, 3 timed out and 96.21% efficacy on both
+paths; `TestSchemataVerdictParity` asserts the same property mutant by
+mutant on the bundled fixtures, which is stronger than comparing the
+summary counts.
+
+The speedup is the per-mutant compile and link disappearing. What is left
+per mutant is process start plus the routed tests, so the ratio grows with
+the number of mutants per package and shrinks as the tests themselves get
+slower — a package whose tests dominate its build has less to gain.
+
+The 10-15% of mutants that stay on the per-mutant path are the ones the
+rewriter declines (constant contexts, mutations that would orphan a
+declaration, guards that would leave a function without a terminating
+statement) plus the ones the schema build rejects. They cost exactly what
+they cost today.
+
 ## Caveats
 
 - **Gremlins v0.6.0 silently produces zero mutants on Go 1.26.x** (the
