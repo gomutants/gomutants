@@ -47,6 +47,23 @@ output: mutation-report.json
 # the CLI overrides. Requires a git repository.
 # changed-since: ""
 
+# Experimental. Compile each package once with every mutant present but
+# inert, guarded by a check on the GOMUTANTS_ACTIVE environment variable,
+# then run mutants against the prebuilt test binary instead of recompiling
+# and relinking for each one. On the bundled fixtures this is roughly a 7x
+# cold-run speedup.
+#
+# Mutants the rewriter cannot prove safe to schematize — constant contexts,
+# anything that would orphan a declaration, a recover() inside a condition —
+# keep the per-mutant path, so verdicts are identical either way. That is
+# also why this setting is deliberately not part of the cache identity:
+# verdicts recorded under one path replay correctly under the other.
+#
+# Ignored when test-flags is set (those are `go test` arguments with no
+# general translation to a test binary's own flags) or with --run-mutant-id
+# (one mutant costs one compile either way).
+# schemata: false
+
 # There is deliberately no run-mutant-id key: --run-mutant-id is a
 # CLI-only flag. Pinning one id in a committed config would make every
 # later run test a single mutant, with no CLI value that turns it back off.

@@ -35,7 +35,14 @@ func invocationsFor(t *testing.T, tm *coverage.TestMap, ownPkg string) [][]strin
 	t.Helper()
 	w := &Worker{testMap: tm}
 	m := mutator.Mutant{Pkg: ownPkg, CoverageFile: "f.go", Line: 1}
-	return w.testInvocations(m, false, time.Second)
+	// Routing is asserted over the argv; the executable and working
+	// directory are the same for every `go test` invocation.
+	invs := w.testInvocations(m, false, time.Second)
+	out := make([][]string, 0, len(invs))
+	for _, inv := range invs {
+		out = append(out, inv.args)
+	}
+	return out
 }
 
 // checkInvocation asserts that invocation i targets wantPkg and carries the

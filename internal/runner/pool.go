@@ -14,6 +14,7 @@ import (
 
 	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/szhekpisov/gomutants/internal/schemata"
 )
 
 // ResultCallback is called for each completed mutant.
@@ -28,6 +29,11 @@ type ExecOpts struct {
 	TestCPU   int
 	Tags      string
 	TestFlags []string
+
+	// Schemata, when non-nil, is the plan naming the mutants compiled into
+	// prebuilt test binaries. Nil means every mutant takes the per-mutant
+	// overlay path, which is the default.
+	Schemata *schemata.Plan
 }
 
 // Pool coordinates parallel mutation testing.
@@ -192,6 +198,7 @@ func (p *Pool) createWorkers() []*Worker {
 		w.testCPU = p.exec.TestCPU
 		w.tags = p.exec.Tags
 		w.testFlags = p.exec.TestFlags
+		w.schemata = p.exec.Schemata
 		workers = append(workers, w)
 	}
 	return workers

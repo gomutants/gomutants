@@ -103,6 +103,15 @@ type Config struct {
 	// target packages. Off by default; see main.go for the -coverpkg
 	// conflict guard.
 	Integration bool `yaml:"integration"`
+	// Schemata enables mutant schemata: every schematizable mutant of a
+	// package is compiled into one test binary, inert behind a guard, and
+	// selected at run time by environment variable. That removes the
+	// per-mutant compile and link, which dominates a cold run. Mutants the
+	// rewriter cannot prove safe fall back to the per-mutant overlay path,
+	// so verdicts are unchanged either way — which is also why this is
+	// deliberately absent from the cache identity. Off by default while the
+	// feature is experimental.
+	Schemata bool `yaml:"schemata"`
 }
 
 // Default values for adaptive-timeout knobs. Exposed as package-level
@@ -370,6 +379,7 @@ type Flags struct {
 	Verbose            bool
 	Quiet              bool
 	Integration        bool
+	Schemata           bool
 	// ExcludeCallsDefaults is three-state (see the type), not a plain
 	// bool: unlike the toggles above, its default is on, so "not provided"
 	// has to stay distinguishable from an explicit =false.
@@ -462,6 +472,9 @@ func (c *Config) applyToggleFlags(f Flags) {
 	}
 	if f.Integration {
 		c.Integration = true
+	}
+	if f.Schemata {
+		c.Schemata = true
 	}
 	if f.DetectEquivalent.Set {
 		v := f.DetectEquivalent.Value

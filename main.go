@@ -28,6 +28,7 @@ import (
 	"github.com/szhekpisov/gomutants/internal/mutator"
 	"github.com/szhekpisov/gomutants/internal/report"
 	"github.com/szhekpisov/gomutants/internal/runner"
+	"github.com/szhekpisov/gomutants/internal/schemata"
 	"github.com/szhekpisov/gomutants/internal/tce"
 )
 
@@ -291,6 +292,7 @@ func run(ctx context.Context, args []string) error {
 		verbose           bool
 		quiet             bool
 		integration       bool
+		useSchemata       bool
 		showVersion       bool
 		listMutators      bool
 	)
@@ -384,6 +386,7 @@ func run(ctx context.Context, args []string) error {
 	fs.BoolVar(&verbose, "v", false, "verbose (shorthand)")
 	fs.BoolVar(&quiet, "quiet", false, "suppress header, phase lines, and per-mutant progress; only the final summary prints (warnings still go to stderr)")
 	fs.BoolVar(&quiet, "q", false, "quiet (shorthand)")
+	fs.BoolVar(&useSchemata, "schemata", false, "experimental: compile each package once with every mutant present but inert, then run mutants against the prebuilt test binary instead of recompiling per mutant. Mutants the rewriter cannot prove safe keep the per-mutant path, so verdicts are unchanged. Ignored with --test-flags or --run-mutant-id")
 	fs.BoolVar(&integration, "integration", false, "cross-package mode: route each mutant to covering tests in any package that imports it (widens coverage + the per-test build to the reverse-dependency closure). Manages -coverpkg itself; passing --coverpkg too is an error")
 	fs.BoolVar(&showVersion, "version", false, "print version and exit")
 	fs.BoolVar(&listMutators, "list-mutators", false, "print every mutator type with its description and example, then exit")
@@ -445,6 +448,7 @@ func run(ctx context.Context, args []string) error {
 		Verbose:            verbose,
 		Quiet:              quiet,
 		Integration:        integration,
+		Schemata:           useSchemata,
 
 		ExcludeCallsDefaults: excludeCallsDefaults,
 	})
@@ -873,6 +877,34 @@ func run(ctx context.Context, args []string) error {
 		}
 	}
 
+	// 7b. Build mutant schemata (opt-in). Compiles each package once with
+	// every schematizable mutant present but inert, so those mutants run
+	// against a prebuilt test binary instead of paying a recompile and
+	// relink each. It runs after the cache lookup so only mutants that will
+	// actually execute are schematized, and after routing so the plan knows
+	// which packages need binaries.
+	//
+	// Any failure here is non-fatal by design: the per-mutant overlay path
+	// is still correct, just slower, and a speed optimization must never
+	// cost a run.
+	var schemaPlan *schemata.Plan
+	if useSchemataFor(&cfg, pendingCount) {
+		term.Phase("Building mutant schemata...")
+		plan, err := schemata.Build(ctx, schemata.Options{
+			ProjectDir: projectDir,
+			TmpDir:     tmpDir,
+			Tags:       cfg.Tags,
+		}, fset, schemataPackages(pkgs, discovered), pendingMutants(mutants))
+		switch {
+		case err != nil:
+			term.PhaseDone("unavailable")
+			fmt.Fprintf(stderr, "warning: mutant schemata unavailable, falling back to per-mutant builds: %v\n", err)
+		default:
+			schemaPlan = plan
+			term.PhaseDone(fmt.Sprintf("%d of %d mutants share one build", plan.Count(), pendingCount))
+		}
+	}
+
 	// 8. Run mutation testing. pool.Run mutates the slice in place.
 	// TimeoutPolicy resolves per-mutant deadlines from the per-test
 	// durations recorded on the testMap, falling back to the global
@@ -922,7 +954,7 @@ func run(ctx context.Context, args []string) error {
 		lastCheckpoint = time.Now()
 	}
 
-	pool := runner.NewPool(cfg.Workers, runner.ExecOpts{TestCPU: cfg.TestCPU, Tags: cfg.Tags, TestFlags: cfg.TestFlagFields()}, policy, tmpDir, srcCache, projectDir, testMap)
+	pool := runner.NewPool(cfg.Workers, runner.ExecOpts{TestCPU: cfg.TestCPU, Tags: cfg.Tags, TestFlags: cfg.TestFlagFields(), Schemata: schemaPlan}, policy, tmpDir, srcCache, projectDir, testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
 	// interval into the run, not on the very first mutant.
 	lastCheckpoint = time.Now()
@@ -1368,4 +1400,51 @@ func readModuleName(dir string) (string, error) {
 		return "", fmt.Errorf("scanning go.mod: %w", err)
 	}
 	return "", fmt.Errorf("module name not found in go.mod")
+}
+
+// useSchemataFor reports whether this run can use mutant schemata.
+//
+// --test-flags stands it down because those are `go test` arguments with no
+// general translation to a prebuilt binary's own flags — the same reason
+// they already stand down adaptive timeouts. --run-mutant-id stands it down
+// because one mutant costs one compile either way, and the schema build is
+// the larger of the two.
+func useSchemataFor(cfg *config.Config, pending int) bool {
+	return cfg.Schemata && pending > 0 && cfg.TestFlags == "" && cfg.RunMutantID == ""
+}
+
+// pendingMutants returns the mutants that will actually execute — cache
+// hits and every pre-execution verdict are already terminal, and
+// schematizing them would build for nothing.
+func pendingMutants(mutants []mutator.Mutant) []mutator.Mutant {
+	out := make([]mutator.Mutant, 0, len(mutants))
+	for _, m := range mutants {
+		if m.Status == mutator.StatusPending {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// schemataPackages adapts the resolved packages and the discovery parse
+// cache into the shape the schemata builder takes, so it re-reads and
+// re-parses nothing.
+func schemataPackages(pkgs []discover.Package, discovered *discover.Result) []schemata.Package {
+	out := make([]schemata.Package, 0, len(pkgs))
+	for _, p := range pkgs {
+		files := make([]schemata.SourceFile, 0, len(p.GoFiles))
+		for _, base := range p.GoFiles {
+			abs := filepath.Join(p.Dir, base)
+			parsed := discovered.Files[abs]
+			if parsed == nil {
+				continue // Unparseable, and already reported at discovery.
+			}
+			files = append(files, schemata.SourceFile{Path: abs, Src: parsed.Src, AST: parsed.File})
+		}
+		if len(files) == 0 {
+			continue
+		}
+		out = append(out, schemata.Package{ImportPath: p.ImportPath, Dir: p.Dir, Files: files})
+	}
+	return out
 }

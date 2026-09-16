@@ -717,7 +717,7 @@ func TestWorkerTestStartFailureClassifiesInfrastructureErrors(t *testing.T) {
 
 			var got mutator.MutantStatus
 			captured := captureStderr(t, func() {
-				got = w.runMutantTest(context.Background(), nil)
+				got = w.runMutantTest(context.Background(), invocation{path: "go"})
 			})
 			if got != mutator.StatusInfraError {
 				t.Errorf("Status=%v, want InfraError", got)
@@ -1044,8 +1044,8 @@ func TestTestInvocationsTestFlags(t *testing.T) {
 	if len(invs) != 1 {
 		t.Fatalf("want 1 invocation with no testMap, got %d: %v", len(invs), invs)
 	}
-	if !containsStr(invs[0], "-short") {
-		t.Errorf("invocation %v missing forwarded -short", invs[0])
+	if !containsStr(invs[0].args, "-short") {
+		t.Errorf("invocation %v missing forwarded -short", invs[0].args)
 	}
 }
 
@@ -1075,7 +1075,8 @@ func TestTestInvocationsTestFlagsTrailPackage(t *testing.T) {
 	// the user flag's position — a regression that moved the flags would
 	// otherwise be checked against whatever element happened to precede them.
 	wantPkgs := []string{"mymod", "mymod/other"}
-	for i, args := range invs {
+	for i, inv := range invs {
+		args := inv.args
 		if args[len(args)-1] != "-custom.iterations=5" {
 			t.Errorf("user flag must trail, got last arg %q in %v", args[len(args)-1], args)
 		}
