@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -101,6 +102,15 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, cov
 	}
 
 	pkgBins := buildPkgBins(ctx, projectDir, tmpDir, coverPkg, tags, resolvedPkgs)
+
+	// Tests were listed but none can run against a compiled binary: the
+	// map would come back empty and per-test routing would switch off
+	// without a word. Surface it as an error so the caller warns and
+	// falls back explicitly (a nil map routes exactly like an empty one).
+	if len(tests) > 0 && !anyTestHasBin(tests, pkgBins) {
+		return nil, fmt.Errorf("no compiled test binary matches the packages of the %d listed tests (%s); per-test routing disabled",
+			len(tests), strings.Join(listedPkgs(tests), ", "))
+	}
 
 	// 3. Run tests in parallel using compiled binaries.
 	work := make(chan testEntry, len(tests))
@@ -242,6 +252,33 @@ func buildPkgBins(ctx context.Context, projectDir, tmpDir, coverPkg, tags string
 		pkgBins[pkg.importPath] = cp
 	}
 	return pkgBins
+}
+
+// anyTestHasBin reports whether at least one listed test belongs to a
+// package with a compiled test binary — i.e. whether processWork will run
+// anything at all.
+func anyTestHasBin(tests []testEntry, pkgBins map[string]*compiledPkg) bool {
+	for _, t := range tests {
+		if pkgBins[t.pkg] != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// listedPkgs returns the distinct packages of the listed tests, sorted, for
+// the no-binary diagnostic.
+func listedPkgs(tests []testEntry) []string {
+	seen := make(map[string]bool)
+	var pkgs []string
+	for _, t := range tests {
+		if !seen[t.pkg] {
+			seen[t.pkg] = true
+			pkgs = append(pkgs, t.pkg)
+		}
+	}
+	sort.Strings(pkgs)
+	return pkgs
 }
 
 // compileTestBinary compiles `pkg`'s test binary into tmpDir and returns
@@ -475,8 +512,13 @@ type testEntry struct {
 	pkg  string
 }
 
+// listTests enumerates the test functions of each package pattern, keyed by
+// the import path go test reports for them. Overlapping patterns (./... and
+// ./pkg) resolve to the same (pkg, name) pairs; each is kept once so the
+// coverage phase neither runs a test twice nor double-counts its duration.
 func listTests(ctx context.Context, projectDir string, packages []string, tags string) ([]testEntry, error) {
 	var allTests []testEntry
+	seen := make(map[testEntry]bool)
 
 	for _, pkg := range packages {
 		args := []string{"test", "-list", "."}
@@ -495,27 +537,61 @@ func listTests(ctx context.Context, projectDir string, packages []string, tags s
 			return nil, fmt.Errorf("go test -list for %s: %w\n%s", pkg, err, stderr.String())
 		}
 
-		allTests = append(allTests, parseListTestsOutput(&stdout, pkg)...)
+		for _, te := range parseListTestsOutput(&stdout) {
+			if !seen[te] {
+				seen[te] = true
+				allTests = append(allTests, te)
+			}
+		}
 	}
 
 	return allTests, nil
 }
 
-// parseListTestsOutput parses the stdout of `go test -list .`. Each non-empty,
-// non-"ok"-prefixed line is one test name. Extracted so the line-filter can
-// be exercised directly from a string reader — driving it through listTests
-// would require a real `go test` invocation.
-func parseListTestsOutput(r io.Reader, pkg string) []testEntry {
+// parseListTestsOutput parses the stdout of `go test -list .`. go test prints
+// each package's test names followed by a summary line
+// "ok  \t<importpath>\t<elapsed>", so names are buffered and attributed to
+// the import path of the next summary line. They must not be attributed to
+// the pattern passed on the command line: for ./... or ./pkg that never
+// matches the import-path keys buildPkgBins uses, and every test would be
+// skipped (#105). "?" lines (packages without test files) and tab-less
+// "ok"-prefixed output from a package's init are skipped; names with no
+// summary line after them are dropped, as no binary could run them.
+//
+// Extracted so the line-filter can be exercised directly from a string
+// reader — driving it through listTests would require a real `go test`
+// invocation.
+func parseListTestsOutput(r io.Reader) []testEntry {
 	var tests []testEntry
+	var pending []string
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "ok") {
-			continue
+		pkg, isSummary := listSummaryPkg(line)
+		switch {
+		case isSummary:
+			for _, name := range pending {
+				tests = append(tests, testEntry{name: name, pkg: pkg})
+			}
+			pending = pending[:0]
+		case line == "" || strings.HasPrefix(line, "ok") || strings.HasPrefix(line, "?"):
+			// Blank, init noise, or a package without test files.
+		default:
+			pending = append(pending, line)
 		}
-		tests = append(tests, testEntry{name: line, pkg: pkg})
 	}
 	return tests
+}
+
+// listSummaryPkg returns the import path from a go test summary line
+// ("ok  \t<importpath>\t<elapsed>"). The tab separators are what tell a
+// summary apart from a package's own stdout that merely starts with "ok".
+func listSummaryPkg(line string) (string, bool) {
+	fields := strings.Split(line, "\t")
+	if len(fields) < 2 || strings.TrimSpace(fields[0]) != "ok" {
+		return "", false
+	}
+	return fields[1], true
 }
 
 type resolvedPkg struct {

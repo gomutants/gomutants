@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -299,6 +300,82 @@ func TestListTests(t *testing.T) {
 	}
 }
 
+// TestBuildTestMapWithPackagePatterns is the #105 regression gate: per-test
+// routing must work for package patterns, not only import paths. Before the
+// fix, tests listed via `./...` or `.` were tagged with the pattern, never
+// matched the import-path-keyed binaries, and the map came back empty.
+func TestBuildTestMapWithPackagePatterns(t *testing.T) {
+	for _, pattern := range []string{"./...", ".", "testmod"} {
+		t.Run(pattern, func(t *testing.T) {
+			dir := setupTestProject(t)
+			var (
+				tm  *TestMap
+				err error
+			)
+			runWithDeadline(t, 30*time.Second, func() {
+				tm, err = BuildTestMap(context.Background(), dir, []string{pattern}, "", "", t.TempDir(), 2)
+			})
+			if err != nil {
+				t.Fatalf("BuildTestMap(%q): %v", pattern, err)
+			}
+			if tests := tm.TestsFor("testmod/add.go", 4); len(tests) == 0 {
+				t.Errorf("BuildTestMap(%q): no tests mapped to add.go:4 — per-test routing is off for this pattern", pattern)
+			}
+		})
+	}
+}
+
+// writeTwoPkgModule writes module "twopkg" with packages twopkg/a and
+// twopkg/sub, both declaring a test named TestShared plus one of their own.
+func writeTwoPkgModule(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	files := map[string]string{
+		"go.mod":          "module twopkg\n\ngo 1.26\n",
+		"a/a.go":          "package a\n\nfunc A() int { return 1 }\n",
+		"a/a_test.go":     "package a\n\nimport \"testing\"\n\nfunc TestShared(t *testing.T) {}\n\nfunc TestOnlyA(t *testing.T) {}\n",
+		"sub/sub.go":      "package sub\n\nfunc S() int { return 2 }\n",
+		"sub/sub_test.go": "package sub\n\nimport \"testing\"\n\nfunc TestShared(t *testing.T) {}\n\nfunc TestOnlySub(t *testing.T) {}\n",
+	}
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return dir
+}
+
+// TestListTestsAttributesPatternToImportPath drives listTests through a real
+// multi-package `go test -list` and checks every test carries its own
+// package's import path — the same-named TestShared once per package —
+// and that overlapping patterns don't list a test twice. The overlap case
+// kills STATEMENT_REMOVE on `seen[te] = true`.
+func TestListTestsAttributesPatternToImportPath(t *testing.T) {
+	dir := writeTwoPkgModule(t)
+	want := []testEntry{
+		{name: "TestOnlyA", pkg: "twopkg/a"},
+		{name: "TestOnlySub", pkg: "twopkg/sub"},
+		{name: "TestShared", pkg: "twopkg/a"},
+		{name: "TestShared", pkg: "twopkg/sub"},
+	}
+	for _, patterns := range [][]string{{"./..."}, {"./...", "./sub"}} {
+		got, err := listTests(context.Background(), dir, patterns, "")
+		if err != nil {
+			t.Fatalf("listTests(%v): %v", patterns, err)
+		}
+		slices.SortFunc(got, func(x, y testEntry) int {
+			return strings.Compare(x.name+"\x00"+x.pkg, y.name+"\x00"+y.pkg)
+		})
+		if !slices.Equal(got, want) {
+			t.Errorf("listTests(%v) =\n  %+v\nwant\n  %+v", patterns, got, want)
+		}
+	}
+}
+
 func TestListTestsFailure(t *testing.T) {
 	_, err := listTests(context.Background(), t.TempDir(), []string{"nonexistent/pkg"}, "")
 	if err == nil {
@@ -492,15 +569,15 @@ func TestBuildTestMapCompileFailure(t *testing.T) {
 	}
 	defer func() { resolvePackagesFunc = origResolve }()
 
-	// listTests will return tests but the package binary won't compile.
+	// listTests will return tests but the package binary won't compile, so
+	// nothing can be mapped — that must surface as an error the caller
+	// warns on, not an empty map that silently disables per-test routing.
 	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1)
-	if err != nil {
-		t.Fatalf("BuildTestMap should not error: %v", err)
+	if err == nil {
+		t.Fatal("BuildTestMap should error when no listed test has a compiled binary")
 	}
-	// Map should be empty since no binaries were compiled.
-	tests := tm.TestsFor("testmod/add.go", 4)
-	if len(tests) != 0 {
-		t.Errorf("expected no tests mapped, got %d", len(tests))
+	if tm != nil {
+		t.Errorf("expected nil map alongside the error, got %+v", tm)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -769,13 +770,115 @@ func TestBuildTestMapContinuesPastFailedCompile(t *testing.T) {
 	}
 }
 
+// stubBuildTestMapDeps swaps BuildTestMap's go-tool seams for stubs: every
+// resolved package compiles, listTests returns `tests`, and each compiled
+// test run bumps the returned counter. Restored on cleanup.
+func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPkg) *int32 {
+	t.Helper()
+	origCompile := compileTestBinaryFunc
+	origResolve := resolvePackagesFunc
+	origList := listTestsFunc
+	origRun := runCompiledTestFunc
+	t.Cleanup(func() {
+		compileTestBinaryFunc = origCompile
+		resolvePackagesFunc = origResolve
+		listTestsFunc = origList
+		runCompiledTestFunc = origRun
+	})
+
+	resolvePackagesFunc = func(_ context.Context, _ string, _ []string, _ string) ([]resolvedPkg, error) {
+		return resolved, nil
+	}
+	listTestsFunc = func(_ context.Context, _ string, _ []string, _ string) ([]testEntry, error) {
+		return tests, nil
+	}
+	compileTestBinaryFunc = func(_ context.Context, _, _, _ string, _ string, pkg resolvedPkg) (*compiledPkg, error) {
+		return &compiledPkg{binPath: "x", importPath: pkg.importPath, dir: pkg.dir}, nil
+	}
+	var ran int32
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string) ([]Block, time.Duration) {
+		atomic.AddInt32(&ran, 1)
+		return nil, time.Millisecond
+	}
+	return &ran
+}
+
+// TestBuildTestMapErrorsWhenNoListedTestHasBin pins the #105 diagnostic:
+// tests listed under a package no compiled binary is keyed by (the pattern
+// `./...` vs the import path) must surface as an error naming that package,
+// not as a silently empty map. Kills BRANCH_IF / CONDITIONALS_NEGATION on
+// the guard and STATEMENT_REMOVE on its return; the run counter kills a
+// guard moved after the worker pool. A single listed test kills
+// INTEGER_INCREMENT on `len(tests) > 0` (→ `> 1`).
+func TestBuildTestMapErrorsWhenNoListedTestHasBin(t *testing.T) {
+	ran := stubBuildTestMapDeps(t,
+		[]testEntry{{name: "TestA", pkg: "./..."}},
+		[]resolvedPkg{{importPath: "example.com/x", dir: t.TempDir()}})
+
+	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, "", "", t.TempDir(), 1)
+	if err == nil {
+		t.Fatal("BuildTestMap returned nil error with no listed test matching a compiled binary — per-test routing would switch off silently")
+	}
+	if tm != nil {
+		t.Errorf("BuildTestMap returned a non-nil map alongside the error: %+v", tm)
+	}
+	if !strings.Contains(err.Error(), "./...") || !strings.Contains(err.Error(), "1 listed tests") {
+		t.Errorf("error %q should name the unmatched package and the listed-test count", err)
+	}
+	if got := atomic.LoadInt32(ran); got != 0 {
+		t.Errorf("runCompiledTestFunc called %d times, want 0 — nothing can be mapped, so no test should run", got)
+	}
+}
+
+// TestBuildTestMapNoListedTestsIsNotAnError kills EXPRESSION_REMOVE on the
+// `len(tests) > 0` operand of the no-binary guard: a module without tests
+// lists nothing, and that must stay a successful (empty) build.
+func TestBuildTestMapNoListedTestsIsNotAnError(t *testing.T) {
+	stubBuildTestMapDeps(t, nil, []resolvedPkg{{importPath: "example.com/x", dir: t.TempDir()}})
+
+	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, "", "", t.TempDir(), 1)
+	if err != nil {
+		t.Fatalf("BuildTestMap with no listed tests: %v", err)
+	}
+	if tm == nil {
+		t.Fatal("BuildTestMap returned a nil map with no listed tests")
+	}
+}
+
+// TestBuildTestMapAnyMatchingBinIsEnough kills INVERT_LOOP_CTRL and
+// return-value mutations in anyTestHasBin: one unmatched test listed ahead
+// of a matched one must not trip the guard, and the matched test runs.
+func TestBuildTestMapAnyMatchingBinIsEnough(t *testing.T) {
+	ran := stubBuildTestMapDeps(t,
+		[]testEntry{{name: "TestStray", pkg: "example.com/gone"}, {name: "TestA", pkg: "example.com/x"}},
+		[]resolvedPkg{{importPath: "example.com/x", dir: t.TempDir()}})
+
+	if _, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, "", "", t.TempDir(), 1); err != nil {
+		t.Fatalf("BuildTestMap: %v — one test with a binary must keep per-test routing on", err)
+	}
+	if got := atomic.LoadInt32(ran); got != 1 {
+		t.Errorf("runCompiledTestFunc called %d times, want 1 (TestA only)", got)
+	}
+}
+
+// TestListedPkgsDistinctSorted pins the diagnostic's package list: each
+// package once, sorted, so the message is stable across runs.
+func TestListedPkgsDistinctSorted(t *testing.T) {
+	got := listedPkgs([]testEntry{
+		{name: "T1", pkg: "b"}, {name: "T2", pkg: "a"}, {name: "T3", pkg: "b"},
+	})
+	if strings.Join(got, ",") != "a,b" {
+		t.Errorf("listedPkgs = %v, want [a b]", got)
+	}
+}
+
 // TestParseListTestsOutputContinuesPastOk kills INVERT_LOOP_CTRL on the
 // `continue` for ok-prefixed/empty lines (testmap.go:253). Mutated to
 // `break`, an "ok" status line in the middle of `go test -list` output
 // would terminate the scan and drop later test names.
 func TestParseListTestsOutputContinuesPastOk(t *testing.T) {
-	in := strings.NewReader("TestA\nok  \tpkg\t0.001s\nTestB\n")
-	got := parseListTestsOutput(in, "pkg")
+	in := strings.NewReader("TestA\nok  \tpkg\t0.001s\nTestB\nok  \tpkg2\t0.001s\n")
+	got := parseListTestsOutput(in)
 	if len(got) != 2 || got[0].name != "TestA" || got[1].name != "TestB" {
 		t.Errorf("got %+v, want [TestA, TestB] — INVERT_LOOP_CTRL on the ok-line `continue` turns later test discovery into break", got)
 	}
@@ -785,14 +888,115 @@ func TestParseListTestsOutputContinuesPastOk(t *testing.T) {
 // `line == ""` operand of the skip guard. With it replaced by `false`,
 // empty lines are no longer skipped and surface as testEntry{Name: ""}.
 func TestParseListTestsOutputSkipsEmptyLine(t *testing.T) {
-	in := strings.NewReader("TestA\n\nTestB\n")
-	got := parseListTestsOutput(in, "pkg")
+	in := strings.NewReader("TestA\n\nTestB\nok  \tpkg\t0.001s\n")
+	got := parseListTestsOutput(in)
 	if len(got) != 2 {
 		t.Fatalf("got %d entries, want 2 (empty line skipped): %+v", len(got), got)
 	}
 	for _, e := range got {
 		if e.name == "" {
 			t.Errorf("empty test name leaked through — EXPRESSION_REMOVE replaces `line == \"\"` with false, which lets blank lines fall through")
+		}
+	}
+}
+
+// listOutputMultiPkg is verbatim `go test -list . ./...` output from a probe
+// module: a package with tests (a), a second one (b), one whose test file
+// declares no tests (emptytests), one whose init prints an "ok"-prefixed
+// line (noisy), and one without test files (notests).
+const listOutputMultiPkg = "TestA1\n" +
+	"TestA2\n" +
+	"ok  \texample.com/edge/a\t0.272s\n" +
+	"TestB\n" +
+	"ok  \texample.com/edge/b\t0.271s\n" +
+	"ok  \texample.com/edge/emptytests\t0.273s\n" +
+	"ok hello from init\n" +
+	"TestNoisy\n" +
+	"ok  \texample.com/edge/noisy\t0.273s\n" +
+	"?   \texample.com/edge/notests\t[no test files]\n"
+
+// TestParseListTestsOutputAttributesByImportPath is the #105 parser gate:
+// every name is attributed to the import path on the summary line that
+// follows its block, never to a pattern. Kills BRANCH_IF / CONDITIONALS_
+// NEGATION on the summary case (names unattributed or attributed per line)
+// and STATEMENT_REMOVE on `pending = pending[:0]` (a's names would leak
+// into b, emptytests and noisy).
+func TestParseListTestsOutputAttributesByImportPath(t *testing.T) {
+	got := parseListTestsOutput(strings.NewReader(listOutputMultiPkg))
+	want := []testEntry{
+		{name: "TestA1", pkg: "example.com/edge/a"},
+		{name: "TestA2", pkg: "example.com/edge/a"},
+		{name: "TestB", pkg: "example.com/edge/b"},
+		{name: "TestNoisy", pkg: "example.com/edge/noisy"},
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("parseListTestsOutput =\n  %+v\nwant\n  %+v", got, want)
+	}
+}
+
+// TestParseListTestsOutputSkipsNoTestFilesLine kills EXPRESSION_REMOVE on
+// the `"?"` prefix operand: a no-test-files line printed between two
+// blocks would otherwise be buffered and attributed to the next package as
+// a test name.
+func TestParseListTestsOutputSkipsNoTestFilesLine(t *testing.T) {
+	in := strings.NewReader("?   \texample.com/x/none\t[no test files]\n" +
+		"TestB\n" +
+		"ok  \texample.com/x/b\t0.01s\n")
+	got := parseListTestsOutput(in)
+	want := []testEntry{{name: "TestB", pkg: "example.com/x/b"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %+v, want %+v — the `?` line leaked into the next package", got, want)
+	}
+}
+
+// TestParseListTestsOutputSkipsTablessOkNoise kills EXPRESSION_REMOVE on
+// the `"ok"` prefix operand: an init-time "ok ..." line has no tabs, so it
+// is not a summary, and it must not be buffered as a test name either.
+func TestParseListTestsOutputSkipsTablessOkNoise(t *testing.T) {
+	in := strings.NewReader("ok hello from init\n" +
+		"TestNoisy\n" +
+		"ok  \texample.com/x/noisy\t0.01s\n")
+	got := parseListTestsOutput(in)
+	want := []testEntry{{name: "TestNoisy", pkg: "example.com/x/noisy"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+// TestParseListTestsOutputDropsUnterminatedNames pins that names with no
+// summary line after them are dropped: there is no import path to run them
+// under, and attributing them to anything else reintroduces #105.
+func TestParseListTestsOutputDropsUnterminatedNames(t *testing.T) {
+	in := strings.NewReader("TestA\nok  \texample.com/x/a\t0.01s\nTestOrphan\n")
+	got := parseListTestsOutput(in)
+	want := []testEntry{{name: "TestA", pkg: "example.com/x/a"}}
+	if !slices.Equal(got, want) {
+		t.Errorf("got %+v, want %+v", got, want)
+	}
+}
+
+// TestListSummaryPkg pins the summary-line recogniser. The bare "ok" case
+// kills EXPRESSION_REMOVE on the `len(fields) < 2` guard (fields[1] would
+// index out of range); the two-field case kills CONDITIONALS_BOUNDARY
+// (`< 2` → `<= 2`); the padded case kills removing the TrimSpace.
+func TestListSummaryPkg(t *testing.T) {
+	cases := []struct {
+		line    string
+		wantPkg string
+		wantOK  bool
+	}{
+		{"ok  \texample.com/a\t0.27s", "example.com/a", true},
+		{"ok\texample.com/a", "example.com/a", true},
+		{"ok", "", false},
+		{"ok hello from init", "", false},
+		{"?   \texample.com/n\t[no test files]", "", false},
+		{"FAIL\texample.com/f\t0.1s", "", false},
+		{"TestA", "", false},
+	}
+	for _, c := range cases {
+		pkg, ok := listSummaryPkg(c.line)
+		if pkg != c.wantPkg || ok != c.wantOK {
+			t.Errorf("listSummaryPkg(%q) = (%q, %v), want (%q, %v)", c.line, pkg, ok, c.wantPkg, c.wantOK)
 		}
 	}
 }
