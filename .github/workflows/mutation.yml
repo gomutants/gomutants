@@ -51,7 +51,7 @@ jobs:
       # intentionally don't pin.
       - name: Run mutation testing (PR, changed-since)
         if: github.event_name == 'pull_request'
-        uses: szhekpisov/gomutants@12850da8ef6d5c45a99c0a45bb2ff69fd08cdca5 # v0.6.0
+        uses: szhekpisov/gomutants@76c6e5989b7f5e252acc4641366a7091392a9733 # v0.6.1
         with:
           # No quotes around the ref: $ARGS in the action is unquoted so
           # it word-splits, and a literal `"` would land in the
@@ -63,7 +63,7 @@ jobs:
       # writes the dashboard report consumed by the upload step below.
       - name: Run mutation testing (full tree, post-merge)
         if: github.event_name == 'push'
-        uses: szhekpisov/gomutants@12850da8ef6d5c45a99c0a45bb2ff69fd08cdca5 # v0.6.0
+        uses: szhekpisov/gomutants@76c6e5989b7f5e252acc4641366a7091392a9733 # v0.6.1
         with:
           args: -workers=2 -verbose --stryker-output stryker-report.json ./internal/...
 
