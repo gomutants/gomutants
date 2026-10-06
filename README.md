@@ -1,7 +1,7 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/szhekpisov/gomutants/badge)](https://scorecard.dev/viewer/?uri=github.com/szhekpisov/gomutants)
 [![codecov](https://codecov.io/gh/szhekpisov/gomutants/graph/badge.svg?token=XNXMEJDGV2)](https://codecov.io/gh/szhekpisov/gomutants)
 [![Mutation testing badge](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fszhekpisov%2Fgomutants%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/szhekpisov/gomutants/main)
-[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=szhekpisov_gomutants&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=szhekpisov_gomutants)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=gomutants_gomutants&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=gomutants_gomutants)
 [![Security & Static Analysis](https://github.com/szhekpisov/gomutants/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/szhekpisov/gomutants/actions/workflows/security.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/szhekpisov/gomutants.svg)](https://pkg.go.dev/github.com/szhekpisov/gomutants)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
