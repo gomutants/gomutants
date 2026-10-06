@@ -221,7 +221,7 @@ var stderr io.Writer = os.Stderr
 
 // buildTestMapFunc is the per-test coverage map builder. Swappable so
 // tests can drive the warning/skip path without engineering a real
-// `go test -list` failure.
+// coverage-map failure.
 var buildTestMapFunc = coverage.BuildTestMap
 
 // runCoverageFunc / measureBaselineFunc / parseProfileFunc / preReadFilesFunc
@@ -795,7 +795,10 @@ func run(ctx context.Context, args []string) error {
 
 	// 7. Build per-test coverage map.
 	term.Phase("Building per-test coverage map...")
-	testMap, err := buildTestMapFunc(ctx, projectDir, coveragePatterns, coverPkgEff, cfg.Tags, tmpDir, cfg.Workers)
+	// testTimeout also bounds each test's solo coverage run: a test that
+	// can't finish in the suite's ceiling would time out every mutant it
+	// covers anyway, and a bare test binary has no timeout of its own.
+	testMap, err := buildTestMapFunc(ctx, projectDir, coveragePatterns, coverPkgEff, cfg.Tags, tmpDir, cfg.Workers, testTimeout)
 	if err != nil {
 		// Non-fatal: fall back to running all tests per mutant.
 		fmt.Fprintf(stderr, "warning: per-test coverage map failed: %v\n", err)

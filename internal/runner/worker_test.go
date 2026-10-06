@@ -1137,7 +1137,7 @@ func TestBuildTestArgsWithTestMap(t *testing.T) {
 	mustWrite("add.go", "package testmod\n\nfunc Add(a, b int) int { return a + b }\n")
 	mustWrite("add_test.go", "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal(\"wrong\") } }\n")
 
-	tm, err := coverage.BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1)
+	tm, err := coverage.BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1, 0)
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}

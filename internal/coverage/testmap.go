@@ -4,13 +4,12 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -85,31 +84,44 @@ type compiledPkg struct {
 	dir        string // Package directory (for running the binary).
 }
 
-// BuildTestMap enumerates tests in the given packages, compiles each package's
-// test binary once, then runs each test function against the compiled binary
-// with coverage. Uses parallel workers.
-func BuildTestMap(ctx context.Context, projectDir string, packages []string, coverPkg, tags string, tmpDir string, workers int) (*TestMap, error) {
-	// 1. Enumerate all test function names.
-	tests, err := listTestsFunc(ctx, projectDir, packages, tags)
-	if err != nil {
-		return nil, fmt.Errorf("listing tests: %w", err)
-	}
-
-	// 2. Resolve package patterns to individual packages and compile test binaries.
+// BuildTestMap compiles each package's test binary once, lists the tests
+// each binary contains, then runs every test function alone against its
+// binary with coverage. Uses parallel workers.
+//
+// testTimeout bounds every run of a compiled test binary (listing and each
+// per-test run); zero means no bound. A test that hangs when run alone
+// would otherwise block the coverage phase forever: unlike `go test`, a
+// bare test binary has no default timeout.
+func BuildTestMap(ctx context.Context, projectDir string, packages []string, coverPkg, tags string, tmpDir string, workers int, testTimeout time.Duration) (*TestMap, error) {
+	// 1. Resolve package patterns to individual packages and compile test binaries.
 	resolvedPkgs, err := resolvePackagesFunc(ctx, projectDir, packages, tags)
 	if err != nil {
 		return nil, fmt.Errorf("resolving packages: %w", err)
 	}
 
-	pkgBins := buildPkgBins(ctx, projectDir, tmpDir, coverPkg, tags, resolvedPkgs)
+	pkgBins, compileFailures := buildPkgBins(ctx, projectDir, tmpDir, coverPkg, tags, resolvedPkgs)
+	// A cancelled ctx fails every remaining compile; report the
+	// cancellation, not the compile failures it caused.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Every package with tests failed to compile: the map would come back
+	// empty and per-test routing would switch off without a word. Surface
+	// it so the caller warns and falls back explicitly (a nil map routes
+	// exactly like an empty one).
+	if len(pkgBins) == 0 && len(compileFailures) > 0 {
+		return nil, fmt.Errorf("no test binary compiled (%d packages failed); first failure: %w",
+			len(compileFailures), compileFailures[0])
+	}
 
-	// Tests were listed but none can run against a compiled binary: the
-	// map would come back empty and per-test routing would switch off
-	// without a word. Surface it as an error so the caller warns and
-	// falls back explicitly (a nil map routes exactly like an empty one).
-	if len(tests) > 0 && !anyTestHasBin(tests, pkgBins) {
-		return nil, fmt.Errorf("no compiled test binary matches the packages of the %d listed tests (%s); per-test routing disabled",
-			len(tests), strings.Join(listedPkgs(tests), ", "))
+	// 2. List each binary's tests. Keying them by the binary's import path
+	// means every listed test has a binary to run against by construction.
+	tests, err := listTestsFunc(ctx, pkgBins, testTimeout)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, fmt.Errorf("listing tests: %w", err)
 	}
 
 	// 3. Run tests in parallel using compiled binaries.
@@ -121,7 +133,7 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, cov
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			processWork(ctx, work, pkgBins, tmpDir, workerID, results)
+			processWork(ctx, work, pkgBins, tmpDir, workerID, testTimeout, results)
 		}(i)
 	}
 
@@ -160,10 +172,9 @@ func (tm *TestMap) ingestResult(tc testCoverage) {
 }
 
 // recordDuration stores a single (pkg, test) timing and updates the
-// rolling per-package sum. Extracted so a duplicate observation (same
-// test re-run because two packages list the same name into testEntry,
-// or future retry logic) accumulates rather than overwrites — matching
-// the per-package sum's pre-existing accumulation behavior.
+// rolling per-package sum. Extracted so a duplicate observation (e.g.
+// future retry logic re-running a test) accumulates rather than
+// overwrites — matching the per-package sum's accumulation behavior.
 func (tm *TestMap) recordDuration(pkg, name string, d time.Duration) {
 	if d <= 0 {
 		return
@@ -195,7 +206,7 @@ func (tm *TestMap) addBlocks(pkg, testName string, blocks []Block) {
 }
 
 // processWork processes test entries from the work channel.
-func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]*compiledPkg, tmpDir string, workerID int, results chan<- testCoverage) {
+func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]*compiledPkg, tmpDir string, workerID int, testTimeout time.Duration, results chan<- testCoverage) {
 	for test := range work {
 		if ctx.Err() != nil {
 			return
@@ -205,7 +216,7 @@ func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]
 			continue
 		}
 		profilePath := filepath.Join(tmpDir, fmt.Sprintf("testmap-%d.cov", workerID))
-		blocks, dur := runCompiledTestFunc(ctx, cp, test.name, profilePath)
+		blocks, dur := runCompiledTestFunc(ctx, cp, test.name, profilePath, testTimeout)
 		// Forward the timing even when the test produced no blocks: the
 		// mutant covering this test still executes it, so its duration
 		// matters for the per-mutant timeout. Without this, a fast unit
@@ -237,54 +248,36 @@ func feedWork(ctx context.Context, tests []testEntry, work chan<- testEntry) {
 }
 
 // buildPkgBins compiles each package's test binary and indexes the results
-// by import path. Compile failures (no tests, syntax errors) are skipped
-// silently — extracted from BuildTestMap so the skip behavior can be
+// by import path. Failures are non-fatal — the package is skipped and the
+// rest keep going — but every one other than a package without test files
+// is returned, so the caller can tell "nothing to test" from "nothing
+// compiled". Extracted from BuildTestMap so the skip behavior can be
 // tested without driving the whole pipeline.
-func buildPkgBins(ctx context.Context, projectDir, tmpDir, coverPkg, tags string, pkgs []resolvedPkg) map[string]*compiledPkg {
+func buildPkgBins(ctx context.Context, projectDir, tmpDir, coverPkg, tags string, pkgs []resolvedPkg) (map[string]*compiledPkg, []error) {
 	pkgBins := make(map[string]*compiledPkg)
+	var failures []error
 	for _, pkg := range pkgs {
 		cp, err := compileTestBinaryFunc(ctx, projectDir, tmpDir, coverPkg, tags, pkg)
 		if err != nil {
-			// Package may have no tests, fail to compile, or produce no
-			// binary; all are non-fatal — skip and keep going.
+			if !errors.Is(err, errNoTestBinary) {
+				failures = append(failures, err)
+			}
 			continue
 		}
 		pkgBins[pkg.importPath] = cp
 	}
-	return pkgBins
+	return pkgBins, failures
 }
 
-// anyTestHasBin reports whether at least one listed test belongs to a
-// package with a compiled test binary — i.e. whether processWork will run
-// anything at all.
-func anyTestHasBin(tests []testEntry, pkgBins map[string]*compiledPkg) bool {
-	for _, t := range tests {
-		if pkgBins[t.pkg] != nil {
-			return true
-		}
-	}
-	return false
-}
-
-// listedPkgs returns the distinct packages of the listed tests, sorted, for
-// the no-binary diagnostic.
-func listedPkgs(tests []testEntry) []string {
-	seen := make(map[string]bool)
-	var pkgs []string
-	for _, t := range tests {
-		if !seen[t.pkg] {
-			seen[t.pkg] = true
-			pkgs = append(pkgs, t.pkg)
-		}
-	}
-	sort.Strings(pkgs)
-	return pkgs
-}
+// errNoTestBinary marks a package `go test -c` built without error but
+// without writing a binary: it has no test files, so there is nothing to
+// map rather than something that failed.
+var errNoTestBinary = errors.New("no test files")
 
 // compileTestBinary compiles `pkg`'s test binary into tmpDir and returns
-// the compiledPkg metadata. Errors from `go test -c` and from a missing
-// output file (a package with no tests produces no binary) are folded
-// into the returned error so callers can `continue` on a single check.
+// the compiledPkg metadata. Errors from `go test -c` (with its stderr) and
+// from a missing output file (wrapping errNoTestBinary) are folded into
+// the returned error so callers can `continue` on a single check.
 func compileTestBinary(ctx context.Context, projectDir, tmpDir, coverPkg, tags string, pkg resolvedPkg) (*compiledPkg, error) {
 	binPath := filepath.Join(tmpDir, "testbin-"+sanitize(pkg.importPath)+".test")
 	args := []string{"test", "-c", "-o", binPath, "-cover"}
@@ -298,11 +291,13 @@ func compileTestBinary(ctx context.Context, projectDir, tmpDir, coverPkg, tags s
 
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = projectDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("go test -c %s: %w", pkg.importPath, err)
+		return nil, fmt.Errorf("go test -c %s: %w\n%s", pkg.importPath, err, stderr.String())
 	}
 	if _, err := statFileFunc(binPath); err != nil {
-		return nil, fmt.Errorf("test binary missing for %s: %w", pkg.importPath, err)
+		return nil, fmt.Errorf("test binary missing for %s: %w: %w", pkg.importPath, errNoTestBinary, err)
 	}
 	return &compiledPkg{
 		binPath:    binPath,
@@ -327,12 +322,16 @@ func compileTestBinary(ctx context.Context, projectDir, tmpDir, coverPkg, tags s
 // adaptive selector's per-package fallback and the global ceiling
 // absorb the impact, but be aware that one cancelled coverage build
 // can leave behind tighter-than-real timings until the next clean run.
-func runCompiledTest(ctx context.Context, cp *compiledPkg, testName, profilePath string) ([]Block, time.Duration) {
+//
+// A run cut off by `timeout` reports the timeout as its duration.
+func runCompiledTest(ctx context.Context, cp *compiledPkg, testName, profilePath string, timeout time.Duration) ([]Block, time.Duration) {
 	args := []string{
 		fmt.Sprintf("-test.run=^%s$", regexp.QuoteMeta(testName)),
 		"-test.coverprofile=" + profilePath,
 	}
 
+	ctx, cancel := withTestTimeout(ctx, timeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, cp.binPath, args...)
 	cmd.Dir = cp.dir
 
@@ -349,6 +348,17 @@ func runCompiledTest(ctx context.Context, cp *compiledPkg, testName, profilePath
 		return nil, dur
 	}
 	return profile.blocks, dur
+}
+
+// withTestTimeout bounds one run of a compiled test binary. The deadline
+// is enforced by killing the process rather than through -test.timeout,
+// which only starts counting inside m.Run and so misses a TestMain that
+// hangs in its setup.
+func withTestTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, timeout)
 }
 
 // TestRef identifies a single covering test by its package import path and
@@ -512,86 +522,60 @@ type testEntry struct {
 	pkg  string
 }
 
-// listTests enumerates the test functions of each package pattern, keyed by
-// the import path go test reports for them. Overlapping patterns (./... and
-// ./pkg) resolve to the same (pkg, name) pairs; each is kept once so the
-// coverage phase neither runs a test twice nor double-counts its duration.
-func listTests(ctx context.Context, projectDir string, packages []string, tags string) ([]testEntry, error) {
-	var allTests []testEntry
-	seen := make(map[testEntry]bool)
-
-	for _, pkg := range packages {
-		args := []string{"test", "-list", "."}
-		if tags != "" {
-			args = append(args, tagsBuildFlag+tags)
-		}
-		args = append(args, pkg)
-		cmd := exec.CommandContext(ctx, "go", args...)
-		cmd.Dir = projectDir
-
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-
-		if err := cmd.Run(); err != nil {
-			return nil, fmt.Errorf("go test -list for %s: %w\n%s", pkg, err, stderr.String())
-		}
-
-		for _, te := range parseListTestsOutput(&stdout) {
-			if !seen[te] {
-				seen[te] = true
-				allTests = append(allTests, te)
-			}
-		}
-	}
-
-	return allTests, nil
-}
-
-// parseListTestsOutput parses the stdout of `go test -list .`. go test prints
-// each package's test names followed by a summary line
-// "ok  \t<importpath>\t<elapsed>", so names are buffered and attributed to
-// the import path of the next summary line. They must not be attributed to
-// the pattern passed on the command line: for ./... or ./pkg that never
-// matches the import-path keys buildPkgBins uses, and every test would be
-// skipped (#105). "?" lines (packages without test files) and tab-less
-// "ok"-prefixed output from a package's init are skipped; names with no
-// summary line after them are dropped, as no binary could run them.
-//
-// Extracted so the line-filter can be exercised directly from a string
-// reader — driving it through listTests would require a real `go test`
-// invocation.
-func parseListTestsOutput(r io.Reader) []testEntry {
+// listTests lists the tests in each compiled binary, keyed by the import
+// path the binary was built for. Listing the binary that will run the
+// tests, rather than parsing `go test -list` output for the package
+// patterns, means the keys match pkgBins by construction (#105) and no
+// package is compiled twice.
+func listTests(ctx context.Context, pkgBins map[string]*compiledPkg, timeout time.Duration) ([]testEntry, error) {
 	var tests []testEntry
-	var pending []string
-	scanner := bufio.NewScanner(r)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		pkg, isSummary := listSummaryPkg(line)
-		switch {
-		case isSummary:
-			for _, name := range pending {
-				tests = append(tests, testEntry{name: name, pkg: pkg})
-			}
-			pending = pending[:0]
-		case line == "" || strings.HasPrefix(line, "ok") || strings.HasPrefix(line, "?"):
-			// Blank, init noise, or a package without test files.
-		default:
-			pending = append(pending, line)
+	for pkg, cp := range pkgBins {
+		names, err := listBinTests(ctx, cp, timeout)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range names {
+			tests = append(tests, testEntry{name: name, pkg: pkg})
 		}
 	}
-	return tests
+	return tests, nil
 }
 
-// listSummaryPkg returns the import path from a go test summary line
-// ("ok  \t<importpath>\t<elapsed>"). The tab separators are what tell a
-// summary apart from a package's own stdout that merely starts with "ok".
-func listSummaryPkg(line string) (string, bool) {
-	fields := strings.Split(line, "\t")
-	if len(fields) < 2 || strings.TrimSpace(fields[0]) != "ok" {
-		return "", false
+// listBinTests runs `<binary> -test.list=.` from the package directory, as
+// the per-test runs do, so a TestMain that depends on the working directory
+// behaves the same in both.
+func listBinTests(ctx context.Context, cp *compiledPkg, timeout time.Duration) ([]string, error) {
+	ctx, cancel := withTestTimeout(ctx, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, cp.binPath, "-test.list=.")
+	cmd.Dir = cp.dir
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%s -test.list: %w\n%s", cp.importPath, err, stderr.String())
 	}
-	return fields[1], true
+	return parseTestList(stdout.String()), nil
+}
+
+// runnableTestName matches the names in -test.list output that -test.run
+// can select: tests, fuzz targets (their seed corpus runs as a test) and
+// examples. Anything else is skipped — benchmarks, which -test.run never
+// matches, and output the binary's init or TestMain printed to stdout.
+var runnableTestName = regexp.MustCompile(`^(Test|Fuzz|Example)[\p{L}\p{N}_]*$`)
+
+// parseTestList extracts the runnable test names from a test binary's
+// -test.list output, one per line.
+func parseTestList(out string) []string {
+	var names []string
+	for line := range strings.Lines(out) {
+		if name := strings.TrimSpace(line); runnableTestName.MatchString(name) {
+			names = append(names, name)
+		}
+	}
+	return names
 }
 
 type resolvedPkg struct {

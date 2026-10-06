@@ -1614,7 +1614,7 @@ func TestRunBuildTestMapWarningOnError(t *testing.T) {
 
 	origBuild := buildTestMapFunc
 	defer func() { buildTestMapFunc = origBuild }()
-	buildTestMapFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ int) (*coverage.TestMap, error) {
+	buildTestMapFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ int, _ time.Duration) (*coverage.TestMap, error) {
 		return nil, errors.New("inject build-test-map failure")
 	}
 

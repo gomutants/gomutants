@@ -2,12 +2,15 @@ package coverage
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -83,7 +86,7 @@ func TestBuildTestMap(t *testing.T) {
 		err error
 	)
 	runWithDeadline(t, 30*time.Second, func() {
-		tm, err = BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", tmpDir, 2)
+		tm, err = BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", tmpDir, 2, 0)
 	})
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
@@ -125,23 +128,174 @@ func TestBuildTestMap(t *testing.T) {
 	}
 }
 
-// TestBuildTestMapListTestsErrorMessage kills STATEMENT_REMOVE on
-// `cmd.Stderr = &stderr` in listTests: without stderr capture, the
-// returned error wouldn't include the underlying go-tool stderr text.
-//
-// The error's format string already embeds the package name ("go test
-// -list for %s: %w\n%s"), so asserting on the pkg name doesn't
-// distinguish the two paths. We instead check for text only the go
-// tool's stderr produces ("is not in std" / "no required module" /
-// "cannot find").
-func TestBuildTestMapListTestsErrorMessage(t *testing.T) {
-	_, err := listTests(context.Background(), t.TempDir(), []string{"definitely/nonexistent/pkg/zzz"}, "")
-	if err == nil {
-		t.Fatal("expected error for nonexistent package")
+// writeModule writes `files` (path → content) under a fresh temp dir and
+// returns it.
+func writeModule(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, content := range files {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
 	}
-	msg := err.Error()
-	if !strings.Contains(msg, "is not in std") && !strings.Contains(msg, "cannot find") && !strings.Contains(msg, "no required module") {
-		t.Errorf("error should include stderr content (stderr-only text like 'is not in std'), got: %q", msg)
+	return dir
+}
+
+// compileFixture compiles the test binary of the module rooted at dir,
+// whose package is `importPath`.
+func compileFixture(t *testing.T, dir, importPath string) *compiledPkg {
+	t.Helper()
+	cp, err := compileTestBinary(context.Background(), dir, t.TempDir(), "", "", resolvedPkg{importPath: importPath, dir: dir})
+	if err != nil {
+		t.Fatalf("compileTestBinary: %v", err)
+	}
+	return cp
+}
+
+// cwdListModule's TestMain refuses to run (stderr + exit 3) unless
+// testdata/marker resolves against the working directory.
+var cwdListModule = map[string]string{
+	"go.mod": "module cwdlist\n\ngo 1.26\n",
+	"lib.go": "package cwdlist\n\nfunc F() int { return 1 }\n",
+	"lib_test.go": `package cwdlist
+
+import (
+	"fmt"
+	"os"
+	"testing"
+)
+
+func TestMain(m *testing.M) {
+	if _, err := os.Stat("testdata/marker"); err != nil {
+		fmt.Fprintln(os.Stderr, "listing refused: no marker in cwd")
+		os.Exit(3)
+	}
+	os.Exit(m.Run())
+}
+
+func TestF(t *testing.T) { F() }
+`,
+}
+
+// TestListBinTestsRunsFromPkgDir kills STATEMENT_REMOVE on `cmd.Dir =
+// cp.dir` in listBinTests: the TestMain only lets listing proceed when its
+// relative fixture resolves against the package directory.
+func TestListBinTestsRunsFromPkgDir(t *testing.T) {
+	files := maps.Clone(cwdListModule)
+	files["testdata/marker"] = "x\n"
+	dir := writeModule(t, files)
+	cp := compileFixture(t, dir, "cwdlist")
+
+	names, err := listBinTests(context.Background(), cp, 0)
+	if err != nil {
+		t.Fatalf("listBinTests: %v", err)
+	}
+	if !slices.Equal(names, []string{"TestF"}) {
+		t.Errorf("listBinTests = %v, want [TestF]", names)
+	}
+}
+
+// TestListBinTestsErrorIncludesStderr kills STATEMENT_REMOVE on
+// `cmd.Stderr = &stderr` in listBinTests: the error must carry what the
+// binary printed, which here only its stderr says.
+func TestListBinTestsErrorIncludesStderr(t *testing.T) {
+	dir := writeModule(t, cwdListModule)
+	cp := compileFixture(t, dir, "cwdlist")
+
+	_, err := listBinTests(context.Background(), cp, 0)
+	if err == nil {
+		t.Fatal("expected error from a binary that exits 3 on -test.list")
+	}
+	if !strings.Contains(err.Error(), "listing refused") || !strings.Contains(err.Error(), "cwdlist") {
+		t.Errorf("error should name the package and include the binary's stderr, got: %q", err)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 3 {
+		t.Errorf("error should wrap the binary's exit status 3, got: %v", err)
+	}
+}
+
+// TestBuildTestMapListErrorIsWrapped pins that a listing failure fails the
+// whole build (the caller falls back to whole-package runs) with the
+// "listing tests" context.
+func TestBuildTestMapListErrorIsWrapped(t *testing.T) {
+	dir := writeModule(t, cwdListModule)
+
+	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, "", "", t.TempDir(), 1, 0)
+	if err == nil || !strings.Contains(err.Error(), "listing tests") || !strings.Contains(err.Error(), "listing refused") {
+		t.Fatalf("BuildTestMap error = %v, want a wrapped listing failure", err)
+	}
+	if tm != nil {
+		t.Errorf("expected nil map alongside the error, got %+v", tm)
+	}
+}
+
+// hangModule has a test that sleeps for an hour, and a TestMain that does
+// the same before m.Run when HANG_MAIN=1. A sleep, not a bare select{}:
+// the runtime would report a blocked-forever select as a deadlock and exit.
+var hangModule = map[string]string{
+	"go.mod": "module hangmod\n\ngo 1.26\n",
+	"lib.go": "package hangmod\n\nfunc F() int { return 1 }\n",
+	"lib_test.go": `package hangmod
+
+import (
+	"os"
+	"testing"
+	"time"
+)
+
+func TestMain(m *testing.M) {
+	if os.Getenv("HANG_MAIN") == "1" {
+		time.Sleep(time.Hour)
+	}
+	os.Exit(m.Run())
+}
+
+func TestQuick(t *testing.T) { F() }
+
+func TestHang(t *testing.T) { time.Sleep(time.Hour) }
+`,
+}
+
+// TestRunCompiledTestTimeout is the regression gate for a test that hangs
+// when run alone: a bare test binary has no default timeout, so without
+// the deadline the coverage phase would block forever.
+func TestRunCompiledTestTimeout(t *testing.T) {
+	dir := writeModule(t, hangModule)
+	cp := compileFixture(t, dir, "hangmod")
+
+	var (
+		blocks []Block
+		dur    time.Duration
+	)
+	runWithDeadline(t, 30*time.Second, func() {
+		blocks, dur = runCompiledTest(context.Background(), cp, "TestHang", filepath.Join(t.TempDir(), "hang.cov"), 200*time.Millisecond)
+	})
+	if blocks != nil {
+		t.Errorf("a killed run returned %d blocks, want none", len(blocks))
+	}
+	if dur < 200*time.Millisecond {
+		t.Errorf("duration %v is shorter than the timeout that cut the run off", dur)
+	}
+}
+
+// TestListBinTestsTimeout covers the hang that -test.timeout would miss: a
+// TestMain stuck before m.Run. The deadline must still end the listing.
+func TestListBinTestsTimeout(t *testing.T) {
+	dir := writeModule(t, hangModule)
+	cp := compileFixture(t, dir, "hangmod")
+	t.Setenv("HANG_MAIN", "1")
+
+	var err error
+	runWithDeadline(t, 30*time.Second, func() {
+		_, err = listBinTests(context.Background(), cp, 200*time.Millisecond)
+	})
+	if err == nil {
+		t.Error("listing a binary whose TestMain hangs returned no error")
 	}
 }
 
@@ -177,7 +331,7 @@ func TestBuildTestMapCoverPkgNoMatch(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"},
-		"completely/nonexistent/zzz", "", tmpDir, 2)
+		"completely/nonexistent/zzz", "", tmpDir, 2, 0)
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
@@ -212,7 +366,7 @@ func TestBuildTestMapPackageArgPassed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	tm, err := BuildTestMap(context.Background(), rootDir, []string{"rootmod/sub"}, "", "", t.TempDir(), 1)
+	tm, err := BuildTestMap(context.Background(), rootDir, []string{"rootmod/sub"}, "", "", t.TempDir(), 1, 0)
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
@@ -226,7 +380,7 @@ func TestBuildTestMapWithCoverpkg(t *testing.T) {
 	dir := setupTestProject(t)
 	tmpDir := t.TempDir()
 
-	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "testmod", "", tmpDir, 2)
+	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "testmod", "", tmpDir, 2, 0)
 	if err != nil {
 		t.Fatalf("BuildTestMap with coverpkg: %v", err)
 	}
@@ -235,48 +389,48 @@ func TestBuildTestMapWithCoverpkg(t *testing.T) {
 	}
 }
 
+// TestBuildTestMapContextCancelled drives the worker pipeline with a ctx
+// cancelled after listing, so feedWork's close-on-ctx.Done path runs.
+// Mutating that close to a no-op deadlocks the workers; the deadline
+// catches it. Every seam is stubbed: real `go` invocations fail on a
+// cancelled ctx and would return before the pipeline starts.
 func TestBuildTestMapContextCancelled(t *testing.T) {
-	dir := setupTestProject(t)
-
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Stub listTests to return many fake tests and cancel the context.
-	// The large number of tests guarantees feedWork's select picks the
-	// ctx.Done branch on at least one iteration (Go select randomises
-	// between ready cases — P(never picked over 1000 tries) ≈ 0).
-	origList := listTestsFunc
-	listTestsFunc = func(ctx context.Context, projectDir string, packages []string, _ string) ([]testEntry, error) {
+	// Many tests make feedWork's select pick the ctx.Done branch on at
+	// least one iteration (Go select randomises between ready cases —
+	// P(never picked over 1000 tries) ≈ 0).
+	var tests []testEntry
+	for i := range 1000 {
+		tests = append(tests, testEntry{name: fmt.Sprintf("Test%d", i), pkg: "testmod"})
+	}
+	ran := stubBuildTestMapDeps(t, tests, []resolvedPkg{{importPath: "testmod", dir: t.TempDir()}})
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration) ([]testEntry, error) {
 		cancel()
-		var tests []testEntry
-		for i := range 1000 {
-			tests = append(tests, testEntry{name: fmt.Sprintf("Test%d", i), pkg: "testmod"})
-		}
 		return tests, nil
 	}
-	defer func() { listTestsFunc = origList }()
 
-	// Stub resolvePackages too: the real one shells out to `go list`, which
-	// fails immediately with the already-cancelled ctx and short-circuits
-	// BuildTestMap before feedWork ever runs. We need feedWork to execute
-	// so the close-on-ctx.Done path is actually exercised by this test.
-	origResolve := resolvePackagesFunc
-	resolvePackagesFunc = func(ctx context.Context, projectDir string, patterns []string, _ string) ([]resolvedPkg, error) {
-		return []resolvedPkg{{importPath: "testmod", dir: dir}}, nil
-	}
-	defer func() { resolvePackagesFunc = origResolve }()
-
-	// Should not hang — feedWork closes work on ctx.Done so workers exit
-	// the for-range, wg.Wait returns, results closes, BuildTestMap returns.
-	// Mutating that close to a no-op deadlocks here; the deadline catches it.
+	var (
+		tm  *TestMap
+		err error
+	)
 	runWithDeadline(t, 30*time.Second, func() {
-		_, _ = BuildTestMap(ctx, dir, []string{"testmod"}, "", "", t.TempDir(), 2)
+		tm, err = BuildTestMap(ctx, t.TempDir(), []string{"testmod"}, "", "", t.TempDir(), 2, 0)
 	})
+	// Every early return yields a nil map; a non-nil one proves the
+	// workers and feedWork ran.
+	if err != nil || tm == nil {
+		t.Fatalf("BuildTestMap = (%v, %v), want the (empty) map from a cancelled pipeline", tm, err)
+	}
+	if got := atomic.LoadInt32(ran); got != 0 {
+		t.Errorf("runCompiledTestFunc called %d times on a cancelled ctx, want 0", got)
+	}
 }
-
 func TestListTests(t *testing.T) {
 	dir := setupTestProject(t)
+	cp := compileFixture(t, dir, "testmod")
 
-	tests, err := listTests(context.Background(), dir, []string{"testmod"}, "")
+	tests, err := listTests(context.Background(), map[string]*compiledPkg{"testmod": cp}, 0)
 	if err != nil {
 		t.Fatalf("listTests: %v", err)
 	}
@@ -313,7 +467,7 @@ func TestBuildTestMapWithPackagePatterns(t *testing.T) {
 				err error
 			)
 			runWithDeadline(t, 30*time.Second, func() {
-				tm, err = BuildTestMap(context.Background(), dir, []string{pattern}, "", "", t.TempDir(), 2)
+				tm, err = BuildTestMap(context.Background(), dir, []string{pattern}, "", "", t.TempDir(), 2, 0)
 			})
 			if err != nil {
 				t.Fatalf("BuildTestMap(%q): %v", pattern, err)
@@ -349,12 +503,11 @@ func writeTwoPkgModule(t *testing.T) string {
 	return dir
 }
 
-// TestListTestsAttributesPatternToImportPath drives listTests through a real
-// multi-package `go test -list` and checks every test carries its own
+// TestListTestsKeysByImportPath drives resolve → compile → list through a
+// real multi-package module and checks every test carries its own
 // package's import path — the same-named TestShared once per package —
-// and that overlapping patterns don't list a test twice. The overlap case
-// kills STATEMENT_REMOVE on `seen[te] = true`.
-func TestListTestsAttributesPatternToImportPath(t *testing.T) {
+// and that overlapping patterns don't list a test twice.
+func TestListTestsKeysByImportPath(t *testing.T) {
 	dir := writeTwoPkgModule(t)
 	want := []testEntry{
 		{name: "TestOnlyA", pkg: "twopkg/a"},
@@ -363,7 +516,15 @@ func TestListTestsAttributesPatternToImportPath(t *testing.T) {
 		{name: "TestShared", pkg: "twopkg/sub"},
 	}
 	for _, patterns := range [][]string{{"./..."}, {"./...", "./sub"}} {
-		got, err := listTests(context.Background(), dir, patterns, "")
+		pkgs, err := resolvePackages(context.Background(), dir, patterns, "")
+		if err != nil {
+			t.Fatalf("resolvePackages(%v): %v", patterns, err)
+		}
+		bins, failures := buildPkgBins(context.Background(), dir, t.TempDir(), "", "", pkgs)
+		if len(failures) > 0 {
+			t.Fatalf("buildPkgBins(%v): %v", patterns, failures)
+		}
+		got, err := listTests(context.Background(), bins, 0)
 		if err != nil {
 			t.Fatalf("listTests(%v): %v", patterns, err)
 		}
@@ -376,13 +537,16 @@ func TestListTestsAttributesPatternToImportPath(t *testing.T) {
 	}
 }
 
+// TestListTestsFailure kills STATEMENT_REMOVE / BRANCH_IF on listTests'
+// error return: a binary that can't be listed must fail the listing rather
+// than silently drop its package's tests.
 func TestListTestsFailure(t *testing.T) {
-	_, err := listTests(context.Background(), t.TempDir(), []string{"nonexistent/pkg"}, "")
+	bins := map[string]*compiledPkg{"gone": {binPath: "/nonexistent/absolutely/not/a/binary", importPath: "gone", dir: t.TempDir()}}
+	tests, err := listTests(context.Background(), bins, 0)
 	if err == nil {
-		t.Fatal("expected error for nonexistent package")
+		t.Fatalf("expected error for a missing test binary, got tests=%+v", tests)
 	}
 }
-
 func TestResolvePackagesCoverage(t *testing.T) {
 	dir := setupTestProject(t)
 
@@ -437,38 +601,6 @@ func setupTaggedProject(t *testing.T) string {
 	return dir
 }
 
-// TestListTestsForwardsTags kills BRANCH_IF / CONDITIONALS_NEGATION /
-// STATEMENT_REMOVE on the `if tags != "" { -tags= }` guard in listTests:
-// the tag-gated TestTagged is only enumerated when the tag reaches
-// `go test -list`.
-func TestListTestsForwardsTags(t *testing.T) {
-	dir := setupTaggedProject(t)
-
-	without, err := listTests(context.Background(), dir, []string{"testmod"}, "")
-	if err != nil {
-		t.Fatalf("listTests (no tags): %v", err)
-	}
-	if names := testNames(without); names["TestTagged"] {
-		t.Errorf("no tags: TestTagged must not be enumerated, got %v", names)
-	}
-
-	with, err := listTests(context.Background(), dir, []string{"testmod"}, "mytag")
-	if err != nil {
-		t.Fatalf("listTests (tags): %v", err)
-	}
-	if names := testNames(with); !names["TestTagged"] {
-		t.Errorf("tags=mytag: TestTagged must be enumerated, got %v", names)
-	}
-}
-
-func testNames(entries []testEntry) map[string]bool {
-	out := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		out[e.name] = true
-	}
-	return out
-}
-
 // TestResolvePackagesForwardsTags kills the same guard in resolvePackages:
 // the testmod/only package — whose only file is build-constrained — can be
 // resolved only when the tag reaches `go list`.
@@ -488,7 +620,7 @@ func TestResolvePackagesForwardsTags(t *testing.T) {
 }
 
 // TestBuildTestMapForwardsTags is the end-to-end guard for the whole
-// tags-aware pipeline (listTests + resolvePackages + compileTestBinary):
+// tags-aware pipeline (resolvePackages + compileTestBinary):
 // coverage for the tag-gated Tagged() line is mapped only when the tag is
 // forwarded, so it kills the `-tags=` STATEMENT_REMOVE in compileTestBinary
 // too — without it the test binary excludes TestTagged and the line is
@@ -501,7 +633,7 @@ func TestBuildTestMapForwardsTags(t *testing.T) {
 		err           error
 	)
 	runWithDeadline(t, 60*time.Second, func() {
-		without, err = BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 2)
+		without, err = BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 2, 0)
 	})
 	if err != nil {
 		t.Fatalf("BuildTestMap (no tags): %v", err)
@@ -513,7 +645,7 @@ func TestBuildTestMapForwardsTags(t *testing.T) {
 	}
 
 	runWithDeadline(t, 60*time.Second, func() {
-		with, err = BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "mytag", t.TempDir(), 2)
+		with, err = BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "mytag", t.TempDir(), 2, 0)
 	})
 	if err != nil {
 		t.Fatalf("BuildTestMap (tags): %v", err)
@@ -523,37 +655,36 @@ func TestBuildTestMapForwardsTags(t *testing.T) {
 	}
 }
 
-func TestBuildTestMapListTestsError(t *testing.T) {
-	// Package with syntax error — listTests fails.
-	dir := t.TempDir()
-	files := map[string]string{
+// TestBuildTestMapAllCompilesFail pins the diagnostic when no package's
+// test binary compiles: an error carrying the compiler's own output, which
+// also kills STATEMENT_REMOVE on `cmd.Stderr = &stderr` in
+// compileTestBinary (only stderr names the bad file).
+func TestBuildTestMapAllCompilesFail(t *testing.T) {
+	dir := writeModule(t, map[string]string{
 		"go.mod":      "module testmod\n\ngo 1.26\n",
 		"bad.go":      "package testmod\n\nfunc Bad() { SYNTAX ERROR }\n",
 		"bad_test.go": "package testmod\nimport \"testing\"\nfunc TestBad(t *testing.T) {}\n",
-	}
-	for name, content := range files {
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
+	})
 
-	_, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1)
+	_, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1, 0)
 	if err == nil {
 		t.Fatal("expected error for package with syntax error")
 	}
+	if !strings.Contains(err.Error(), "no test binary compiled") || !strings.Contains(err.Error(), "bad.go:3") {
+		t.Errorf("error should report the failed compile with the compiler's output, got: %q", err)
+	}
 }
-
 func TestBuildTestMapResolveError(t *testing.T) {
 	dir := setupTestProject(t)
 
-	// Stub resolvePackagesFunc to fail after listTests succeeds.
+	// Stub resolvePackagesFunc to fail.
 	origResolve := resolvePackagesFunc
 	resolvePackagesFunc = func(ctx context.Context, projectDir string, patterns []string, _ string) ([]resolvedPkg, error) {
 		return nil, fmt.Errorf("injected resolve error")
 	}
 	defer func() { resolvePackagesFunc = origResolve }()
 
-	_, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1)
+	_, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1, 0)
 	if err == nil {
 		t.Fatal("expected error from resolvePackages")
 	}
@@ -569,12 +700,12 @@ func TestBuildTestMapCompileFailure(t *testing.T) {
 	}
 	defer func() { resolvePackagesFunc = origResolve }()
 
-	// listTests will return tests but the package binary won't compile, so
-	// nothing can be mapped — that must surface as an error the caller
-	// warns on, not an empty map that silently disables per-test routing.
-	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1)
+	// The only package's binary won't compile, so nothing can be mapped —
+	// that must surface as an error the caller warns on, not an empty map
+	// that silently disables per-test routing.
+	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1, 0)
 	if err == nil {
-		t.Fatal("BuildTestMap should error when no listed test has a compiled binary")
+		t.Fatal("BuildTestMap should error when no test binary compiles")
 	}
 	if tm != nil {
 		t.Errorf("expected nil map alongside the error, got %+v", tm)
@@ -595,7 +726,7 @@ func TestBuildTestMapNoTestsPkg(t *testing.T) {
 	}
 	tmpDir := t.TempDir()
 
-	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", tmpDir, 1)
+	tm, err := BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", tmpDir, 1, 0)
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
@@ -626,7 +757,7 @@ func TestRunCompiledTestStaleProfileNotReturned(t *testing.T) {
 		importPath: "testmod",
 		dir:        tmpDir,
 	}
-	blocks, _ := runCompiledTest(ctx, cp, "TestAnything", profilePath)
+	blocks, _ := runCompiledTest(ctx, cp, "TestAnything", profilePath, 0)
 	if blocks != nil {
 		t.Errorf("cmd.Run failed but got %d blocks from stale profile — BRANCH_IF on the err check lets it through", len(blocks))
 	}
@@ -659,7 +790,7 @@ func TestProcessWorkContextCancelledSkipsWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-cancel before processWork reads
 
-	processWork(ctx, work, pkgBins, tmpDir, 0, results)
+	processWork(ctx, work, pkgBins, tmpDir, 0, 0, results)
 	close(results)
 
 	count := 0
@@ -714,7 +845,7 @@ func TestRunCompiledTestFailure(t *testing.T) {
 	}
 
 	profilePath := filepath.Join(tmpDir, "test.cov")
-	blocks, _ := runCompiledTest(ctx, cp, "TestAdd", profilePath)
+	blocks, _ := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
 	if blocks != nil {
 		t.Errorf("expected nil blocks for failed test binary, got %d", len(blocks))
 	}
@@ -731,7 +862,7 @@ func TestRunCompiledTestParseError(t *testing.T) {
 	defer func() { parseFileFunc = origParse }()
 
 	profilePath := filepath.Join(tmpDir, "test.cov")
-	blocks, _ := runCompiledTest(ctx, cp, "TestAdd", profilePath)
+	blocks, _ := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
 	if blocks != nil {
 		t.Errorf("expected nil blocks when ParseFile fails, got %d", len(blocks))
 	}
@@ -743,7 +874,7 @@ func TestRunCompiledTestBadProfile(t *testing.T) {
 	// Use a directory as the profile path — go test will fail to write to it.
 	profileDir := filepath.Join(tmpDir, "profdir")
 	os.MkdirAll(profileDir, 0o755)
-	blocks, _ := runCompiledTest(ctx, cp, "TestAdd", profileDir)
+	blocks, _ := runCompiledTest(ctx, cp, "TestAdd", profileDir, 0)
 	// cmd.Run fails because -test.coverprofile can't write to a directory.
 	if blocks != nil {
 		t.Logf("blocks=%d (expected nil or empty)", len(blocks))
@@ -754,7 +885,7 @@ func TestRunCompiledTest(t *testing.T) {
 	ctx, cp, tmpDir := compileTestmodBinary(t)
 
 	profilePath := filepath.Join(tmpDir, "test.cov")
-	blocks, dur := runCompiledTest(ctx, cp, "TestAdd", profilePath)
+	blocks, dur := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
 	if len(blocks) == 0 {
 		t.Error("expected coverage blocks from TestAdd")
 	}
@@ -763,6 +894,6 @@ func TestRunCompiledTest(t *testing.T) {
 	}
 
 	// Running a non-existent test should return nil/empty blocks.
-	blocks, _ = runCompiledTest(ctx, cp, "TestNonExistent", profilePath)
+	blocks, _ = runCompiledTest(ctx, cp, "TestNonExistent", profilePath, 0)
 	_ = blocks
 }
