@@ -1,6 +1,7 @@
 package patch_test
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/szhekpisov/gomutants/internal/patch"
@@ -139,5 +140,170 @@ func TestApplyDoesNotMutateOriginal(t *testing.T) {
 	}
 	if string(original) != snapshot {
 		t.Error("Apply mutated the original slice")
+	}
+}
+
+func TestApplyAllEmptyReturnsCopy(t *testing.T) {
+	original := []byte("a + b")
+	got, err := patch.ApplyAll(original, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "a + b" {
+		t.Errorf("got %q, want %q", string(got), "a + b")
+	}
+	// Must be a copy: schemata hands the result to a file write while the
+	// original stays in the shared source cache.
+	got[0] = 'z'
+	if original[0] != 'a' {
+		t.Error("ApplyAll returned an alias of the original")
+	}
+}
+
+func TestApplyAllMultipleEdits(t *testing.T) {
+	original := []byte("a + b - c")
+	got, err := patch.ApplyAll(original, []patch.Edit{
+		{Start: 2, End: 3, Replacement: "*"},
+		{Start: 6, End: 7, Replacement: "/"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "a * b / c" {
+		t.Errorf("got %q, want %q", string(got), "a * b / c")
+	}
+}
+
+func TestApplyAllSortsUnorderedInput(t *testing.T) {
+	original := []byte("a + b - c")
+	got, err := patch.ApplyAll(original, []patch.Edit{
+		{Start: 6, End: 7, Replacement: "/"},
+		{Start: 2, End: 3, Replacement: "*"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "a * b / c" {
+		t.Errorf("got %q, want %q", string(got), "a * b / c")
+	}
+}
+
+func TestApplyAllAdjacentEditsAreNotOverlaps(t *testing.T) {
+	original := []byte("abcd")
+	got, err := patch.ApplyAll(original, []patch.Edit{
+		{Start: 0, End: 2, Replacement: "X"},
+		{Start: 2, End: 4, Replacement: "Y"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "XY" {
+		t.Errorf("got %q, want %q", string(got), "XY")
+	}
+}
+
+func TestApplyAllZeroWidthInsert(t *testing.T) {
+	// The shape RANGE_BREAK uses: insert without consuming any bytes.
+	original := []byte("for range x {\n}")
+	got, err := patch.ApplyAll(original, []patch.Edit{
+		{Start: 13, End: 13, Replacement: " break;"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "for range x { break;\n}" {
+		t.Errorf("got %q", string(got))
+	}
+}
+
+func TestApplyAllZeroWidthInsertsAtSameOffsetComposeStably(t *testing.T) {
+	original := []byte("ab")
+	edits := []patch.Edit{
+		{Start: 1, End: 1, Replacement: "Y"},
+		{Start: 1, End: 1, Replacement: "X"},
+	}
+	got, err := patch.ApplyAll(original, edits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sorted by Replacement, so the order is input-independent.
+	if string(got) != "aXYb" {
+		t.Errorf("got %q, want %q", string(got), "aXYb")
+	}
+	reversed, err := patch.ApplyAll(original, []patch.Edit{edits[1], edits[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(reversed) != string(got) {
+		t.Errorf("input order changed the result: %q vs %q", string(reversed), string(got))
+	}
+}
+
+func TestApplyAllDoesNotReorderCallerSlice(t *testing.T) {
+	edits := []patch.Edit{
+		{Start: 6, End: 7, Replacement: "/"},
+		{Start: 2, End: 3, Replacement: "*"},
+	}
+	if _, err := patch.ApplyAll([]byte("a + b - c"), edits); err != nil {
+		t.Fatal(err)
+	}
+	if edits[0].Start != 6 {
+		t.Errorf("caller slice was sorted in place: %+v", edits)
+	}
+}
+
+func TestApplyAllRejectsOverlap(t *testing.T) {
+	tests := []struct {
+		name  string
+		edits []patch.Edit
+	}{
+		{"nested", []patch.Edit{{Start: 0, End: 5, Replacement: "X"}, {Start: 1, End: 2, Replacement: "Y"}}},
+		{"straddling", []patch.Edit{{Start: 0, End: 3, Replacement: "X"}, {Start: 2, End: 5, Replacement: "Y"}}},
+		{"identical", []patch.Edit{{Start: 1, End: 3, Replacement: "X"}, {Start: 1, End: 3, Replacement: "Y"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := patch.ApplyAll([]byte("abcdefgh"), tt.edits); err == nil {
+				t.Error("expected an overlap error, got nil")
+			}
+		})
+	}
+}
+
+func TestApplyAllRejectsInvalidRange(t *testing.T) {
+	// The message is asserted, not just the presence of an error: a
+	// negative start also trips the overlap check that follows, so
+	// "some error" cannot tell the two guards apart.
+	tests := []struct {
+		name string
+		edit patch.Edit
+	}{
+		{"negative start", patch.Edit{Start: -1, End: 2, Replacement: "X"}},
+		{"end past EOF", patch.Edit{Start: 0, End: 99, Replacement: "X"}},
+		{"start after end", patch.Edit{Start: 3, End: 1, Replacement: "X"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := patch.ApplyAll([]byte("abcde"), []patch.Edit{tt.edit})
+			if err == nil {
+				t.Fatal("expected a range error, got nil")
+			}
+			if !strings.Contains(err.Error(), "invalid range") {
+				t.Errorf("want an invalid-range error, got %q", err)
+			}
+		})
+	}
+}
+
+func TestApplyAllOverlapErrorNamesTheOverlap(t *testing.T) {
+	_, err := patch.ApplyAll([]byte("abcdefgh"), []patch.Edit{
+		{Start: 0, End: 3, Replacement: "X"},
+		{Start: 2, End: 5, Replacement: "Y"},
+	})
+	if err == nil {
+		t.Fatal("expected an overlap error, got nil")
+	}
+	if !strings.Contains(err.Error(), "overlaps") {
+		t.Errorf("want an overlap error, got %q", err)
 	}
 }

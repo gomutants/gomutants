@@ -86,6 +86,7 @@ These are unchanged-tree reruns, not a claim that all edits are free: editing a 
   - [Configuration File](#configuration-file)
   - [Mutators](#mutators)
   - [All Flags](#all-flags)
+- [Mutant schemata](#mutant-schemata)
 - [How It Works](#how-it-works)
 - [Self-efficacy (gomutants on itself)](#self-efficacy-gomutants-on-itself)
 - [Security & Code Quality](#security--code-quality)
@@ -670,6 +671,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source package and covering tests are byte-identical to the cached run — invalidation is package-scoped, so editing one file re-runs its package. Pass `--cache=off` to disable. |
 | `--checkpoint-interval` | | 10s | How often to flush completed mutant outcomes to the cache mid-run, so a hard kill (OOM, CI timeout, SIGKILL) loses at most this much progress and the next run resumes from the last checkpoint. `0` disables periodic checkpointing (the cache is then written only once, at the end). Ignored when `--cache=off`. |
 | `--detect-equivalent` | | false | After testing, recompile each surviving mutant with package-scoped `-gcflags=-S` and reclassify it as `EQUIVALENT` when the generated assembly is identical to the original (Trivial Compiler Equivalence). Equivalent mutants can't be killed by any test, so they're dropped from the efficacy denominator. Adds one package compile per survivor. |
+| `--schemata` | | false | **Experimental.** Compile each package once with every mutant present but inert, then run mutants against the prebuilt test binary instead of recompiling per mutant — roughly a 7x cold-run speedup on the bundled fixtures. Mutants the rewriter cannot prove safe keep the per-mutant path, so verdicts are unchanged. Ignored with `--test-flags` or `--run-mutant-id`. See [Mutant schemata](#mutant-schemata) |
 | `--integration` | | false | Route each mutant to covering tests in *any* package that imports it, not just its own. Widens coverage and the per-test build to the reverse-dependency closure of the target packages and manages `-coverpkg` itself (passing `--coverpkg` too is an error). Lets a mutant be killed by a cross-package/E2E test. See [Cross-Package Mode](#cross-package-mode). |
 | `--annotations` | | | Emit annotations for LIVED mutants. Supported: `github` (workflow-command warnings on stdout). |
 | `--stryker-output` | | | Also write a [Stryker mutation-testing-elements](https://github.com/stryker-mutator/mutation-testing-elements) report at this path (for the HTML viewer and Stryker Dashboard). |
@@ -813,6 +815,56 @@ or `--` as a boundary when the field before it is a flag with no inline
 `=` value. Write that value inline (`-bench=. -args -run=custom`) if you
 need the relaxation there. Names gomutants does not manage are unaffected,
 so `--test-flags '-race -args -x'` works either way.
+
+## Mutant schemata
+
+`--schemata` is an experimental execution mode. Instead of recompiling the
+package and relinking the test binary once per mutant, it compiles each
+package **once** with every mutant already present but inert, each one behind
+a guard keyed to the `GOMUTANTS_ACTIVE` environment variable, and then runs
+the prebuilt test binary once per mutant.
+
+```bash
+gomutants --schemata ./...
+```
+
+That removes the dominant cost of a cold run. On this repository's own
+`internal/report` package, 348 mutants take 59s on the per-mutant path and
+8.7s with `--schemata` — the same 305 killed, 12 lived, 28 not viable.
+
+This is the architecture Stryker.NET, StrykerJS and mutmut 3 use. Go makes it
+harder than those languages do: there is no conditional expression, and
+gomutants deliberately carries no type checker, so the rewriter has to prove
+from syntax alone that a mutation can be made switchable. It uses four
+strategies:
+
+| | Shape | Covers |
+|---|---|---|
+| Bool wrap | `func() bool { if on(41) { return a >= b }; return a > b }()` | Conditions and logical operators, whose type is bool whatever the operands are |
+| Statement wrap | `if on(42) { return x - y } else { return x + y }` | Arithmetic, literals, return values, assignment operators |
+| Block guard | `if !on(43) { … }` | The branch-emptying mutators, with no duplicated source at all |
+| Fallback | today's per-mutant `-overlay` run | Everything else |
+
+**Verdicts do not change.** Anything the rewriter cannot prove safe falls back
+to the per-mutant path rather than guessing, and so does anything the schema
+build rejects. The declined set includes constant contexts (a closure is not a
+constant), `recover()` inside a condition (wrapping it stops it recovering),
+mutations that would orphan a declaration or an import, and guards that would
+leave a function without a terminating statement. Because verdicts are
+interchangeable, `--schemata` is deliberately **not** part of the cache
+identity: results recorded under one path replay correctly under the other.
+
+Two known costs, which are why it is opt-in:
+
+- The guards perturb inlining and escape analysis, so benchmark-shaped or
+  timing-sensitive tests may behave differently than on the per-mutant path.
+- `GOMUTANTS_ACTIVE` is visible to the tests, which matters only to a test
+  asserting on an exact environment.
+
+`--test-flags` and `--run-mutant-id` switch it off automatically: the former
+because those are `go test` arguments with no general translation to a test
+binary's own flags, the latter because a single mutant costs one compile
+either way.
 
 ## How It Works
 
