@@ -8,4 +8,6 @@ import "os/exec"
 // kill, so cancellation kills the binary alone, exec's default. The
 // WaitDelay testBinaryCmd sets still bounds a wait on output held open by
 // a process the binary started.
-func killTreeOnCancel(*exec.Cmd) {}
+func killTreeOnCancel(*exec.Cmd) {
+	// Intentionally empty: see above.
+}

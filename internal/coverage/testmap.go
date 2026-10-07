@@ -35,6 +35,8 @@ var (
 	runCompiledTestFunc   = runCompiledTest
 	measureRebuildFunc    = measureRebuild
 	statFileFunc          = os.Stat
+	writeFileFunc         = os.WriteFile
+	checkSoloSkipsFunc    = checkSoloSkips
 )
 
 // TestMap maps (file, line) positions to the test functions that cover them.
@@ -281,7 +283,8 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			processWork(ctx, work, pkgBins, opts.TmpDir, workerID, opts.TestTimeout, failed, results)
+			profilePath := filepath.Join(opts.TmpDir, fmt.Sprintf("testmap-%d.cov", workerID))
+			processWork(ctx, work, pkgBins, profilePath, opts.TestTimeout, failed, results)
 		}(i)
 	}
 
@@ -310,15 +313,8 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 		return nil, err
 	}
 
-	// 5. A package already unmapped runs in full whatever its skips say.
-	for pkg := range soloSkips {
-		if _, ok := tm.unmapped[pkg]; ok {
-			delete(soloSkips, pkg)
-		}
-	}
-	for pkg, f := range checkSoloSkips(ctx, pkgBins, tests, soloSkips, opts.TestTimeout, opts.Workers) {
-		tm.markUnmapped(pkg, pkgBins[pkg].dir, f.reason, f.order)
-	}
+	// 5. Check the tests that skipped alone (see checkSoloSkips).
+	tm.unmapSoloSkips(ctx, pkgBins, tests, soloSkips, opts)
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -330,6 +326,21 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 		tm.testDeps, _ = testDepsFunc(ctx, projectDir, opts.Tags, slices.Sorted(maps.Keys(tm.unmapped)))
 	}
 	return tm, nil
+}
+
+// unmapSoloSkips unmaps the packages checkSoloSkips finds a test in that
+// skips alone but not in package order. skips holds the tests that
+// skipped alone; a package already unmapped runs in full whatever they
+// say, so it isn't checked.
+func (tm *TestMap) unmapSoloSkips(ctx context.Context, pkgBins map[string]*compiledPkg, tests []testEntry, skips map[string][]testEntry, opts BuildOptions) {
+	for pkg := range skips {
+		if _, ok := tm.unmapped[pkg]; ok {
+			delete(skips, pkg)
+		}
+	}
+	for pkg, f := range checkSoloSkipsFunc(ctx, pkgBins, tests, skips, opts.TestTimeout, opts.Workers) {
+		tm.markUnmapped(pkg, pkgBins[pkg].dir, f.reason, f.order)
+	}
 }
 
 // ingestResult folds one per-test outcome into both the coverage index
@@ -390,7 +401,9 @@ func (tm *TestMap) addBlocks(pkg, testName string, blocks []Block) {
 // unused, and a test that hangs alone would hold a worker for the whole
 // timeout. Tests listed before the failure still run, as one of them may
 // fail too and the earliest failure is the reason reported.
-func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]*compiledPkg, tmpDir string, workerID int, testTimeout time.Duration, failed *firstFailures, results chan<- testCoverage) {
+//
+// profilePath is the worker's own coverage profile, rewritten by each run.
+func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]*compiledPkg, profilePath string, testTimeout time.Duration, failed *firstFailures, results chan<- testCoverage) {
 	for test := range work {
 		if ctx.Err() != nil {
 			return
@@ -399,7 +412,6 @@ func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]
 		if cp == nil || failed.before(test.pkg, test.order) {
 			continue
 		}
-		profilePath := filepath.Join(tmpDir, fmt.Sprintf("testmap-%d.cov", workerID))
 		blocks, dur, skipped, err := runCompiledTestFunc(ctx, cp, test.name, profilePath, testTimeout)
 		// Forward the timing even when the test produced no blocks: the
 		// mutant covering this test still executes it, so its duration
@@ -598,18 +610,12 @@ func measureRebuild(ctx context.Context, projectDir string, opts BuildOptions, c
 	if err != nil {
 		return 0, err
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	changed := filepath.Join(dir, filepath.Base(cp.probeFile))
 	src = fmt.Appendf(src, "\n// gomutants rebuild probe %d\n", time.Now().UnixNano())
-	if err := os.WriteFile(changed, src, 0o644); err != nil {
-		return 0, err
-	}
-	ov, err := json.Marshal(map[string]map[string]string{"Replace": {cp.probeFile: changed}})
-	if err != nil {
-		return 0, err
-	}
+	ov, _ := json.Marshal(map[string]map[string]string{"Replace": {cp.probeFile: changed}})
 	ovPath := filepath.Join(dir, "overlay.json")
-	if err := os.WriteFile(ovPath, ov, 0o644); err != nil {
+	if err := errors.Join(writeFileFunc(changed, src, 0o644), writeFileFunc(ovPath, ov, 0o644)); err != nil {
 		return 0, err
 	}
 
@@ -852,7 +858,9 @@ func checkPkgSkips(ctx context.Context, cp *compiledPkg, listed, skipped []testE
 // hangs in its setup.
 func withTestTimeout(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	if timeout <= 0 {
-		return ctx, func() {}
+		return ctx, func() {
+			// No timeout, so nothing to release.
+		}
 	}
 	return context.WithTimeout(ctx, timeout)
 }
@@ -1211,11 +1219,13 @@ func testBinaryArgs(ctx context.Context, projectDir, tags, pkg string, flags []s
 	args = append(append(args, pkg), flags...)
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = projectDir
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return nil, fmt.Errorf("go test -n %s: %w\n%s", pkg, err, out)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("go test -n %s: %w\n%s", pkg, err, out.String())
 	}
-	return parseTestBinaryArgs(string(out))
+	return parseTestBinaryArgs(out.String())
 }
 
 // goTestOwnArg reports whether a test-binary argument is one `go test` adds
@@ -1264,10 +1274,10 @@ func testDeps(ctx context.Context, projectDir, tags string, pkgs []string) (map[
 	args = append(args, pkgs...)
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = projectDir
-	var stderr bytes.Buffer
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	out, err := cmd.Output()
-	if err != nil {
+	if err := cmd.Run(); err != nil {
 		return nil, fmt.Errorf("go list -test: %w\n%s", err, stderr.String())
 	}
 
@@ -1276,7 +1286,7 @@ func testDeps(ctx context.Context, projectDir, tags string, pkgs []string) (map[
 		testMains[p+".test"] = p
 	}
 	deps := make(map[string]map[string]bool)
-	for line := range strings.Lines(string(out)) {
+	for line := range strings.Lines(stdout.String()) {
 		testMain, dep, _ := strings.Cut(strings.TrimSpace(line), "\t")
 		pkg, ok := testMains[testMain]
 		if !ok {

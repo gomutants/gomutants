@@ -4,7 +4,9 @@ package coverage
 
 import (
 	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -111,5 +113,33 @@ func TestListBinTestsStopsWaitingForEscapedOutput(t *testing.T) {
 
 	if took, _ := listHanging(t, true); took > 10*time.Second {
 		t.Errorf("listing took %s, want it to stop waiting soon after its timeout", took)
+	}
+}
+
+// TestKillTreeOnCancelFallsBackToProcess: when the group can't be
+// signalled — just after Start on macOS — cancellation still kills the
+// process itself.
+func TestKillTreeOnCancelFallsBackToProcess(t *testing.T) {
+	orig := syscallKillFunc
+	t.Cleanup(func() { syscallKillFunc = orig })
+	syscallKillFunc = func(int, syscall.Signal) error { return errors.New("no such group") }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sleep", "60")
+	killTreeOnCancel(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a killed sleep exited cleanly")
+		}
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("cancelling didn't kill the process")
 	}
 }

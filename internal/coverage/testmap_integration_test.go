@@ -665,6 +665,71 @@ func TestMeasureRebuild(t *testing.T) {
 	}
 }
 
+// TestMeasureRebuildErrors: every step that can fail fails the
+// measurement — reading the file to change, making the scratch directory,
+// writing the changed file and overlay, and the build itself.
+func TestMeasureRebuildErrors(t *testing.T) {
+	dir := setupTestProject(t)
+	pkgs, err := resolvePackages(context.Background(), dir, []string{"testmod"}, "")
+	if err != nil || len(pkgs) != 1 {
+		t.Fatalf("resolvePackages = (%v, %v)", pkgs, err)
+	}
+	good := &compiledPkg{importPath: "testmod", dir: dir, probeFile: pkgs[0].probeFile}
+	missingDir := filepath.Join(t.TempDir(), "missing")
+
+	cases := []struct {
+		name string
+		tmp  string
+		cp   *compiledPkg
+	}{
+		{"unreadable file", t.TempDir(), &compiledPkg{importPath: "testmod", probeFile: filepath.Join(missingDir, "x.go")}},
+		{"no scratch directory", missingDir, good},
+		{"build fails", t.TempDir(), &compiledPkg{importPath: "testmod/does/not/exist", probeFile: pkgs[0].probeFile}},
+	}
+	for _, c := range cases {
+		if _, err := measureRebuild(context.Background(), dir, BuildOptions{TmpDir: c.tmp}, c.cp); err == nil {
+			t.Errorf("%s: want an error", c.name)
+		}
+	}
+
+	orig := writeFileFunc
+	t.Cleanup(func() { writeFileFunc = orig })
+	boom := errors.New("boom")
+	writeFileFunc = func(string, []byte, os.FileMode) error { return boom }
+	if _, err := measureRebuild(context.Background(), dir, BuildOptions{TmpDir: t.TempDir()}, good); !errors.Is(err, boom) {
+		t.Errorf("write fails: err = %v, want the write's error", err)
+	}
+}
+
+// TestCompileTestBinaryNoScratchDir: a test binary's directory that can't
+// be made fails the compile with the error.
+func TestCompileTestBinaryNoScratchDir(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	_, err := compileTestBinary(context.Background(), t.TempDir(), BuildOptions{TmpDir: missing}, resolvedPkg{importPath: "testmod"})
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("err = %v, want the missing directory's error", err)
+	}
+}
+
+// TestTestDepsError: a go list that can't run is an error, tags and all.
+func TestTestDepsError(t *testing.T) {
+	if _, err := testDeps(context.Background(), filepath.Join(t.TempDir(), "missing"), "mytag", []string{"m/p"}); err == nil {
+		t.Error("testDeps in a missing directory: want an error")
+	}
+}
+
+// TestCheckPkgSkipsTimeout: a check run cut off by its timeout says so.
+func TestCheckPkgSkipsTimeout(t *testing.T) {
+	dir := writeModule(t, hangModule)
+	cp := compileFixture(t, dir, "hangmod")
+	t.Setenv("HANG_MAIN", "1")
+	skipped := []testEntry{{name: "TestQuick", pkg: "hangmod", order: 0}}
+	f, ok := checkPkgSkips(context.Background(), cp, slices.Clone(skipped), skipped, 200*time.Millisecond)
+	if !ok || f.reason != "TestQuick skips when run alone, and running it after the tests listed before it failed: timed out after 200ms" {
+		t.Errorf("checkPkgSkips = (%+v, %v), want the timeout as the reason", f, ok)
+	}
+}
+
 // soloSkipModule's TestCheck skips unless TestSetup ran first, and
 // TestAlways always skips. Run alone, both skip; in package order only
 // TestAlways does.
@@ -945,7 +1010,7 @@ func TestProcessWorkContextCancelledSkipsWork(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // pre-cancel before processWork reads
 
-	processWork(ctx, work, pkgBins, tmpDir, 0, 0, nil, results)
+	processWork(ctx, work, pkgBins, filepath.Join(tmpDir, "p.cov"), 0, nil, results)
 	close(results)
 
 	count := 0

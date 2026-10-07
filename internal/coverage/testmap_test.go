@@ -338,7 +338,7 @@ func TestProcessWorkRecordsDurationOnlyEntries(t *testing.T) {
 	pkgBins := map[string]*compiledPkg{
 		"p": {binPath: "x", importPath: "p", dir: t.TempDir()},
 	}
-	processWork(context.Background(), work, pkgBins, t.TempDir(), 0, 0, nil, results)
+	processWork(context.Background(), work, pkgBins, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	got := 0
@@ -385,7 +385,7 @@ func TestProcessWorkContextCancelled(t *testing.T) {
 	close(work)
 
 	// No compiled packages — cp will be nil, exercising the nil check.
-	processWork(ctx, work, map[string]*compiledPkg{}, t.TempDir(), 0, 0, nil, results)
+	processWork(ctx, work, map[string]*compiledPkg{}, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	// Should complete without hanging.
@@ -402,7 +402,7 @@ func TestProcessWorkNilPkg(t *testing.T) {
 	work <- testEntry{name: "TestA", pkg: "missing"}
 	close(work)
 
-	processWork(ctx, work, map[string]*compiledPkg{}, t.TempDir(), 0, 0, nil, results)
+	processWork(ctx, work, map[string]*compiledPkg{}, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	if len(results) != 0 {
@@ -495,7 +495,7 @@ func TestProcessWorkReturnsImmediatelyOnCancelledCtx(t *testing.T) {
 	pkgBins := map[string]*compiledPkg{
 		"pkg1": {binPath: "x", importPath: "pkg1", dir: t.TempDir()},
 	}
-	processWork(ctx, work, pkgBins, t.TempDir(), 0, 0, nil, results)
+	processWork(ctx, work, pkgBins, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	if got := calls.Load(); got != 0 {
@@ -526,7 +526,7 @@ func TestProcessWorkContinuesPastEmptyBlocks(t *testing.T) {
 	pkgBins := map[string]*compiledPkg{
 		"pkg1": {binPath: "x", importPath: "pkg1", dir: t.TempDir()},
 	}
-	processWork(context.Background(), work, pkgBins, t.TempDir(), 0, 0, nil, results)
+	processWork(context.Background(), work, pkgBins, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	count := 0
@@ -559,7 +559,7 @@ func TestProcessWorkContinuesPastNilCp(t *testing.T) {
 	pkgBins := map[string]*compiledPkg{
 		"pkg1": {binPath: "x", importPath: "pkg1", dir: t.TempDir()},
 	}
-	processWork(context.Background(), work, pkgBins, t.TempDir(), 0, 0, nil, results)
+	processWork(context.Background(), work, pkgBins, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	if got := calls.Load(); got != 1 {
@@ -586,7 +586,7 @@ func TestProcessWorkSkipsEmptyBlocks(t *testing.T) {
 	pkgBins := map[string]*compiledPkg{
 		"pkg1": {binPath: "x", importPath: "pkg1", dir: t.TempDir()},
 	}
-	processWork(context.Background(), work, pkgBins, t.TempDir(), 0, 0, nil, results)
+	processWork(context.Background(), work, pkgBins, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	count := 0
@@ -955,7 +955,7 @@ func TestProcessWorkSkipsAfterEarlierFailure(t *testing.T) {
 	close(work)
 	results := make(chan testCoverage, len(entries))
 	failed := &firstFailures{at: make(map[string]int)}
-	processWork(context.Background(), work, map[string]*compiledPkg{"p": {}, "q": {}}, t.TempDir(), 0, 0, failed, results)
+	processWork(context.Background(), work, map[string]*compiledPkg{"p": {}, "q": {}}, filepath.Join(t.TempDir(), "p.cov"), 0, failed, results)
 	close(results)
 
 	if want := []string{"TestB", "TestA", "TestX"}; !slices.Equal(ran, want) {
@@ -1313,7 +1313,7 @@ func TestProcessWorkForwardsFailures(t *testing.T) {
 	results := make(chan testCoverage, 1)
 	work <- testEntry{name: "TestA", pkg: "pkg1"}
 	close(work)
-	processWork(context.Background(), work, map[string]*compiledPkg{"pkg1": {binPath: "x", importPath: "pkg1", dir: "/pkg1"}}, t.TempDir(), 0, 0, nil, results)
+	processWork(context.Background(), work, map[string]*compiledPkg{"pkg1": {binPath: "x", importPath: "pkg1", dir: "/pkg1"}}, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	got := <-results
@@ -1451,7 +1451,7 @@ func TestProcessWorkForwardsTinyDurations(t *testing.T) {
 	results := make(chan testCoverage, 1)
 	work <- testEntry{name: "TestA", pkg: "pkg1"}
 	close(work)
-	processWork(context.Background(), work, map[string]*compiledPkg{"pkg1": {binPath: "x", importPath: "pkg1"}}, t.TempDir(), 0, 0, nil, results)
+	processWork(context.Background(), work, map[string]*compiledPkg{"pkg1": {binPath: "x", importPath: "pkg1"}}, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
 	if got := <-results; got.testName != "TestA" || got.duration != time.Nanosecond {
@@ -1478,5 +1478,77 @@ func TestCheckSoloSkipsRunFailure(t *testing.T) {
 	if len(got) != 1 || !ok || f.order != 1 ||
 		!strings.HasPrefix(f.reason, "TestB skips when run alone, and running it after the tests listed before it failed: ") {
 		t.Errorf("checkSoloSkips = %+v, want p unmapped at TestB with the run's failure", got)
+	}
+}
+
+// TestRebuildDuration: a nil map has no measurement, and the test helper
+// replaces the measurements wholesale, leaving the map it is called on as
+// it was.
+func TestRebuildDuration(t *testing.T) {
+	if d, ok := (*TestMap)(nil).RebuildDuration("p"); d != 0 || ok {
+		t.Errorf("nil map: RebuildDuration = (%v, %v), want (0, false)", d, ok)
+	}
+	base := NewTestMapForTesting(map[[2]string]time.Duration{{"p", "TestA"}: time.Millisecond}, nil)
+	got := base.WithRebuildsForTesting(map[string]time.Duration{"q": time.Second})
+	if d, ok := got.RebuildDuration("q"); d != time.Second || !ok {
+		t.Errorf("RebuildDuration(q) = (%v, %v), want (1s, true)", d, ok)
+	}
+	if _, ok := got.RebuildDuration("p"); ok {
+		t.Error("RebuildDuration(p) measured, want the helper's map to replace the fixture's")
+	}
+	if _, ok := base.RebuildDuration("p"); !ok {
+		t.Error("the helper changed the map it was called on")
+	}
+}
+
+// TestBuildTestMapSkipsSoloSkipCheckForUnmapped: a package unmapped by a
+// failure isn't checked for solo skips, so the failure stays its reason.
+func TestBuildTestMapSkipsSoloSkipCheckForUnmapped(t *testing.T) {
+	stubBuildTestMapDeps(t, []testEntry{{name: "TestA", pkg: "p", order: 0}, {name: "TestB", pkg: "p", order: 1}}, []resolvedPkg{{importPath: "p", dir: t.TempDir()}})
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, name, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
+		if name == "TestA" {
+			return nil, time.Millisecond, true, nil
+		}
+		return nil, time.Millisecond, false, errors.New("TestB failed when run alone")
+	}
+	orig := checkSoloSkipsFunc
+	t.Cleanup(func() { checkSoloSkipsFunc = orig })
+	var checked map[string][]testEntry
+	checkSoloSkipsFunc = func(_ context.Context, _ map[string]*compiledPkg, _ []testEntry, skips map[string][]testEntry, _ time.Duration, _ int) map[string]soloSkipFailure {
+		checked = skips
+		return nil
+	}
+
+	tm, err := BuildTestMap(context.Background(), "", []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
+	if err != nil {
+		t.Fatalf("BuildTestMap: %v", err)
+	}
+	if len(checked) != 0 {
+		t.Errorf("checked %v for solo skips, want nothing: p is already unmapped", checked)
+	}
+	if got := tm.Unmapped(); len(got) != 1 || got[0].Reason != "TestB failed when run alone" {
+		t.Errorf("Unmapped() = %+v, want p with TestB's failure", got)
+	}
+}
+
+// TestBuildTestMapCancelledDuringSoloSkipCheck: a cancellation while the
+// solo skips are checked returns the cancellation, not a map that may be
+// missing their verdict.
+func TestBuildTestMapCancelledDuringSoloSkipCheck(t *testing.T) {
+	stubBuildTestMapDeps(t, []testEntry{{name: "TestA", pkg: "p"}}, []resolvedPkg{{importPath: "p", dir: t.TempDir()}})
+	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, bool, error) {
+		return nil, time.Millisecond, true, nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	orig := checkSoloSkipsFunc
+	t.Cleanup(func() { checkSoloSkipsFunc = orig })
+	checkSoloSkipsFunc = func(context.Context, map[string]*compiledPkg, []testEntry, map[string][]testEntry, time.Duration, int) map[string]soloSkipFailure {
+		cancel()
+		return nil
+	}
+
+	if tm, err := BuildTestMap(ctx, "", []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1}); !errors.Is(err, context.Canceled) || tm != nil {
+		t.Errorf("BuildTestMap = (%v, %v), want (nil, context.Canceled)", tm, err)
 	}
 }
