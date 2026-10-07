@@ -222,10 +222,11 @@ func TestListBinTestsErrorIncludesStderr(t *testing.T) {
 	}
 }
 
-// TestListBinTestsRejectsGluedOutput: a TestMain that prints without a
+// TestListBinTestsDropsGluedName: a TestMain that prints without a
 // trailing newline glues its output onto the first test name, losing that
-// test, so the listing must not be trusted.
-func TestListBinTestsRejectsGluedOutput(t *testing.T) {
+// test; the rest still list. The lost test's package suite still decides
+// every verdict (see SuitePkgs).
+func TestListBinTestsDropsGluedName(t *testing.T) {
 	dir := writeModule(t, map[string]string{
 		"go.mod": "module gluemod\n\ngo 1.26\n",
 		"lib_test.go": `package gluemod
@@ -249,24 +250,23 @@ func TestTwo(t *testing.T) {}
 	cp := compileFixture(t, dir, "gluemod")
 
 	names, err := listBinTests(context.Background(), cp, 0)
-	if err == nil || !strings.Contains(err.Error(), `"partialTestOne"`) {
-		t.Errorf("listBinTests = (%v, %v), want an error quoting the glued line", names, err)
+	if err != nil || !slices.Equal(names, []string{"TestTwo"}) {
+		t.Errorf("listBinTests = (%v, %v), want only TestTwo", names, err)
 	}
 }
 
-// TestBuildTestMapUnmapsUnlistablePackage: a binary that refuses to list
-// leaves its package unmapped, with the binary's message as the reason,
-// instead of failing the whole map.
-func TestBuildTestMapUnmapsUnlistablePackage(t *testing.T) {
+// TestBuildTestMapKeepsUnlistablePackage: a binary that refuses to list
+// maps none of its tests but keeps its package's suite in scope, instead
+// of failing the whole map.
+func TestBuildTestMapKeepsUnlistablePackage(t *testing.T) {
 	dir := writeModule(t, cwdListModule)
 
 	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
-	got := tm.Unmapped()
-	if len(got) != 1 || got[0].ImportPath != "cwdlist" || !strings.Contains(got[0].Reason, "listing refused") {
-		t.Errorf("Unmapped() = %+v, want cwdlist with the listing's reason", got)
+	if got := importPaths(tm.SuitePkgs("cwdlist")); !slices.Equal(got, []string{"cwdlist"}) || len(tm.index) != 0 {
+		t.Errorf("SuitePkgs(cwdlist) = %v with %d lines mapped, want cwdlist with none", got, len(tm.index))
 	}
 }
 
@@ -305,19 +305,18 @@ func TestRunCompiledTestTimeout(t *testing.T) {
 	cp := compileFixture(t, dir, "hangmod")
 
 	var (
-		blocks  []Block
-		dur     time.Duration
-		skipped bool
-		err     error
+		blocks []Block
+		dur    time.Duration
+		err    error
 	)
 	runWithDeadline(t, 30*time.Second, func() {
-		blocks, dur, skipped, err = runCompiledTest(context.Background(), cp, "TestHang", filepath.Join(t.TempDir(), "hang.cov"), 200*time.Millisecond)
+		blocks, dur, err = runCompiledTest(context.Background(), cp, "TestHang", filepath.Join(t.TempDir(), "hang.cov"), 200*time.Millisecond)
 	})
-	if blocks != nil || skipped {
-		t.Errorf("a killed run returned %d blocks, skipped %v; want none", len(blocks), skipped)
+	if blocks != nil {
+		t.Errorf("a killed run returned %d blocks; want none", len(blocks))
 	}
-	if err == nil || err.Error() != "TestHang timed out after 200ms when run alone" {
-		t.Errorf("err = %v, want the timeout reason", err)
+	if !errors.Is(err, errSoloTimeout) || err.Error() != "TestHang: timed out when run alone after 200ms" {
+		t.Errorf("err = %v, want the timeout reason wrapping errSoloTimeout", err)
 	}
 	if dur < 200*time.Millisecond {
 		t.Errorf("duration %v is shorter than the timeout that cut the run off", dur)
@@ -445,10 +444,10 @@ func TestBuildTestMapContextCancelled(t *testing.T) {
 	}
 	stubBuildTestMapDeps(t, tests, []resolvedPkg{{importPath: "testmod", dir: t.TempDir()}})
 	var ran int32
-	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, bool, error) {
+	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, error) {
 		atomic.AddInt32(&ran, 1)
 		cancel()
-		return nil, time.Millisecond, false, nil
+		return nil, time.Millisecond, nil
 	}
 
 	var (
@@ -469,10 +468,7 @@ func TestListTests(t *testing.T) {
 	dir := setupTestProject(t)
 	cp := compileFixture(t, dir, "testmod")
 
-	tests, unmapped := listTests(context.Background(), map[string]*compiledPkg{"testmod": cp}, 0, 1)
-	if len(unmapped) > 0 {
-		t.Fatalf("listTests: %v", unmapped)
-	}
+	tests := listTests(context.Background(), map[string]*compiledPkg{"testmod": cp}, 0, 1)
 
 	if len(tests) != 2 {
 		t.Fatalf("expected 2 tests, got %d", len(tests))
@@ -550,10 +546,10 @@ func writeTwoPkgModule(t *testing.T) string {
 func TestListTestsKeysByImportPath(t *testing.T) {
 	dir := writeTwoPkgModule(t)
 	want := []testEntry{
-		{name: "TestOnlyA", pkg: "twopkg/a", order: 1},
-		{name: "TestOnlySub", pkg: "twopkg/sub", order: 1},
-		{name: "TestShared", pkg: "twopkg/a", order: 0},
-		{name: "TestShared", pkg: "twopkg/sub", order: 0},
+		{name: "TestOnlyA", pkg: "twopkg/a"},
+		{name: "TestOnlySub", pkg: "twopkg/sub"},
+		{name: "TestShared", pkg: "twopkg/a"},
+		{name: "TestShared", pkg: "twopkg/sub"},
 	}
 	for _, patterns := range [][]string{{"./..."}, {"./...", "./sub"}} {
 		pkgs, err := resolvePackages(context.Background(), dir, patterns, "")
@@ -564,10 +560,7 @@ func TestListTestsKeysByImportPath(t *testing.T) {
 		if len(failures) > 0 {
 			t.Fatalf("buildPkgBins(%v): %v", patterns, failures)
 		}
-		got, unmapped := listTests(context.Background(), bins, 0, 2)
-		if len(unmapped) > 0 {
-			t.Fatalf("listTests(%v): %v", patterns, unmapped)
-		}
+		got := listTests(context.Background(), bins, 0, 2)
 		slices.SortFunc(got, func(x, y testEntry) int {
 			return strings.Compare(x.name+"\x00"+x.pkg, y.name+"\x00"+y.pkg)
 		})
@@ -577,14 +570,12 @@ func TestListTestsKeysByImportPath(t *testing.T) {
 	}
 }
 
-// TestListTestsFailure: a binary that can't be listed comes back unmapped
-// with the reason, rather than failing the listing or silently dropping
-// its package's tests.
+// TestListTestsFailure: a binary that can't be listed lists no tests,
+// rather than failing the listing.
 func TestListTestsFailure(t *testing.T) {
 	bins := map[string]*compiledPkg{"gone": {binPath: "/nonexistent/absolutely/not/a/binary", importPath: "gone", dir: t.TempDir()}}
-	tests, unmapped := listTests(context.Background(), bins, 0, 1)
-	if len(tests) != 0 || !strings.HasPrefix(unmapped["gone"], "listing its tests failed") {
-		t.Fatalf("listTests = %+v, unmapped %v; want no tests and gone unmapped", tests, unmapped)
+	if tests := listTests(context.Background(), bins, 0, 1); len(tests) != 0 {
+		t.Fatalf("listTests = %+v, want no tests", tests)
 	}
 }
 
@@ -754,73 +745,25 @@ func TestCompileTestBinaryNoScratchDir(t *testing.T) {
 
 // TestTestDepsError: a go list that can't run is an error, tags and all.
 func TestTestDepsError(t *testing.T) {
-	if _, err := testDeps(context.Background(), filepath.Join(t.TempDir(), "missing"), "mytag", []string{"m/p"}); err == nil {
+	if _, err := testDeps(context.Background(), filepath.Join(t.TempDir(), "missing"), BuildOptions{Tags: "mytag"}, []string{"m/p"}); err == nil {
 		t.Error("testDeps in a missing directory: want an error")
 	}
 }
 
-// TestCheckPkgSkipsTimeout: a check run cut off by its timeout says so.
-func TestCheckPkgSkipsTimeout(t *testing.T) {
-	dir := writeModule(t, hangModule)
-	cp := compileFixture(t, dir, "hangmod")
-	t.Setenv("HANG_MAIN", "1")
-	skipped := []testEntry{{name: "TestQuick", pkg: "hangmod", order: 0}}
-	f, ok := checkPkgSkips(context.Background(), cp, slices.Clone(skipped), skipped, 200*time.Millisecond)
-	if !ok || f.reason != "TestQuick skips when run alone, and running it after the tests listed before it failed: timed out after 200ms" {
-		t.Errorf("checkPkgSkips = (%+v, %v), want the timeout as the reason", f, ok)
-	}
-}
-
-// soloSkipModule's TestCheck skips unless TestSetup ran first, and
-// TestAlways always skips. Run alone, both skip; in package order only
-// TestAlways does.
-var soloSkipModule = map[string]string{
-	"go.mod": "module skipmod\n\ngo 1.26\n",
-	"lib.go": "package skipmod\n\nvar ready bool\n\nfunc Setup() { ready = true }\n\nfunc Check() bool { return ready }\n",
-	"lib_test.go": `package skipmod
-
-import "testing"
-
-func TestSetup(t *testing.T) { Setup() }
-
-func TestCheck(t *testing.T) {
-	if !ready {
-		t.Skip("not set up")
-	}
-	if !Check() {
-		t.Fatal("not ready")
-	}
-}
-
-func TestAlways(t *testing.T) { t.Skip("never runs") }
-`,
-}
-
-// TestBuildTestMapUnmapsOrderDependentSkips: a test that skips alone but
-// not after the tests listed before it unmaps its package; a test that
-// skips either way leaves it mapped.
-func TestBuildTestMapUnmapsOrderDependentSkips(t *testing.T) {
-	dir := writeModule(t, soloSkipModule)
-	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 2})
-	if err != nil {
-		t.Fatalf("BuildTestMap: %v", err)
-	}
-	got := tm.Unmapped()
-	if len(got) != 1 || got[0].Reason != "TestCheck skips when run alone but not after the tests listed before it" {
-		t.Errorf("Unmapped() = %+v, want skipmod with TestCheck's skip", got)
-	}
-
-	dir = writeModule(t, map[string]string{
+// TestBuildTestMapMeasuresRebuild: a real build measures each package's
+// rebuild, and a test that always skips maps nothing.
+func TestBuildTestMapMeasuresRebuild(t *testing.T) {
+	dir := writeModule(t, map[string]string{
 		"go.mod":      "module skipmod\n\ngo 1.26\n",
 		"lib.go":      "package skipmod\n\nfunc F() int { return 1 }\n",
 		"lib_test.go": "package skipmod\n\nimport \"testing\"\n\nfunc TestF(t *testing.T) { F() }\n\nfunc TestAlways(t *testing.T) { t.Skip(\"never runs\") }\n",
 	})
-	tm, err = BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 2})
+	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 2})
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
-	if got := tm.Unmapped(); len(got) != 0 {
-		t.Errorf("a test that always skips: Unmapped() = %+v, want none", got)
+	if got := tm.TestsFor("skipmod/lib.go", 3); !slices.Equal(got, []string{"TestF"}) {
+		t.Errorf("TestsFor(lib.go:3) = %v, want only TestF", got)
 	}
 	if _, ok := tm.RebuildDuration("skipmod"); !ok {
 		t.Error("RebuildDuration(skipmod) unmeasured, want the probe's measurement")
@@ -997,6 +940,27 @@ func TestBuildTestMapNoTestsPkg(t *testing.T) {
 	}
 }
 
+// TestRunCompiledTestRemovesPreviousProfile: a binary that exits 0
+// without writing a profile — its TestMain exits before m.Run — must not
+// read as having covered what the worker's previous run did, whose
+// profile sat at the same path.
+func TestRunCompiledTestRemovesPreviousProfile(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"go.mod":      "module exitmod\n\ngo 1.26\n",
+		"lib.go":      "package exitmod\n\nfunc F() int { return 1 }\n",
+		"lib_test.go": "package exitmod\n\nimport (\n\t\"os\"\n\t\"testing\"\n)\n\nfunc TestMain(m *testing.M) { os.Exit(0) }\n\nfunc TestF(t *testing.T) { F() }\n",
+	})
+	cp := compileFixture(t, dir, "exitmod")
+	profilePath := filepath.Join(t.TempDir(), "worker.cov")
+	if err := os.WriteFile(profilePath, []byte("mode: set\nexitmod/lib.go:3.1,3.30 1 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	blocks, _, err := runCompiledTest(context.Background(), cp, "TestF", profilePath, 0)
+	if blocks != nil || err == nil || !strings.Contains(err.Error(), "reading its coverage profile") {
+		t.Errorf("runCompiledTest = (%d blocks, %v), want no blocks and the missing profile's error", len(blocks), err)
+	}
+}
+
 // TestRunCompiledTestStaleProfileNotReturned kills BRANCH_IF on
 // runCompiledTest's `if err := cmd.Run(); err != nil { return nil }`.
 // We pre-seed the profile path with valid coverage data, then hand in a
@@ -1018,7 +982,7 @@ func TestRunCompiledTestStaleProfileNotReturned(t *testing.T) {
 		importPath: "testmod",
 		dir:        tmpDir,
 	}
-	blocks, _, _, _ := runCompiledTest(ctx, cp, "TestAnything", profilePath, 0)
+	blocks, _, _ := runCompiledTest(ctx, cp, "TestAnything", profilePath, 0)
 	if blocks != nil {
 		t.Errorf("cmd.Run failed but got %d blocks from stale profile — BRANCH_IF on the err check lets it through", len(blocks))
 	}
@@ -1106,9 +1070,9 @@ func TestRunCompiledTestFailure(t *testing.T) {
 	}
 
 	profilePath := filepath.Join(tmpDir, "test.cov")
-	blocks, dur, skipped, err := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
-	if blocks != nil || skipped {
-		t.Errorf("expected nil blocks and no skip for failed test binary, got %d blocks, skipped %v", len(blocks), skipped)
+	blocks, dur, err := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
+	if blocks != nil {
+		t.Errorf("expected nil blocks for failed test binary, got %d blocks", len(blocks))
 	}
 	if err == nil || !strings.HasPrefix(err.Error(), "TestAdd failed when run alone: ") || !errors.Is(err, fs.ErrNotExist) {
 		t.Errorf("err = %v, want the failed-alone reason wrapping the start error", err)
@@ -1131,9 +1095,9 @@ func TestRunCompiledTestParseError(t *testing.T) {
 	defer func() { parseFileFunc = origParse }()
 
 	profilePath := filepath.Join(tmpDir, "test.cov")
-	blocks, dur, skipped, err := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
-	if blocks != nil || skipped {
-		t.Errorf("expected nil blocks and no skip when ParseFile fails, got %d blocks, skipped %v", len(blocks), skipped)
+	blocks, dur, err := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
+	if blocks != nil {
+		t.Errorf("expected nil blocks when ParseFile fails, got %d blocks", len(blocks))
 	}
 	if err == nil || err.Error() != "TestAdd: reading its coverage profile: injected parse error" || !errors.Is(err, parseErr) {
 		t.Errorf("err = %v, want the unreadable-profile reason wrapping the parse error", err)
@@ -1149,7 +1113,7 @@ func TestRunCompiledTestBadProfile(t *testing.T) {
 	// Use a directory as the profile path — go test will fail to write to it.
 	profileDir := filepath.Join(tmpDir, "profdir")
 	os.MkdirAll(profileDir, 0o755)
-	blocks, _, _, _ := runCompiledTest(ctx, cp, "TestAdd", profileDir, 0)
+	blocks, _, _ := runCompiledTest(ctx, cp, "TestAdd", profileDir, 0)
 	// cmd.Run fails because -test.coverprofile can't write to a directory.
 	if blocks != nil {
 		t.Logf("blocks=%d (expected nil or empty)", len(blocks))
@@ -1160,7 +1124,7 @@ func TestRunCompiledTest(t *testing.T) {
 	ctx, cp, tmpDir := compileTestmodBinary(t)
 
 	profilePath := filepath.Join(tmpDir, "test.cov")
-	blocks, dur, _, err := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
+	blocks, dur, err := runCompiledTest(ctx, cp, "TestAdd", profilePath, 0)
 	if len(blocks) == 0 || err != nil {
 		t.Errorf("expected coverage blocks and no error from TestAdd, got %d blocks, err %v", len(blocks), err)
 	}
@@ -1169,7 +1133,7 @@ func TestRunCompiledTest(t *testing.T) {
 	}
 
 	// Running a non-existent test should return nil/empty blocks.
-	blocks, _, _, _ = runCompiledTest(ctx, cp, "TestNonExistent", profilePath, 0)
+	blocks, _, _ = runCompiledTest(ctx, cp, "TestNonExistent", profilePath, 0)
 	_ = blocks
 }
 
@@ -1194,24 +1158,26 @@ func TestNeedsSetup(t *testing.T) {
 `,
 }
 
-// TestBuildTestMapUnmapsOrderDependentPackage is the end-to-end gate for a
-// test that fails when run alone: it has no coverage, so routing mutants
-// to the package's other tests could skip it. The package is unmapped with
-// the reason instead, and the test that passes alone is still indexed.
-func TestBuildTestMapUnmapsOrderDependentPackage(t *testing.T) {
+// TestBuildTestMapLeavesOutOrderDependentTest is the end-to-end gate for a
+// test that fails when run alone: routing a mutant to it alone would fail
+// with or without the mutant, so it is left out of the map, timing and
+// all, while the test that passes alone is still indexed. The package's
+// suite still decides every survivor's verdict (see SuitePkgs).
+func TestBuildTestMapLeavesOutOrderDependentTest(t *testing.T) {
 	dir := writeModule(t, orderModule)
 
 	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 2})
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
-	got := tm.Unmapped()
-	if len(got) != 1 || got[0].ImportPath != "ordermod" || got[0].Dir != dir ||
-		!strings.HasPrefix(got[0].Reason, "TestNeedsSetup failed when run alone") {
-		t.Errorf("Unmapped() = %+v, want ordermod unmapped by TestNeedsSetup", got)
-	}
 	if tests := tm.TestsFor("ordermod/lib.go", 3); !slices.Equal(tests, []string{"TestSetup"}) {
 		t.Errorf("TestsFor(lib.go:3) = %v, want [TestSetup]", tests)
+	}
+	if _, ok := tm.SumDurationsFor("ordermod", []string{"TestNeedsSetup"}); ok {
+		t.Error("TestNeedsSetup has a timing, want it left out of the map")
+	}
+	if got := tm.SuitePkgs("ordermod"); !slices.Equal(got, []Package{{ImportPath: "ordermod", Dir: dir}}) {
+		t.Errorf("SuitePkgs(ordermod) = %+v, want ordermod in %s", got, dir)
 	}
 }
 
@@ -1252,16 +1218,14 @@ func TestShort(t *testing.T) {
 
 // TestBuildTestMapForwardsTestFlags is the end-to-end gate for test flags:
 // -short and a custom flag after -args reach the listing and the per-test
-// run, so the package maps normally. Without them it can't be listed.
+// run, so the package maps normally. Without them it can't be listed and
+// maps nothing.
 func TestBuildTestMapForwardsTestFlags(t *testing.T) {
 	dir := writeModule(t, flagModule)
 
 	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1, TestFlags: []string{"-short", "-args", "-need"}})
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
-	}
-	if got := tm.Unmapped(); len(got) != 0 {
-		t.Errorf("Unmapped() = %+v, want none with the flags forwarded", got)
 	}
 	if tests := tm.TestsFor("flagmod/lib.go", 3); !slices.Equal(tests, []string{"TestShort"}) {
 		t.Errorf("TestsFor(lib.go:3) = %v, want [TestShort]", tests)
@@ -1275,9 +1239,6 @@ func TestBuildTestMapForwardsTestFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildTestMap with a custom flag: %v", err)
 	}
-	if got := tm.Unmapped(); len(got) != 0 {
-		t.Errorf("custom flag: Unmapped() = %+v, want none", got)
-	}
 	if tests := tm.TestsFor("flagmod/lib.go", 3); !slices.Equal(tests, []string{"TestShort"}) {
 		t.Errorf("custom flag: TestsFor(lib.go:3) = %v, want [TestShort]", tests)
 	}
@@ -1286,8 +1247,8 @@ func TestBuildTestMapForwardsTestFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildTestMap without flags: %v", err)
 	}
-	if got := tm.Unmapped(); len(got) != 1 || !strings.Contains(got[0].Reason, "missing -need") {
-		t.Errorf("without flags: Unmapped() = %+v, want flagmod unlistable", got)
+	if tests := tm.TestsFor("flagmod/lib.go", 3); len(tests) != 0 {
+		t.Errorf("without flags: TestsFor(lib.go:3) = %v, want none: the binary can't be listed", tests)
 	}
 }
 
@@ -1315,7 +1276,7 @@ func TestRunCompiledTestArgsComeFirst(t *testing.T) {
 	ctx, cp, tmpDir := compileTestmodBinary(t)
 	cp.testArgs = []string{"positional"}
 
-	blocks, _, _, err := runCompiledTest(ctx, cp, "TestAdd", filepath.Join(tmpDir, "pos.cov"), 0)
+	blocks, _, err := runCompiledTest(ctx, cp, "TestAdd", filepath.Join(tmpDir, "pos.cov"), 0)
 	if err != nil || len(blocks) == 0 {
 		t.Errorf("runCompiledTest = (%d blocks, %v), want coverage with a positional test arg", len(blocks), err)
 	}
@@ -1357,7 +1318,8 @@ func TestTestBinaryArgsForwardsTags(t *testing.T) {
 
 // TestTestDeps reads real `go list -test` output: an external test
 // package's imports count, a package recompiled for the test is reported
-// under its own import path, and an unrelated package is not linked.
+// under its own import path, an unrelated package is not linked, and a
+// test file the build flags among the test flags add brings its imports.
 func TestTestDeps(t *testing.T) {
 	dir := writeModule(t, map[string]string{
 		"go.mod":          "module depmod\n\ngo 1.26\n",
@@ -1366,8 +1328,9 @@ func TestTestDeps(t *testing.T) {
 		"q/q.go":          "package q\n\nfunc G() int { return 2 }\n",
 		"e/e.go":          "package e\n",
 		"e/e_ext_test.go": "package e_test\n\nimport (\n\t\"testing\"\n\n\t\"depmod/p\"\n)\n\nfunc TestE(t *testing.T) { p.F() }\n",
+		"p/q_test.go":     "//go:build integration\n\npackage p\n\nimport (\n\t\"testing\"\n\n\t\"depmod/q\"\n)\n\nfunc TestQ(t *testing.T) { q.G() }\n",
 	})
-	deps, err := testDeps(context.Background(), dir, "", []string{"depmod/e", "depmod/p"})
+	deps, err := testDeps(context.Background(), dir, BuildOptions{}, []string{"depmod/e", "depmod/p"})
 	if err != nil {
 		t.Fatalf("testDeps: %v", err)
 	}
@@ -1380,13 +1343,17 @@ func TestTestDeps(t *testing.T) {
 	if len(deps) != 2 {
 		t.Errorf("deps has %d packages, want e and p only", len(deps))
 	}
+	deps, err = testDeps(context.Background(), dir, BuildOptions{TestFlags: []string{"-run", "X", "-tags=integration", "-custom"}}, []string{"depmod/p"})
+	if err != nil || !deps["depmod/p"]["depmod/q"] {
+		t.Errorf("-tags=integration among the test flags: testDeps = (%v, %v), want p to link q", deps, err)
+	}
 
 	gated := writeModule(t, map[string]string{
 		"go.mod":    "module gated\n\ngo 1.26\n",
 		"g.go":      "//go:build mytag\n\npackage gated\n",
 		"g_test.go": "//go:build mytag\n\npackage gated\n\nimport \"testing\"\n\nfunc TestG(t *testing.T) {}\n",
 	})
-	if deps, err := testDeps(context.Background(), gated, "mytag", []string{"gated"}); err != nil || !deps["gated"]["gated"] {
+	if deps, err := testDeps(context.Background(), gated, BuildOptions{Tags: "mytag"}, []string{"gated"}); err != nil || !deps["gated"]["gated"] {
 		t.Errorf("tags=mytag: testDeps = (%v, %v), want gated's links", deps, err)
 	}
 }
@@ -1407,9 +1374,6 @@ func TestBuildTestMapKeepsCollidingBinariesApart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
-	if got := tm.Unmapped(); len(got) != 0 {
-		t.Errorf("Unmapped() = %+v, want none", got)
-	}
 	for file, want := range map[string]TestRef{
 		"m/api_v1/a.go": {Pkg: "m/api_v1", Name: "TestA"},
 		"m/api/v1/b.go": {Pkg: "m/api/v1", Name: "TestB"},
@@ -1417,31 +1381,5 @@ func TestBuildTestMapKeepsCollidingBinariesApart(t *testing.T) {
 		if got := tm.TestRefsFor(file, 3); !slices.Equal(got, []TestRef{want}) {
 			t.Errorf("TestRefsFor(%s:3) = %+v, want [%+v]", file, got, want)
 		}
-	}
-}
-
-// orderSkipModule: TestB always skips, and TestC, listed after it, fails.
-var orderSkipModule = map[string]string{
-	"go.mod":      "module ordermod\n\ngo 1.26\n",
-	"lib.go":      "package ordermod\n",
-	"lib_test.go": "package ordermod\n\nimport \"testing\"\n\nfunc TestA(t *testing.T) {}\n\nfunc TestB(t *testing.T) { t.Skip(\"always\") }\n\nfunc TestC(t *testing.T) { t.Fatal(\"fails\") }\n",
-}
-
-// TestCheckSoloSkipsRunsOnlyUpToTheSkip: the check runs the tests listed
-// up to the last one that skipped alone — those before it included, even
-// handed over out of order — and nothing after it, so a later test's
-// failure doesn't read as the skip's.
-func TestCheckSoloSkipsRunsOnlyUpToTheSkip(t *testing.T) {
-	dir := writeModule(t, orderSkipModule)
-	cp := compileFixture(t, dir, "ordermod")
-	tests := []testEntry{
-		{name: "TestC", pkg: "ordermod", order: 2},
-		{name: "TestB", pkg: "ordermod", order: 1},
-		{name: "TestA", pkg: "ordermod", order: 0},
-		{name: "TestZ", pkg: "other", order: 0},
-	}
-	skips := map[string][]testEntry{"ordermod": {tests[1]}}
-	if got := checkSoloSkips(context.Background(), map[string]*compiledPkg{"ordermod": cp}, tests, skips, 0, 1); len(got) != 0 {
-		t.Errorf("checkSoloSkips = %+v, want no failure", got)
 	}
 }

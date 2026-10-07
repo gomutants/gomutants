@@ -62,7 +62,13 @@ import (
 //	    //go:embed dimension in the same version: a v7 profile recorded
 //	    before it simply mismatches and is recomputed, which is why this
 //	    framing change rides on v7 rather than a bump of its own.
-const SchemaVersion = 7
+//	v8: LIVED means the mutant survived every test suite that can kill it,
+//	    not just the tests the coverage map routed it to, which could miss
+//	    a test that covers the line only after another test has run. v7
+//	    LIVED entries can be such false survivors. With -coverpkg the
+//	    tests dimension now spans every package whose tests link the
+//	    mutant's, as all of them decide a LIVED verdict.
+const SchemaVersion = 8
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path

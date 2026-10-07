@@ -117,4 +117,9 @@ type Mutant struct {
 	// serialized to the JSON report. Used by report.Generate to count
 	// MutantsCached without changing the gremlins-compatible schema.
 	FromCache bool
+	// Rechecked marks a mutant its covering tests didn't kill that was
+	// then run against the whole test suites its verdict rests on (see
+	// runner.Worker.Test). In-memory only, like FromCache; report.Generate
+	// counts it.
+	Rechecked bool
 }

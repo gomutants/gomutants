@@ -294,6 +294,11 @@ func TestAdd(t *testing.T) {
 	if result.Status != mutator.StatusLived {
 		t.Errorf("Status=%v, want LIVED", result.Status)
 	}
+	// With no coverage map the routed run was the whole package, so there
+	// is nothing to re-check.
+	if result.Rechecked {
+		t.Error("Rechecked=true, want false: the routed run already ran the whole package")
+	}
 	// The all-lived tail must still stamp Duration — STATEMENT_REMOVE on
 	// `m.Duration = time.Since(start)` would leave it at zero.
 	if result.Duration <= 0 {
@@ -1040,7 +1045,7 @@ func TestTestInvocationsTestFlags(t *testing.T) {
 		policy:      TimeoutPolicy{Global: time.Second},
 		overlayPath: "/tmp/o.json",
 	}
-	invs := w.testInvocations(mutator.Mutant{Pkg: "mymod"}, false, time.Second)
+	invs := w.routedInvocations(mutator.Mutant{Pkg: "mymod"}, false, time.Second)
 	if len(invs) != 1 {
 		t.Fatalf("want 1 invocation with no testMap, got %d: %v", len(invs), invs)
 	}
@@ -1066,7 +1071,7 @@ func TestTestInvocationsTestFlagsTrailPackage(t *testing.T) {
 		}),
 	}
 	m := mutator.Mutant{Pkg: "mymod", CoverageFile: "add.go", Line: 3}
-	invs := w.testInvocations(m, false, time.Second)
+	invs := w.routedInvocations(m, false, time.Second)
 	if len(invs) != 2 {
 		t.Fatalf("want one invocation per covering package, got %d: %v", len(invs), invs)
 	}
@@ -1408,7 +1413,7 @@ func TestCompileErrorRegex(t *testing.T) {
 // failing the test if routing produced any other number.
 func onlyInvocation(t *testing.T, w *Worker, m mutator.Mutant, short bool, timeout time.Duration) []string {
 	t.Helper()
-	invs := w.testInvocations(m, short, timeout)
+	invs := w.routedInvocations(m, short, timeout)
 	if len(invs) != 1 {
 		t.Fatalf("got %d invocations, want 1: %v", len(invs), invs)
 	}

@@ -818,7 +818,6 @@ func run(ctx context.Context, args []string) error {
 		term.PhaseDone("skipped (will run all tests per mutant)")
 	} else {
 		term.PhaseDone("done")
-		warnUnmapped(stderr, testMap.Unmapped())
 	}
 
 	// 7a. Apply incremental-analysis cache (opt-in via --cache). Hits
@@ -1300,13 +1299,13 @@ func testFilesResolver(testIndex *cache.TestIndex, testMap *coverage.TestMap, cr
 		}
 		dir := filepath.Dir(m.File)
 		files := testIndex.CoveringFiles(dir, names, crossPkg)
-		// A package the map couldn't cover test by test runs in full for
-		// this mutant, so every file of it decides the verdict. The own
+		// A survivor is re-checked against every package suite that can
+		// kill it, so every file of them decides the verdict. The own
 		// package is skipped for the reason CoveringFiles skips it: its
 		// sources are already the production dimension.
-		for _, u := range testMap.FullRunPkgs(m.Pkg) {
-			if u.Dir != dir {
-				files = append(files, testIndex.PackageFiles(u.Dir)...)
+		for _, p := range testMap.SuitePkgs(m.Pkg) {
+			if p.Dir != dir {
+				files = append(files, testIndex.PackageFiles(p.Dir)...)
 			}
 		}
 		return files
@@ -1321,26 +1320,6 @@ func coverageTestFlags(userFlags []string, short bool) []string {
 		return append([]string{"-short"}, userFlags...)
 	}
 	return userFlags
-}
-
-// maxUnmappedListed caps the packages warnUnmapped names one by one.
-const maxUnmappedListed = 5
-
-// warnUnmapped names the packages the per-test map couldn't cover test by
-// test. Their tests run in full for every mutant they may cover: slower,
-// but routing to a subset could skip the killing test.
-func warnUnmapped(w io.Writer, pkgs []coverage.UnmappedPkg) {
-	if len(pkgs) == 0 {
-		return
-	}
-	fmt.Fprintf(w, "warning: per-test routing is off for %d package(s); their tests run in full:\n", len(pkgs))
-	for i, u := range pkgs {
-		if i == maxUnmappedListed {
-			fmt.Fprintf(w, "  ... and %d more\n", len(pkgs)-maxUnmappedListed)
-			break
-		}
-		fmt.Fprintf(w, "  %s: %s\n", u.ImportPath, u.Reason)
-	}
 }
 
 // integrationScope computes the reverse-dependency closure of the target

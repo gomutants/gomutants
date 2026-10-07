@@ -189,36 +189,14 @@ func TestTestMapSumDurationsFor(t *testing.T) {
 	}
 }
 
-func TestTestMapPackageDuration(t *testing.T) {
-	tm := &TestMap{
-		pkgDurations: map[string]time.Duration{
-			"p": 500 * time.Millisecond,
-			"q": time.Second,
-		},
-	}
-
-	if got := tm.PackageDuration("p"); got != 500*time.Millisecond {
-		t.Errorf("PackageDuration(p) = %v, want 500ms", got)
-	}
-	if got := tm.PackageDuration("missing"); got != 0 {
-		t.Errorf("PackageDuration(missing) = %v, want 0", got)
-	}
-
-	var nilTm *TestMap
-	if got := nilTm.PackageDuration("p"); got != 0 {
-		t.Errorf("nil.PackageDuration = %v, want 0", got)
-	}
-}
-
 // TestTestMapIngestResultUpdatesBothMaps kills STATEMENT_REMOVE on the
 // recordDuration call inside the BuildTestMap collect loop. Without
 // this assertion any path that drops the duration recording would be
 // invisible — the index map still gets populated by addBlocks.
 func TestTestMapIngestResultUpdatesBothMaps(t *testing.T) {
 	tm := &TestMap{
-		index:        map[string]map[testKey]bool{},
-		durations:    map[testKey]time.Duration{},
-		pkgDurations: map[string]time.Duration{},
+		index:     map[string]map[testKey]bool{},
+		durations: map[testKey]time.Duration{},
 	}
 	tm.ingestResult(testCoverage{
 		pkg:      "p",
@@ -232,21 +210,17 @@ func TestTestMapIngestResultUpdatesBothMaps(t *testing.T) {
 	if got := tm.durations[testKey{pkg: "p", name: "TestA"}]; got != 25*time.Millisecond {
 		t.Errorf("durations not populated by ingestResult; got %v want 25ms — STATEMENT_REMOVE on the recordDuration call would zero this", got)
 	}
-	if got := tm.pkgDurations["p"]; got != 25*time.Millisecond {
-		t.Errorf("pkgDurations not populated; got %v want 25ms", got)
-	}
 	if !tm.index["f.go:5"][testKey{pkg: "p", name: "TestA"}] {
 		t.Errorf("addBlocks side of ingestResult missing the f.go:5 → TestA edge; index=%v", tm.index)
 	}
 }
 
 func TestTestMapRecordDurationAccumulates(t *testing.T) {
-	// Same (pkg, name) recorded twice — the per-package sum and the per-test
-	// entry must both accumulate, not overwrite. Mirrors the documented
-	// behavior contract on recordDuration.
+	// Same (pkg, name) recorded twice — the per-test entry must
+	// accumulate, not overwrite. Mirrors the documented behavior contract
+	// on recordDuration.
 	tm := &TestMap{
-		durations:    map[testKey]time.Duration{},
-		pkgDurations: map[string]time.Duration{},
+		durations: map[testKey]time.Duration{},
 	}
 	tm.recordDuration("p", "TestA", 10*time.Millisecond)
 	tm.recordDuration("p", "TestA", 5*time.Millisecond)
@@ -255,8 +229,8 @@ func TestTestMapRecordDurationAccumulates(t *testing.T) {
 	if got := tm.durations[testKey{pkg: "p", name: "TestA"}]; got != 15*time.Millisecond {
 		t.Errorf("durations[p,TestA] = %v, want 15ms (10ms + 5ms)", got)
 	}
-	if got := tm.pkgDurations["p"]; got != 22*time.Millisecond {
-		t.Errorf("pkgDurations[p] = %v, want 22ms", got)
+	if got := tm.durations[testKey{pkg: "p", name: "TestB"}]; got != 7*time.Millisecond {
+		t.Errorf("durations[p,TestB] = %v, want 7ms", got)
 	}
 
 	// Zero or negative durations are dropped (sentinel "no measurement").
@@ -297,14 +271,6 @@ func TestNewTestMapForTestingPopulatesAllMaps(t *testing.T) {
 		t.Errorf("durations[q,TestA]=%v, want 100ms — cross-package isolation must hold", got)
 	}
 
-	// Per-package sums roll up correctly.
-	if got := tm.pkgDurations["p"]; got != 100*time.Millisecond {
-		t.Errorf("pkgDurations[p]=%v, want 100ms (30+70)", got)
-	}
-	if got := tm.pkgDurations["q"]; got != 100*time.Millisecond {
-		t.Errorf("pkgDurations[q]=%v, want 100ms", got)
-	}
-
 	// Cover index entries are converted from []TestRef to set[testKey]bool.
 	if !tm.index["f.go:10"][testKey{pkg: "p", name: "TestA"}] || !tm.index["f.go:10"][testKey{pkg: "p", name: "TestB"}] {
 		t.Errorf("f.go:10 → {TestA, TestB} edges missing; got %v — STATEMENT_REMOVE on the index assignment would empty this", tm.index["f.go:10"])
@@ -315,7 +281,7 @@ func TestNewTestMapForTestingPopulatesAllMaps(t *testing.T) {
 
 	// Empty inputs produce an empty-but-usable TestMap (no nil maps).
 	empty := NewTestMapForTesting(nil, nil)
-	if empty.durations == nil || empty.pkgDurations == nil || empty.index == nil {
+	if empty.durations == nil || empty.index == nil {
 		t.Errorf("NewTestMapForTesting(nil, nil) left a nil internal map; future writes would panic")
 	}
 }
@@ -327,8 +293,8 @@ func TestProcessWorkRecordsDurationOnlyEntries(t *testing.T) {
 	// must reflect that work.
 	orig := runCompiledTestFunc
 	defer func() { runCompiledTestFunc = orig }()
-	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
-		return nil, 50 * time.Millisecond, false, nil
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, error) {
+		return nil, 50 * time.Millisecond, nil
 	}
 
 	work := make(chan testEntry, 1)
@@ -480,9 +446,9 @@ func TestProcessWorkReturnsImmediatelyOnCancelledCtx(t *testing.T) {
 	orig := runCompiledTestFunc
 	defer func() { runCompiledTestFunc = orig }()
 	var calls atomic.Int32
-	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, error) {
 		calls.Add(1)
-		return nil, 0, false, nil
+		return nil, 0, nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -511,11 +477,11 @@ func TestProcessWorkReturnsImmediatelyOnCancelledCtx(t *testing.T) {
 func TestProcessWorkContinuesPastEmptyBlocks(t *testing.T) {
 	orig := runCompiledTestFunc
 	defer func() { runCompiledTestFunc = orig }()
-	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, testName, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, testName, _ string, _ time.Duration) ([]Block, time.Duration, error) {
 		if testName == "TestEmpty" {
-			return nil, 0, false, nil
+			return nil, 0, nil
 		}
-		return []Block{{File: "f.go", StartLine: 1, EndLine: 1, Count: 1}}, 0, false, nil
+		return []Block{{File: "f.go", StartLine: 1, EndLine: 1, Count: 1}}, 0, nil
 	}
 
 	work := make(chan testEntry, 2)
@@ -546,9 +512,9 @@ func TestProcessWorkContinuesPastNilCp(t *testing.T) {
 	orig := runCompiledTestFunc
 	defer func() { runCompiledTestFunc = orig }()
 	var calls atomic.Int32
-	runCompiledTestFunc = func(_ context.Context, cp *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
+	runCompiledTestFunc = func(_ context.Context, cp *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, error) {
 		calls.Add(1)
-		return nil, 0, false, nil
+		return nil, 0, nil
 	}
 
 	work := make(chan testEntry, 2)
@@ -575,8 +541,8 @@ func TestProcessWorkContinuesPastNilCp(t *testing.T) {
 func TestProcessWorkSkipsEmptyBlocks(t *testing.T) {
 	orig := runCompiledTestFunc
 	defer func() { runCompiledTestFunc = orig }()
-	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
-		return nil, 0, false, nil // simulate test that produced no coverage blocks
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, error) {
+		return nil, 0, nil // simulate test that produced no coverage blocks
 	}
 
 	work := make(chan testEntry, 1)
@@ -735,7 +701,7 @@ func TestNeedsCwd(t *testing.T) {
 	}
 
 	profilePath := filepath.Join(tmpDir, "cwd.cov")
-	blocks, _, _, _ := runCompiledTest(context.Background(), cp, "TestNeedsCwd", profilePath, 0)
+	blocks, _, _ := runCompiledTest(context.Background(), cp, "TestNeedsCwd", profilePath, 0)
 	if len(blocks) == 0 {
 		t.Errorf("expected coverage blocks; the test fails when cwd != cp.dir, so STATEMENT_REMOVE on `cmd.Dir = cp.dir` would zero this out")
 	}
@@ -744,20 +710,22 @@ func TestNeedsCwd(t *testing.T) {
 // TestBuildTestMapContinuesPastFailedCompile kills INVERT_LOOP_CTRL on the
 // `continue` after a compile failure in buildPkgBins. Stub
 // compileTestBinaryFunc to fail for the first package and succeed for the
-// second; assert the second package's tests still drive runCompiledTestFunc
-// and that a partial failure is not an error but unmaps the failed package.
+// second; assert the second package's tests still drive runCompiledTestFunc,
+// and that a partial failure is not an error and keeps the failed
+// package's suite in scope: a failed -cover build may build for a mutant
+// run, and its tests may kill.
 func TestBuildTestMapContinuesPastFailedCompile(t *testing.T) {
 	failDir := t.TempDir()
 	ran := stubBuildTestMapDeps(t, nil, []resolvedPkg{
 		{importPath: "pkg.fail", dir: failDir},
 		{importPath: "pkg.ok", dir: t.TempDir()},
 	})
-	listTestsFunc = func(_ context.Context, bins map[string]*compiledPkg, _ time.Duration, _ int) ([]testEntry, map[string]string) {
+	listTestsFunc = func(_ context.Context, bins map[string]*compiledPkg, _ time.Duration, _ int) []testEntry {
 		var tests []testEntry
 		for pkg := range bins {
 			tests = append(tests, testEntry{name: "TestA", pkg: pkg})
 		}
-		return tests, nil
+		return tests
 	}
 	compileTestBinaryFunc = func(_ context.Context, _ string, _ BuildOptions, pkg resolvedPkg) (*compiledPkg, error) {
 		if pkg.importPath == "pkg.fail" {
@@ -773,44 +741,35 @@ func TestBuildTestMapContinuesPastFailedCompile(t *testing.T) {
 	if got := atomic.LoadInt32(ran); got != 1 {
 		t.Errorf("runCompiledTestFunc called %d times, want 1 — INVERT_LOOP_CTRL turns the compile-failure `continue` into `break`, dropping pkg.ok", got)
 	}
-	// pkg.fail's tests can't be mapped, so its mutants must run it in full
-	// rather than route to nothing.
-	got := tm.Unmapped()
-	if len(got) != 1 || got[0].ImportPath != "pkg.fail" || got[0].Dir != failDir || got[0].Reason != "its test binary failed to compile" {
-		t.Errorf("Unmapped() = %+v, want only pkg.fail with its dir and the compile reason", got)
+	if got, want := tm.SuitePkgs("pkg.fail"), []Package{{ImportPath: "pkg.fail", Dir: failDir}}; !slices.Equal(got, want) {
+		t.Errorf("SuitePkgs(pkg.fail) = %+v, want %+v", got, want)
 	}
 }
 
-// TestBuildTestMapCrossPkgFollowsCoverPkg: an unmapped package's tests can
-// cover a mutant elsewhere only when the binaries were built with
-// -coverpkg, so only then does FullRunPkgs return it for another package.
+// TestBuildTestMapCrossPkgFollowsCoverPkg: another package's tests can
+// kill a mutant only when the binaries were built with -coverpkg, so only
+// then does SuitePkgs return more than the mutant's own package.
 func TestBuildTestMapCrossPkgFollowsCoverPkg(t *testing.T) {
 	for _, coverPkg := range []string{"", "./..."} {
 		stubBuildTestMapDeps(t, nil, []resolvedPkg{
-			{importPath: "pkg.fail", dir: t.TempDir()},
-			{importPath: "pkg.ok", dir: t.TempDir()},
+			{importPath: "pkg.a", dir: t.TempDir()},
+			{importPath: "pkg.b", dir: t.TempDir()},
 		})
-		compileTestBinaryFunc = func(_ context.Context, _ string, _ BuildOptions, pkg resolvedPkg) (*compiledPkg, error) {
-			if pkg.importPath == "pkg.fail" {
-				return nil, errors.New("compile failed")
-			}
-			return &compiledPkg{binPath: "x", importPath: pkg.importPath, dir: pkg.dir}, nil
-		}
 
 		tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{CoverPkg: coverPkg, TmpDir: t.TempDir(), Workers: 1})
 		if err != nil {
 			t.Fatalf("BuildTestMap(coverpkg=%q): %v", coverPkg, err)
 		}
-		got := len(tm.FullRunPkgs("pkg.ok"))
-		if want := map[string]int{"": 0, "./...": 1}[coverPkg]; got != want {
-			t.Errorf("coverpkg=%q: FullRunPkgs(pkg.ok) has %d packages, want %d", coverPkg, got, want)
+		got := len(tm.SuitePkgs("pkg.b"))
+		if want := map[string]int{"": 1, "./...": 2}[coverPkg]; got != want {
+			t.Errorf("coverpkg=%q: SuitePkgs(pkg.b) has %d packages, want %d", coverPkg, got, want)
 		}
 	}
 }
 
-// TestBuildTestMapReadsTestDeps: with -coverpkg, an unmapped package runs
-// in full only for mutants in packages its test binary links, read once
-// for all unmapped packages with the tags.
+// TestBuildTestMapReadsTestDeps: with -coverpkg, a package's suite decides
+// only the verdicts of mutants in packages its test binary links, read
+// once for every package with tests, compiled or not, with the options.
 func TestBuildTestMapReadsTestDeps(t *testing.T) {
 	stubBuildTestMapDeps(t, nil, []resolvedPkg{
 		{importPath: "pkg.fail", dir: t.TempDir()},
@@ -824,134 +783,96 @@ func TestBuildTestMapReadsTestDeps(t *testing.T) {
 		return &compiledPkg{binPath: "x", importPath: pkg.importPath, dir: pkg.dir}, nil
 	}
 	var calls []string
-	testDepsFunc = func(_ context.Context, _, tags string, pkgs []string) (map[string]map[string]bool, error) {
-		calls = append(calls, tags+" "+strings.Join(pkgs, " "))
-		return map[string]map[string]bool{"pkg.fail": {"pkg.dep": true}}, nil
+	testDepsFunc = func(_ context.Context, _ string, opts BuildOptions, pkgs []string) (map[string]map[string]bool, error) {
+		calls = append(calls, opts.Tags+" "+strings.Join(pkgs, " "))
+		return map[string]map[string]bool{"pkg.fail": {"pkg.dep": true}, "pkg.ok": {}, "pkg.dep": {}}, nil
 	}
 
 	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{CoverPkg: "./...", Tags: "t", TmpDir: t.TempDir(), Workers: 1})
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
-	if !slices.Equal(calls, []string{"t pkg.fail"}) {
-		t.Errorf("testDeps calls = %q, want one for pkg.fail with the tags", calls)
+	if !slices.Equal(calls, []string{"t pkg.dep pkg.fail pkg.ok"}) {
+		t.Errorf("testDeps calls = %q, want one for every package with the tags", calls)
 	}
-	if got := tm.FullRunPkgs("pkg.dep"); len(got) != 1 || got[0].ImportPath != "pkg.fail" {
-		t.Errorf("FullRunPkgs(pkg.dep) = %+v, want pkg.fail, whose tests link it", got)
+	if got := importPaths(tm.SuitePkgs("pkg.dep")); !slices.Equal(got, []string{"pkg.dep", "pkg.fail"}) {
+		t.Errorf("SuitePkgs(pkg.dep) = %v, want pkg.dep and pkg.fail, whose tests link it", got)
 	}
-	if got := tm.FullRunPkgs("pkg.ok"); len(got) != 0 {
-		t.Errorf("FullRunPkgs(pkg.ok) = %+v, want none: pkg.fail's tests don't link it", got)
+	if got := importPaths(tm.SuitePkgs("pkg.ok")); !slices.Equal(got, []string{"pkg.ok"}) {
+		t.Errorf("SuitePkgs(pkg.ok) = %v, want only pkg.ok: no other package's tests link it", got)
 	}
 }
 
-// TestFullRunPkgs pins which unmapped packages run in full for a mutant:
-// its own package without cross-package coverage; with it, every unmapped
-// package (sorted) whose tests link the mutant's package or whose links
-// are unknown; and nothing on a nil map.
-func TestFullRunPkgs(t *testing.T) {
-	a := UnmappedPkg{ImportPath: "m/a", Dir: "/a", Reason: "ra"}
-	b := UnmappedPkg{ImportPath: "m/b", Dir: "/b", Reason: "rb"}
-	c := UnmappedPkg{ImportPath: "m/c", Dir: "/c", Reason: "rc"}
-	own := NewTestMapForTesting(nil, nil).WithUnmappedForTesting(false, c, a)
-	cross := NewTestMapForTesting(nil, nil).WithUnmappedForTesting(true, c, a, b)
-	linked := NewTestMapForTesting(nil, nil).WithUnmappedForTesting(true, c, a, b)
-	linked.testDeps = map[string]map[string]bool{"m/a": {"m/x": true}, "m/b": {"m/y": true}}
-
+// TestSuitePkgs pins which suites decide a mutant's verdict: its own
+// package's without cross-package coverage; with it, every package
+// (sorted) whose tests link the mutant's package or whose links are
+// unknown, and its own; and nothing on a nil map.
+func TestSuitePkgs(t *testing.T) {
+	a := Package{ImportPath: "m/a", Dir: "/a"}
+	b := Package{ImportPath: "m/b", Dir: "/b"}
+	c := Package{ImportPath: "m/c", Dir: "/c"}
+	base := NewTestMapForTesting(nil, nil)
+	own := base.WithSuitesForTesting(false, nil, c, a)
+	cross := base.WithSuitesForTesting(true, nil, c, a, b)
+	linked := base.WithSuitesForTesting(true, map[string]map[string]bool{"m/a": {"m/x": true}, "m/b": {}}, c, a, b)
 	cases := []struct {
 		name string
 		tm   *TestMap
 		pkg  string
-		want []UnmappedPkg
+		want []Package
 	}{
+		{"own package", own, "m/a", []Package{a}},
+		{"own package without tests", own, "m/b", nil},
+		{"cross-package: links unknown, every package, sorted", cross, "m/z", []Package{a, b, c}},
+		{"cross-package: linking packages and unknown links", linked, "m/x", []Package{a, c}},
+		{"cross-package: own package even when not linked", linked, "m/b", []Package{b, c}},
 		{"nil map", nil, "m/a", nil},
-		{"own package unmapped", own, "m/a", []UnmappedPkg{a}},
-		{"own package mapped, others ignored", own, "m/b", nil},
-		{"cross-package: every unmapped package, sorted", cross, "m/z", []UnmappedPkg{a, b, c}},
-		{"cross-package: linking packages and unknown links", linked, "m/x", []UnmappedPkg{a, c}},
-		{"cross-package: own package even when not linked", linked, "m/b", []UnmappedPkg{b, c}},
 	}
 	for _, tc := range cases {
-		if got := tc.tm.FullRunPkgs(tc.pkg); !slices.Equal(got, tc.want) {
-			t.Errorf("%s: FullRunPkgs(%q) = %+v, want %+v", tc.name, tc.pkg, got, tc.want)
+		if got := tc.tm.SuitePkgs(tc.pkg); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: SuitePkgs(%q) = %+v, want %+v", tc.name, tc.pkg, got, tc.want)
 		}
 	}
-	if got := (*TestMap)(nil).Unmapped(); got != nil {
-		t.Errorf("nil map: Unmapped() = %+v, want nil", got)
-	}
 }
 
-// TestMarkUnmappedKeepsEarliestReason: of a package's reasons, the one
-// from the test listed first is kept whatever order they arrive in, and a
-// reason about the whole package beats any test's, even the first one's.
-func TestMarkUnmappedKeepsEarliestReason(t *testing.T) {
-	tm := newTestMap(false)
-	steps := []struct {
-		reason string
-		order  int
-		want   string
-	}{
-		{"third", 3, "third"},
-		{"first", 0, "first"},
-		{"second", 2, "first"},
-		{"again", 0, "first"},
-	}
-	for _, st := range steps {
-		tm.markUnmappedAt("m/a", "/a", st.reason, st.order)
-		if got := tm.Unmapped(); len(got) != 1 || got[0].Reason != st.want {
-			t.Errorf("after %q at %d: Unmapped() = %+v, want reason %q", st.reason, st.order, got, st.want)
-		}
-	}
-	tm.markUnmapped("m/a", "/a", "package")
-	tm.markUnmapped("m/a", "/a", "package again")
-	if got := tm.Unmapped(); len(got) != 1 || got[0].Reason != "package" {
-		t.Errorf("Unmapped() = %+v, want the first whole-package reason", got)
-	}
-}
-
-// TestUnmappedIsACopy: a caller changing what Unmapped returns must not
-// change the map, which workers read without locks.
-func TestUnmappedIsACopy(t *testing.T) {
-	tm := newTestMap(true)
-	tm.markUnmapped("m/a", "/a", "r")
-	tm.Unmapped()[0].Reason = "changed"
-	if got := tm.FullRunPkgs("m/x"); len(got) != 1 || got[0].Reason != "r" {
-		t.Errorf("FullRunPkgs = %+v, want m/a's reason unchanged", got)
-	}
-}
-
-// TestWithUnmappedForTestingCopies: the test helper leaves the map it is
-// called on as it was.
-func TestWithUnmappedForTestingCopies(t *testing.T) {
+// TestWithSuitesForTestingCopies: the test helper leaves the map it is
+// called on as it was, and sorts the suites it is given.
+func TestWithSuitesForTestingCopies(t *testing.T) {
 	base := NewTestMapForTesting(nil, nil)
-	got := base.WithUnmappedForTesting(true, UnmappedPkg{ImportPath: "m/a"})
-	if len(got.Unmapped()) != 1 || !got.crossPkg {
-		t.Errorf("copy: Unmapped() = %+v, crossPkg %v; want m/a, cross-package", got.Unmapped(), got.crossPkg)
+	deps := map[string]map[string]bool{"m/a": {}}
+	got := base.WithSuitesForTesting(true, deps, Package{ImportPath: "m/b"}, Package{ImportPath: "m/a"})
+	if !slices.Equal(importPaths(got.suites), []string{"m/a", "m/b"}) || !got.crossPkg || got.testDeps == nil {
+		t.Errorf("copy: suites %v, crossPkg %v, deps %v; want m/a and m/b sorted, cross-package, the deps", got.suites, got.crossPkg, got.testDeps)
 	}
-	if len(base.unmapped) != 0 || len(base.unmappedOrder) != 0 || len(base.Unmapped()) != 0 || base.crossPkg {
-		t.Errorf("original: unmapped %v, order %v, crossPkg %v; want it unchanged", base.unmapped, base.unmappedOrder, base.crossPkg)
+	if base.suites != nil || base.crossPkg || base.testDeps != nil {
+		t.Errorf("original: suites %v, crossPkg %v, deps %v; want it unchanged", base.suites, base.crossPkg, base.testDeps)
 	}
 }
 
-// TestProcessWorkSkipsAfterEarlierFailure: once a test fails alone, its
-// package's tests listed after it don't run, while those listed before it
-// still do — one of them may be the earlier failure to report.
-func TestProcessWorkSkipsAfterEarlierFailure(t *testing.T) {
+// TestProcessWorkSkipsStalledPackages: once a test times out alone, its
+// package's remaining tests don't run; a test that fails alone doesn't
+// stop them, and neither stops another package's. Neither reaches the map.
+func TestProcessWorkSkipsStalledPackages(t *testing.T) {
 	orig := runCompiledTestFunc
 	t.Cleanup(func() { runCompiledTestFunc = orig })
 	var ran []string
-	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, name, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, name, _ string, _ time.Duration) ([]Block, time.Duration, error) {
 		ran = append(ran, name)
-		if name == "TestB" {
-			return nil, time.Millisecond, false, errors.New("TestB failed when run alone")
+		switch name {
+		case "TestHang":
+			return nil, time.Second, fmt.Errorf("%s: %w after 1s", name, errSoloTimeout)
+		case "TestFail":
+			return nil, time.Millisecond, errors.New("TestFail failed when run alone")
 		}
-		return nil, time.Millisecond, false, nil
+		return nil, time.Millisecond, nil
 	}
 
 	entries := []testEntry{
-		{name: "TestB", pkg: "p", order: 1},
-		{name: "TestC", pkg: "p", order: 2},
-		{name: "TestA", pkg: "p", order: 0},
-		{name: "TestX", pkg: "q", order: 5},
+		{name: "TestFail", pkg: "q"},
+		{name: "TestQ", pkg: "q"},
+		{name: "TestHang", pkg: "p"},
+		{name: "TestP", pkg: "p"},
+		{name: "TestX", pkg: "x"},
 	}
 	work := make(chan testEntry, len(entries))
 	for _, e := range entries {
@@ -959,56 +880,19 @@ func TestProcessWorkSkipsAfterEarlierFailure(t *testing.T) {
 	}
 	close(work)
 	results := make(chan testCoverage, len(entries))
-	failed := &firstFailures{at: make(map[string]int)}
-	processWork(context.Background(), work, map[string]*compiledPkg{"p": {}, "q": {}}, filepath.Join(t.TempDir(), "p.cov"), 0, failed, results)
+	stalled := &stalledPkgs{set: make(map[string]bool)}
+	processWork(context.Background(), work, map[string]*compiledPkg{"p": {}, "q": {}, "x": {}}, filepath.Join(t.TempDir(), "p.cov"), 0, stalled, results)
 	close(results)
 
-	if want := []string{"TestB", "TestA", "TestX"}; !slices.Equal(ran, want) {
+	if want := []string{"TestFail", "TestQ", "TestHang", "TestX"}; !slices.Equal(ran, want) {
 		t.Errorf("ran %v, want %v", ran, want)
 	}
-	var orders []int
+	var mapped []string
 	for tc := range results {
-		orders = append(orders, tc.order)
+		mapped = append(mapped, tc.testName)
 	}
-	if want := []int{1, 0, 5}; !slices.Equal(orders, want) {
-		t.Errorf("result orders = %v, want each run's listing order %v", orders, want)
-	}
-}
-
-// writeInChunks writes out to s in writes of size bytes, each of which
-// must be taken whole.
-func writeInChunks(t *testing.T, s *skipScanner, out string, size int) {
-	t.Helper()
-	for chunk := range slices.Chunk([]byte(out), size) {
-		if n, err := s.Write(chunk); n != len(chunk) || err != nil {
-			t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(chunk))
-		}
-	}
-}
-
-// TestSkipScanner reads skip lines from -test.v output however it is
-// split into writes: top-level skips only. Of an overlong line only the
-// first 4096 bytes are kept, which still holds a whole skip line.
-func TestSkipScanner(t *testing.T) {
-	long := skipLinePrefix + "Test" + strings.Repeat("L", 4096-len(skipLinePrefix)-len("Test"))
-	out := "=== RUN   TestA\n--- SKIP: TestA (0.00s)\n    x_test.go:3: not ready\n" +
-		"=== RUN   TestB\n    --- SKIP: TestB/sub (0.00s)\n--- PASS: TestB (0.00s)\n" +
-		long + "\n" + strings.Repeat("y", 3*4096) + "\n--- SKIP: TestC (0.01s)\n--- SKIP: TestD"
-	for _, size := range []int{1, 7, len(out)} {
-		var s skipScanner
-		writeInChunks(t, &s, out, size)
-		if want := []string{"TestA", long[len(skipLinePrefix):], "TestC"}; !slices.Equal(s.skipped, want) {
-			t.Errorf("writes of %d: skipped = %.40q, want %.40q", size, s.skipped, want)
-		}
-	}
-
-	var s skipScanner
-	writeInChunks(t, &s, strings.Repeat("y", 3*4096), 1000)
-	if len(s.line) != 4096 {
-		t.Errorf("an unfinished overlong line written in parts: kept %d bytes, want 4096", len(s.line))
-	}
-	if n, err := s.Write(nil); n != 0 || err != nil {
-		t.Errorf("Write(nil) = (%d, %v), want (0, nil)", n, err)
+	if want := []string{"TestQ", "TestX"}; !slices.Equal(mapped, want) {
+		t.Errorf("results = %v, want %v: a failed or timed-out run maps nothing", mapped, want)
 	}
 }
 
@@ -1032,7 +916,7 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 		testDepsFunc = origDeps
 		measureRebuildFunc = origRebuild
 	})
-	testDepsFunc = func(context.Context, string, string, []string) (map[string]map[string]bool, error) {
+	testDepsFunc = func(context.Context, string, BuildOptions, []string) (map[string]map[string]bool, error) {
 		return nil, errors.New("deps not stubbed")
 	}
 	measureRebuildFunc = func(context.Context, string, BuildOptions, *compiledPkg) (time.Duration, error) {
@@ -1042,16 +926,16 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 	resolvePackagesFunc = func(_ context.Context, _ string, _ []string, _ string) ([]resolvedPkg, error) {
 		return resolved, nil
 	}
-	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, map[string]string) {
-		return tests, nil
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) []testEntry {
+		return tests
 	}
 	compileTestBinaryFunc = func(_ context.Context, _ string, _ BuildOptions, pkg resolvedPkg) (*compiledPkg, error) {
 		return &compiledPkg{binPath: "x", importPath: pkg.importPath, dir: pkg.dir}, nil
 	}
 	var ran int32
-	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, _ time.Duration) ([]Block, time.Duration, error) {
 		atomic.AddInt32(&ran, 1)
-		return nil, time.Millisecond, false, nil
+		return nil, time.Millisecond, nil
 	}
 	return &ran
 }
@@ -1071,9 +955,9 @@ func TestBuildTestMapErrorsWhenNothingCompiles(t *testing.T) {
 		return nil, fmt.Errorf("go test -c %s: %w", pkg.importPath, boom)
 	}
 	listed := false
-	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, map[string]string) {
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) []testEntry {
 		listed = true
-		return nil, nil
+		return nil
 	}
 
 	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
@@ -1139,9 +1023,9 @@ func TestBuildTestMapReportsCancellationDuringListing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ran := stubBuildTestMapDeps(t, nil, []resolvedPkg{{importPath: "example.com/x", dir: t.TempDir()}})
-	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, map[string]string) {
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) []testEntry {
 		cancel()
-		return []testEntry{{name: "TestA", pkg: "example.com/x"}}, map[string]string{"example.com/x": "listing its tests failed: signal: killed"}
+		return []testEntry{{name: "TestA", pkg: "example.com/x"}}
 	}
 
 	tm, err := BuildTestMap(ctx, t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
@@ -1153,25 +1037,24 @@ func TestBuildTestMapReportsCancellationDuringListing(t *testing.T) {
 	}
 }
 
-// TestBuildTestMapUnmapsListingFailures: a package whose listing failed is
-// unmapped with the listing's reason, and the rest of the map still builds.
-func TestBuildTestMapUnmapsListingFailures(t *testing.T) {
+// TestBuildTestMapKeepsUnlistedPackages: a package whose listing failed
+// maps no tests but stays in scope, and the rest of the map still builds.
+func TestBuildTestMapKeepsUnlistedPackages(t *testing.T) {
 	badDir := t.TempDir()
 	ran := stubBuildTestMapDeps(t, nil, []resolvedPkg{
 		{importPath: "example.com/bad", dir: badDir},
 		{importPath: "example.com/ok", dir: t.TempDir()},
 	})
-	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, map[string]string) {
-		return []testEntry{{name: "TestA", pkg: "example.com/ok"}}, map[string]string{"example.com/bad": "listing its tests failed: exit status 3"}
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) []testEntry {
+		return []testEntry{{name: "TestA", pkg: "example.com/ok"}}
 	}
 
 	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
-	want := []UnmappedPkg{{ImportPath: "example.com/bad", Dir: badDir, Reason: "listing its tests failed: exit status 3"}}
-	if got := tm.Unmapped(); !slices.Equal(got, want) {
-		t.Errorf("Unmapped() = %+v, want %+v", got, want)
+	if got, want := tm.SuitePkgs("example.com/bad"), []Package{{ImportPath: "example.com/bad", Dir: badDir}}; !slices.Equal(got, want) {
+		t.Errorf("SuitePkgs(bad) = %+v, want %+v", got, want)
 	}
 	if got := atomic.LoadInt32(ran); got != 1 {
 		t.Errorf("runCompiledTestFunc called %d times, want 1 (example.com/ok's TestA)", got)
@@ -1213,20 +1096,17 @@ func TestListTestsBoundsConcurrency(t *testing.T) {
 		bins[p] = &compiledPkg{importPath: p}
 	}
 
-	var (
-		tests    []testEntry
-		unmapped map[string]string
-	)
+	var tests []testEntry
 	// A slot that is never released blocks the loop for good. The deadline
 	// stays under the per-mutant timeout so that mutant reads as killed.
 	runWithDeadline(t, 5*time.Second, func() {
-		tests, unmapped = listTests(context.Background(), bins, 0, 2)
+		tests = listTests(context.Background(), bins, 0, 2)
 	})
 	if peak != 2 {
 		t.Errorf("peak concurrent listings = %d, want 2", peak)
 	}
-	if len(tests) != 4 || len(unmapped) != 0 {
-		t.Errorf("listTests = %+v, unmapped %v; want one test per package", tests, unmapped)
+	if len(tests) != 4 {
+		t.Errorf("listTests = %+v, want one test per package", tests)
 	}
 }
 
@@ -1238,13 +1118,13 @@ func TestBuildTestMapForwardsTestTimeout(t *testing.T) {
 	stubBuildTestMapDeps(t, nil, []resolvedPkg{{importPath: "example.com/x", dir: t.TempDir()}})
 	var listTimeout, runTimeout time.Duration
 	var listWorkers int
-	listTestsFunc = func(_ context.Context, _ map[string]*compiledPkg, d time.Duration, workers int) ([]testEntry, map[string]string) {
+	listTestsFunc = func(_ context.Context, _ map[string]*compiledPkg, d time.Duration, workers int) []testEntry {
 		listTimeout, listWorkers = d, workers
-		return []testEntry{{name: "TestA", pkg: "example.com/x"}}, nil
+		return []testEntry{{name: "TestA", pkg: "example.com/x"}}
 	}
-	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, d time.Duration) ([]Block, time.Duration, bool, error) {
+	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, d time.Duration) ([]Block, time.Duration, error) {
 		runTimeout = d
-		return nil, time.Millisecond, false, nil
+		return nil, time.Millisecond, nil
 	}
 
 	if _, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 3, TestTimeout: timeout}); err != nil {
@@ -1292,11 +1172,10 @@ func TestBuildTestMapNoListedTestsIsNotAnError(t *testing.T) {
 	}
 }
 
-// TestParseTestList keeps only names -test.run can select and reports the
-// first line that looks like output glued onto a test name. The input is
+// TestParseTestList keeps only names -test.run can select. The input is
 // verbatim -test.list output from a probe package whose TestMain printed
-// "partial" without a newline (gluing it onto TestOne), plus a log line,
-// a benchmark whose name contains Test, and padding.
+// "partial" without a newline (gluing it onto TestOne, which is lost),
+// plus a log line, a benchmark whose name contains Test, and padding.
 func TestParseTestList(t *testing.T) {
 	out := "partialTestOne\n" +
 		"TestTwo\n" +
@@ -1310,27 +1189,20 @@ func TestParseTestList(t *testing.T) {
 		"log: also ends in TestTwo\n" +
 		"\n" +
 		"Test"
-	names, glued := parseTestList(out)
 	want := []string{"TestTwo", "FuzzF", "ExampleA", "TestÜber_2", "TestPadded", "Test"}
-	if !slices.Equal(names, want) {
+	if names := parseTestList(out); !slices.Equal(names, want) {
 		t.Errorf("parseTestList names = %q, want %q", names, want)
-	}
-	if glued != "partialTestOne" {
-		t.Errorf("parseTestList glued = %q, want the first glued line %q", glued, "partialTestOne")
-	}
-	if _, glued := parseTestList("TestA\nBenchmarkTestB\nBenchmarkC\nnoise\n"); glued != "" {
-		t.Errorf("clean listing reported glued line %q", glued)
 	}
 }
 
-// TestProcessWorkForwardsFailures: a solo run that failed must reach the
-// map even with no blocks and no duration, carrying the reason and the
-// package dir, since it unmaps the package.
-func TestProcessWorkForwardsFailures(t *testing.T) {
+// TestProcessWorkDropsFailures: a test that fails alone is left out of
+// the map, timing and all: routing a mutant to it alone would fail with or
+// without the mutant.
+func TestProcessWorkDropsFailures(t *testing.T) {
 	orig := runCompiledTestFunc
 	t.Cleanup(func() { runCompiledTestFunc = orig })
-	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, bool, error) {
-		return nil, 0, false, errors.New("TestA failed when run alone: exit status 1")
+	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, error) {
+		return []Block{{File: "f.go", StartLine: 1, EndLine: 1, Count: 1}}, time.Millisecond, errors.New("TestA failed when run alone: exit status 1")
 	}
 
 	work := make(chan testEntry, 1)
@@ -1340,24 +1212,8 @@ func TestProcessWorkForwardsFailures(t *testing.T) {
 	processWork(context.Background(), work, map[string]*compiledPkg{"pkg1": {binPath: "x", importPath: "pkg1", dir: "/pkg1"}}, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
 	close(results)
 
-	got := <-results
-	want := testCoverage{pkg: "pkg1", dir: "/pkg1", testName: "TestA", failure: "TestA failed when run alone: exit status 1"}
-	if got.pkg != want.pkg || got.dir != want.dir || got.testName != want.testName || got.failure != want.failure {
-		t.Errorf("result = %+v, want %+v", got, want)
-	}
-}
-
-// TestIngestResultUnmapsOnFailure: only a failed run unmaps its package.
-func TestIngestResultUnmapsOnFailure(t *testing.T) {
-	tm := newTestMap(false)
-	tm.ingestResult(testCoverage{pkg: "ok", dir: "/ok", testName: "TestA", duration: time.Millisecond})
-	tm.ingestResult(testCoverage{pkg: "bad", dir: "/bad", testName: "TestB", duration: time.Millisecond, failure: "TestB failed when run alone"})
-	want := []UnmappedPkg{{ImportPath: "bad", Dir: "/bad", Reason: "TestB failed when run alone"}}
-	if got := tm.Unmapped(); !slices.Equal(got, want) {
-		t.Errorf("Unmapped() = %+v, want %+v", got, want)
-	}
-	if _, ok := tm.SumDurationsFor("bad", []string{"TestB"}); !ok {
-		t.Error("a failed run's duration should still be recorded")
+	if got, ok := <-results; ok {
+		t.Errorf("result = %+v, want none for a failed run", got)
 	}
 }
 
@@ -1469,8 +1325,8 @@ func TestSetTestArgs(t *testing.T) {
 func TestProcessWorkForwardsTinyDurations(t *testing.T) {
 	orig := runCompiledTestFunc
 	t.Cleanup(func() { runCompiledTestFunc = orig })
-	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, bool, error) {
-		return nil, time.Nanosecond, false, nil
+	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, error) {
+		return nil, time.Nanosecond, nil
 	}
 
 	work := make(chan testEntry, 1)
@@ -1482,35 +1338,6 @@ func TestProcessWorkForwardsTinyDurations(t *testing.T) {
 
 	if got := <-results; got.testName != "TestA" || got.duration != time.Nanosecond {
 		t.Errorf("result = %+v, want TestA's 1ns duration forwarded", got)
-	}
-}
-
-// TestCheckSoloSkipsRunFailure: when running the tests up to a
-// skipped-alone one fails, the package is unmapped at the first such test,
-// with the failure as the reason; a package without solo skips isn't run.
-func TestCheckSoloSkipsRunFailure(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "missing.test")
-	bins := map[string]*compiledPkg{
-		"p": {binPath: missing, dir: t.TempDir()},
-		"r": {binPath: missing, dir: t.TempDir()},
-	}
-	tests := []testEntry{
-		{name: "TestA", pkg: "p", order: 0},
-		{name: "TestB", pkg: "p", order: 1},
-		{name: "TestC", pkg: "p", order: 2},
-		{name: "TestQ", pkg: "q", order: 0},
-		{name: "TestR", pkg: "r", order: 0},
-	}
-	skips := map[string][]testEntry{"p": {tests[2], tests[1]}, "r": {tests[4]}}
-	var got map[string]soloSkipFailure
-	// One worker for two packages: each check must free its slot.
-	runWithDeadline(t, 30*time.Second, func() {
-		got = checkSoloSkips(context.Background(), bins, tests, skips, 0, 1)
-	})
-	f, ok := got["p"]
-	if len(got) != 2 || !ok || f.order != 1 ||
-		!strings.HasPrefix(f.reason, "TestB skips when run alone, and running it after the tests listed before it failed: ") {
-		t.Errorf("checkSoloSkips = %+v, want p unmapped at TestB with the run's failure", got)
 	}
 }
 
@@ -1534,139 +1361,36 @@ func TestRebuildDuration(t *testing.T) {
 	}
 }
 
-// TestBuildTestMapSkipsSoloSkipCheckForUnmapped: a package unmapped by a
-// failure isn't checked for solo skips, so the failure stays its reason.
-func TestBuildTestMapSkipsSoloSkipCheckForUnmapped(t *testing.T) {
-	stubBuildTestMapDeps(t, []testEntry{{name: "TestA", pkg: "p", order: 0}, {name: "TestB", pkg: "p", order: 1}}, []resolvedPkg{{importPath: "p", dir: t.TempDir()}})
-	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, name, _ string, _ time.Duration) ([]Block, time.Duration, bool, error) {
-		if name == "TestA" {
-			return nil, time.Millisecond, true, nil
-		}
-		return nil, time.Millisecond, false, errors.New("TestB failed when run alone")
+// TestStalledPkgs: a package is stalled once added, others aren't, and a
+// nil set records nothing.
+func TestStalledPkgs(t *testing.T) {
+	s := &stalledPkgs{set: make(map[string]bool)}
+	s.add("p")
+	if !s.has("p") || s.has("q") {
+		t.Errorf("has(p)=%v has(q)=%v, want true, false", s.has("p"), s.has("q"))
 	}
-	orig := checkSoloSkipsFunc
-	t.Cleanup(func() { checkSoloSkipsFunc = orig })
-	var checked map[string][]testEntry
-	checkSoloSkipsFunc = func(_ context.Context, _ map[string]*compiledPkg, _ []testEntry, skips map[string][]testEntry, _ time.Duration, _ int) map[string]soloSkipFailure {
-		checked = skips
-		return nil
-	}
-
-	tm, err := BuildTestMap(context.Background(), "", []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
-	if err != nil {
-		t.Fatalf("BuildTestMap: %v", err)
-	}
-	if len(checked) != 0 {
-		t.Errorf("checked %v for solo skips, want nothing: p is already unmapped", checked)
-	}
-	if got := tm.Unmapped(); len(got) != 1 || got[0].Reason != "TestB failed when run alone" {
-		t.Errorf("Unmapped() = %+v, want p with TestB's failure", got)
-	}
-}
-
-// TestBuildTestMapCancelledDuringSoloSkipCheck: a cancellation while the
-// solo skips are checked returns the cancellation, not a map that may be
-// missing their verdict.
-func TestBuildTestMapCancelledDuringSoloSkipCheck(t *testing.T) {
-	stubBuildTestMapDeps(t, []testEntry{{name: "TestA", pkg: "p"}}, []resolvedPkg{{importPath: "p", dir: t.TempDir()}})
-	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, bool, error) {
-		return nil, time.Millisecond, true, nil
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	orig := checkSoloSkipsFunc
-	t.Cleanup(func() { checkSoloSkipsFunc = orig })
-	checkSoloSkipsFunc = func(context.Context, map[string]*compiledPkg, []testEntry, map[string][]testEntry, time.Duration, int) map[string]soloSkipFailure {
-		cancel()
-		return nil
-	}
-
-	if tm, err := BuildTestMap(ctx, "", []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1}); !errors.Is(err, context.Canceled) || tm != nil {
-		t.Errorf("BuildTestMap = (%v, %v), want (nil, context.Canceled)", tm, err)
-	}
-}
-
-// TestFirstFailures: the earliest failure per package is kept whatever
-// order failures arrive in, and only tests listed after it count as
-// after it — not the failing test itself, nor another package's.
-func TestFirstFailures(t *testing.T) {
-	f := &firstFailures{at: make(map[string]int)}
-	f.record("p", 5)
-	f.record("p", 2)
-	f.record("p", 7)
-	cases := []struct {
-		pkg   string
-		order int
-		want  bool
-	}{
-		{"p", 3, true},
-		{"p", 2, false},
-		{"p", 1, false},
-		{"q", 9, false},
-	}
-	for _, c := range cases {
-		if got := f.before(c.pkg, c.order); got != c.want {
-			t.Errorf("before(%s, %d) = %v, want %v", c.pkg, c.order, got, c.want)
-		}
-	}
-	var none *firstFailures
-	none.record("p", 0)
-	if none.before("p", 1) {
-		t.Error("a nil firstFailures reported a failure")
-	}
-}
-
-// TestProcessWorkForwardsSkips: a test that skipped alone is forwarded
-// even with no blocks and no duration, so its skip gets checked.
-func TestProcessWorkForwardsSkips(t *testing.T) {
-	orig := runCompiledTestFunc
-	t.Cleanup(func() { runCompiledTestFunc = orig })
-	runCompiledTestFunc = func(context.Context, *compiledPkg, string, string, time.Duration) ([]Block, time.Duration, bool, error) {
-		return nil, 0, true, nil
-	}
-	work := make(chan testEntry, 1)
-	work <- testEntry{name: "TestA", pkg: "p", order: 3}
-	close(work)
-	results := make(chan testCoverage, 1)
-	processWork(context.Background(), work, map[string]*compiledPkg{"p": {}}, filepath.Join(t.TempDir(), "p.cov"), 0, nil, results)
-	close(results)
-	tc, ok := <-results
-	if !ok || !tc.skipped || tc.testName != "TestA" || tc.order != 3 {
-		t.Errorf("result = (%+v, %v), want TestA's skip", tc, ok)
+	var none *stalledPkgs
+	none.add("p")
+	if none.has("p") {
+		t.Error("a nil stalledPkgs reported a stalled package")
 	}
 }
 
 // TestBuildTestMapReadsTestDepsOnlyWhenNeeded: the links are read only
-// when they can matter — with -coverpkg, and with a package unmapped.
+// when they can matter — with -coverpkg.
 func TestBuildTestMapReadsTestDepsOnlyWhenNeeded(t *testing.T) {
-	cases := []struct {
-		name     string
-		coverPkg string
-		fail     bool
-		want     int
-	}{
-		{"own-package coverage", "", true, 0},
-		{"nothing unmapped", "./...", false, 0},
-		{"cross-package with an unmapped package", "./...", true, 1},
-	}
-	for _, c := range cases {
-		stubBuildTestMapDeps(t, nil, []resolvedPkg{{importPath: "pkg.fail", dir: t.TempDir()}, {importPath: "pkg.ok", dir: t.TempDir()}})
-		compileTestBinaryFunc = func(_ context.Context, _ string, _ BuildOptions, pkg resolvedPkg) (*compiledPkg, error) {
-			if c.fail && pkg.importPath == "pkg.fail" {
-				return nil, errors.New("compile failed")
-			}
-			return &compiledPkg{binPath: "x", importPath: pkg.importPath, dir: pkg.dir}, nil
-		}
+	for coverPkg, want := range map[string]int{"": 0, "./...": 1} {
+		stubBuildTestMapDeps(t, nil, []resolvedPkg{{importPath: "pkg.a", dir: t.TempDir()}})
 		calls := 0
-		testDepsFunc = func(context.Context, string, string, []string) (map[string]map[string]bool, error) {
+		testDepsFunc = func(context.Context, string, BuildOptions, []string) (map[string]map[string]bool, error) {
 			calls++
 			return nil, nil
 		}
-		if _, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{CoverPkg: c.coverPkg, TmpDir: t.TempDir(), Workers: 1}); err != nil {
-			t.Fatalf("%s: BuildTestMap: %v", c.name, err)
+		if _, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{CoverPkg: coverPkg, TmpDir: t.TempDir(), Workers: 1}); err != nil {
+			t.Fatalf("coverpkg=%q: BuildTestMap: %v", coverPkg, err)
 		}
-		if calls != c.want {
-			t.Errorf("%s: testDeps called %d times, want %d", c.name, calls, c.want)
+		if calls != want {
+			t.Errorf("coverpkg=%q: testDeps called %d times, want %d", coverPkg, calls, want)
 		}
 	}
 }

@@ -173,13 +173,14 @@ func TestMain(m *testing.M) {
 
 func TestF(t *testing.T) { F() }
 
-func TestSkip(t *testing.T) { t.Skip("always") }
+func TestG(t *testing.T) { F() }
 `,
 }
 
 // TestRunsSurviveLeftoverOutput: a binary that succeeds but leaves a
-// process holding its output open still lists, runs and checks fine once
-// pipeDrainDelay gives up on that output — the binary's own is complete.
+// process holding its output open still lists fine once pipeDrainDelay
+// gives up on that output — the binary's own is complete — and runs fine,
+// as a per-test run reads no output.
 func TestRunsSurviveLeftoverOutput(t *testing.T) {
 	orig := pipeDrainDelay
 	t.Cleanup(func() { pipeDrainDelay = orig })
@@ -200,11 +201,7 @@ func TestRunsSurviveLeftoverOutput(t *testing.T) {
 	if names, err := listBinTests(context.Background(), cp, 0); err != nil || len(names) != 2 {
 		t.Errorf("listBinTests = (%v, %v), want both tests", names, err)
 	}
-	if blocks, _, skipped, err := runCompiledTest(context.Background(), cp, "TestF", filepath.Join(t.TempDir(), "f.cov"), 0); err != nil || len(blocks) == 0 || skipped {
-		t.Errorf("runCompiledTest = (%d blocks, skipped %v, %v), want TestF's coverage", len(blocks), skipped, err)
-	}
-	skip := []testEntry{{name: "TestSkip", pkg: "leakmod", order: 1}}
-	if f, failed := checkPkgSkips(context.Background(), cp, skip, skip, 0); failed {
-		t.Errorf("checkPkgSkips = %+v, want TestSkip's skip confirmed", f)
+	if blocks, _, err := runCompiledTest(context.Background(), cp, "TestF", filepath.Join(t.TempDir(), "f.cov"), 0); err != nil || len(blocks) == 0 {
+		t.Errorf("runCompiledTest = (%d blocks, %v), want TestF's coverage", len(blocks), err)
 	}
 }

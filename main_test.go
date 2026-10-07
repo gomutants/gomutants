@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1728,76 +1727,63 @@ func TestCoverageTestFlags(t *testing.T) {
 	}
 }
 
-// TestRunWarnsUnmappedPackages: packages the map couldn't cover test by
-// test are named on stderr, since their mutants now run them in full.
-func TestRunWarnsUnmappedPackages(t *testing.T) {
-	dir := setupTinyProject(t)
+// TestRunRechecksOrderDependentSurvivor is the end-to-end gate for a test
+// that covers a line only after another test has run: TestCheck skips
+// alone, so the map routes Max's mutants to TestWeak, which passes them.
+// The re-check against the whole package runs TestCheck after TestSetup
+// and kills them, where routing alone reported them LIVED.
+func TestRunRechecksOrderDependentSurvivor(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"go.mod": "module testmod\n\ngo 1.26\n",
+		"max.go": "package testmod\n\nfunc Max(a, b int) int {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n",
+		"max_test.go": "package testmod\n\nimport \"testing\"\n\nvar ready bool\n\n" +
+			"func TestSetup(t *testing.T) { ready = true }\n\n" +
+			"func TestWeak(t *testing.T) { _ = Max(2, 1) }\n\n" +
+			"func TestCheck(t *testing.T) {\n\tif !ready {\n\t\tt.Skip(\"needs TestSetup\")\n\t}\n" +
+			"\tif Max(2, 1) != 2 || Max(1, 2) != 2 {\n\t\tt.Fatal(\"max\")\n\t}\n}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
 	orig, _ := os.Getwd()
 	os.Chdir(dir)
 	defer os.Chdir(orig)
 
-	origBuild := buildTestMapFunc
-	defer func() { buildTestMapFunc = origBuild }()
-	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
-		return coverage.NewTestMapForTesting(nil, nil).WithUnmappedForTesting(false,
-			coverage.UnmappedPkg{ImportPath: "testmod", Reason: "its test binary failed to compile"}), nil
-	}
-
-	var errBuf bytes.Buffer
-	origStderr := stderr
-	stderr = &errBuf
-	defer func() { stderr = origStderr }()
-
-	if _, err := captureOutput(t, func() error {
-		return run(context.Background(), []string{"--only", "ARITHMETIC_BASE", "-w", "1", "-o", filepath.Join(dir, "r.json"), "testmod"})
-	}); err != nil {
+	outPath := filepath.Join(dir, "r.json")
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--only", "CONDITIONALS_NEGATION", "-w", "1", "-o", outPath, "./..."})
+	})
+	if err != nil {
 		t.Fatalf("run: %v", err)
 	}
-	want := "warning: per-test routing is off for 1 package(s); their tests run in full:\n  testmod: its test binary failed to compile\n"
-	if !strings.Contains(errBuf.String(), want) {
-		t.Errorf("stderr = %q, want it to contain %q", errBuf.String(), want)
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading report: %v", err)
+	}
+	var r struct {
+		MutantsKilled        int `json:"mutants_killed"`
+		MutantsLived         int `json:"mutants_lived"`
+		MutantsRechecked     int `json:"mutants_rechecked"`
+		MutantsRecheckKilled int `json:"mutants_recheck_killed"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatalf("parsing report: %v", err)
+	}
+	if r.MutantsKilled != 1 || r.MutantsLived != 0 || r.MutantsRechecked != 1 || r.MutantsRecheckKilled != 1 {
+		t.Errorf("report = %+v, want the one mutant killed by its re-check", r)
+	}
+	if !strings.Contains(out, "Re-checked:   1  (1 killed by tests the coverage map missed)") {
+		t.Errorf("summary lacks the re-check line; got:\n%s", out)
 	}
 }
 
-// TestWarnUnmapped pins the warning's shape: nothing when every package is
-// mapped, and at most maxUnmappedListed packages named before a summary.
-func TestWarnUnmapped(t *testing.T) {
-	pkgs := func(n int) []coverage.UnmappedPkg {
-		var out []coverage.UnmappedPkg
-		for i := range n {
-			out = append(out, coverage.UnmappedPkg{ImportPath: fmt.Sprintf("m/p%d", i), Reason: "r"})
-		}
-		return out
-	}
-	cases := []struct {
-		n         int
-		wantLines int
-		wantMore  string
-	}{
-		{0, 0, ""},
-		{maxUnmappedListed, maxUnmappedListed + 1, ""},
-		{maxUnmappedListed + 2, maxUnmappedListed + 2, "  ... and 2 more\n"},
-	}
-	for _, c := range cases {
-		var buf bytes.Buffer
-		warnUnmapped(&buf, pkgs(c.n))
-		out := buf.String()
-		if got := strings.Count(out, "\n"); got != c.wantLines {
-			t.Errorf("%d packages: %d lines, want %d:\n%s", c.n, got, c.wantLines, out)
-		}
-		if c.wantMore != "" && !strings.HasSuffix(out, c.wantMore) {
-			t.Errorf("%d packages: output should end with %q:\n%s", c.n, c.wantMore, out)
-		}
-		if c.n > 0 && !strings.Contains(out, fmt.Sprintf("off for %d package(s)", c.n)) {
-			t.Errorf("%d packages: header lacks the count:\n%s", c.n, out)
-		}
-	}
-}
-
-// TestTestFilesResolverAddsFullRunPackages: a package run in full for a
-// mutant decides its verdict through every file, so they all key the cache;
-// the mutant's own package is left to the production dimension.
-func TestTestFilesResolverAddsFullRunPackages(t *testing.T) {
+// TestTestFilesResolverAddsSuitePackages: every package suite a survivor
+// is re-checked against decides its verdict through every file, so they
+// all key the cache; the mutant's own package is left to the production
+// dimension.
+func TestTestFilesResolverAddsSuitePackages(t *testing.T) {
 	target := t.TempDir()
 	importer := t.TempDir()
 	for path, src := range map[string]string{
@@ -1821,11 +1807,14 @@ func TestTestFilesResolverAddsFullRunPackages(t *testing.T) {
 		return names
 	}
 
-	cross := coverage.NewTestMapForTesting(nil, nil).WithUnmappedForTesting(true,
-		coverage.UnmappedPkg{ImportPath: "m/calc", Dir: target},
-		coverage.UnmappedPkg{ImportPath: "m/app", Dir: importer})
+	suites := []coverage.Package{{ImportPath: "m/calc", Dir: target}, {ImportPath: "m/app", Dir: importer}}
+	cross := coverage.NewTestMapForTesting(nil, nil).WithSuitesForTesting(true, nil, suites...)
 	if got := base(testFilesResolver(ti, cross, true)(m)); !slices.Equal(got, []string{"app.go", "app_test.go", "calc_test.go"}) {
-		t.Errorf("unmapped importer: files = %v, want the importer's files plus the own test file", got)
+		t.Errorf("linking importer: files = %v, want the importer's files plus the own test file", got)
+	}
+	own := coverage.NewTestMapForTesting(nil, nil).WithSuitesForTesting(false, nil, suites...)
+	if got := base(testFilesResolver(ti, own, false)(m)); !slices.Equal(got, []string{"calc_test.go"}) {
+		t.Errorf("own-package coverage: files = %v, want only the own test file", got)
 	}
 	if got := base(testFilesResolver(ti, nil, false)(m)); !slices.Equal(got, []string{"calc_test.go"}) {
 		t.Errorf("nil map: files = %v, want only the own test file", got)

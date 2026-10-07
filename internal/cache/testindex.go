@@ -239,7 +239,7 @@ func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string, crossPkg b
 
 // PackageFiles returns every indexed file of dir: its test files and its
 // production sources. A package whose whole suite runs for a mutant (see
-// coverage.TestMap.FullRunPkgs) decides the verdict through all of them.
+// coverage.TestMap.SuitePkgs) decides the verdict through all of them.
 func (ti *TestIndex) PackageFiles(dir string) []string {
 	var files []string
 	ti.addWholePackage(dir, func(f string) { files = append(files, f) })
