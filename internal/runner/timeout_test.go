@@ -51,33 +51,50 @@ func TestTimeoutPolicyForAdaptiveDisabledIgnoresTestMap(t *testing.T) {
 	}
 }
 
-// TestTimeoutPolicyForUnmeasuredIgnoresTestMap pins the --test-flags
-// fallback: timings recorded without the run's flags can't size its
-// deadlines, so Unmeasured must return Global even with a fully populated
-// map and Adaptive on. Kills BRANCH_IF on the `if p.Unmeasured` return —
-// dropping it hands a `-race` run a deadline measured without -race,
-// which turns survivors into TIMED_OUT and quietly removes them from the
-// efficacy denominator.
-func TestTimeoutPolicyForUnmeasuredIgnoresTestMap(t *testing.T) {
+// TestTimeoutPolicyForAddsRebuilds: the deadline also covers rebuilding
+// the test binary of every package the mutant's tests run in — each once,
+// however many of its tests run — or of the mutant's own package when no
+// test covers it. The floor alone can be shorter than a link under load.
+func TestTimeoutPolicyForAddsRebuilds(t *testing.T) {
 	tm := newTestMapWithDurations(t,
 		map[[2]string]time.Duration{
 			{"p", "TestA"}: 100 * time.Millisecond,
+			{"p", "TestB"}: 100 * time.Millisecond,
+			{"q", "TestC"}: 100 * time.Millisecond,
 		},
 		map[string][]coverage.TestRef{
-			"f.go:1": {{Pkg: "p", Name: "TestA"}},
+			"f.go:1": {{Pkg: "p", Name: "TestA"}, {Pkg: "p", Name: "TestB"}},
+			"f.go:2": {{Pkg: "p", Name: "TestA"}, {Pkg: "q", Name: "TestC"}},
 		},
-	)
-	m := mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}
-	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 3, Min: time.Second, Adaptive: true, Unmeasured: true}
-	if got := p.For(tm, m); got != 30*time.Second {
-		t.Errorf("Unmeasured must return Global; got %v", got)
+	).WithRebuildsForTesting(map[string]time.Duration{"p": 500 * time.Millisecond, "q": time.Second})
+	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 2, Min: time.Second, Adaptive: true}
+	cases := []struct {
+		name string
+		m    mutator.Mutant
+		want time.Duration
+	}{
+		{"one package", mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}, 1400 * time.Millisecond},
+		{"two packages", mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 2}, 3400 * time.Millisecond},
+		{"no covering tests: own package", mutator.Mutant{Pkg: "q", CoverageFile: "f.go", Line: 9}, 2200 * time.Millisecond},
 	}
-	// The same policy without the flag must still size adaptively —
-	// otherwise the assertion above would pass on a For() that ignores
-	// the TestMap unconditionally.
-	p.Unmeasured = false
-	if got := p.For(tm, m); got != time.Second {
-		t.Errorf("Unmeasured=false must size from the TestMap (100ms × 3, clamped to Min 1s); got %v", got)
+	for _, tc := range cases {
+		if got := p.For(tm, tc.m); got != tc.want {
+			t.Errorf("%s: For = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestTimeoutPolicyForUnmeasuredRebuild: a package whose rebuild wasn't
+// measured gives no basis for the build part of the deadline, so the
+// mutant gets Global.
+func TestTimeoutPolicyForUnmeasuredRebuild(t *testing.T) {
+	tm := newTestMapWithDurations(t,
+		map[[2]string]time.Duration{{"p", "TestA"}: 100 * time.Millisecond, {"q", "TestC"}: 100 * time.Millisecond},
+		map[string][]coverage.TestRef{"f.go:1": {{Pkg: "p", Name: "TestA"}, {Pkg: "q", Name: "TestC"}}},
+	).WithRebuildsForTesting(map[string]time.Duration{"p": 0})
+	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 3, Min: time.Second, Adaptive: true}
+	if got := p.For(tm, mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}); got != 30*time.Second {
+		t.Errorf("For = %v, want Global with q's rebuild unmeasured", got)
 	}
 }
 

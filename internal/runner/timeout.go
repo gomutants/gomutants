@@ -14,10 +14,12 @@ import (
 //
 //   - Adaptive=false → every mutant gets Global. Behavior matches pre-
 //     adaptive gomutants exactly; used as the kill switch.
-//   - Adaptive=true  → per-mutant timeout = clamp(baseSum*Margin, Min, Global)
-//     where baseSum is the sum of selected per-test durations from the
-//     coverage map (preferred), or the per-package total (fallback when
-//     no per-test set is known), or 0 (degrade to Global).
+//   - Adaptive=true  → per-mutant timeout =
+//     clamp((baseSum+rebuild)*Margin, Min, Global) where baseSum is the
+//     sum of selected per-test durations from the coverage map
+//     (preferred), or the per-package total (fallback when no per-test
+//     set is known), or 0 (degrade to Global), and rebuild is what the
+//     mutant's `go test` runs spend rebuilding their test binaries.
 //
 // All clamps point in the safe direction: a missing measurement falls
 // back to a longer timeout, never a shorter one. Worst-case the user
@@ -44,23 +46,6 @@ type TimeoutPolicy struct {
 	// Adaptive is the master switch. When false, For() always returns
 	// Global; the per-mutant tm/m arguments are ignored.
 	Adaptive bool
-
-	// Unmeasured reports that the TestMap's per-test timings were recorded
-	// under different conditions than the runs they would now size, which
-	// makes them unusable as a deadline no matter how large Margin is.
-	// Set when --test-flags is in effect: those flags reach the per-mutant
-	// `go test` but not the timing phase, which compiles with `go test -c`
-	// and drives the binary through `-test.*`-namespaced flags.
-	//
-	// The direction matters. Work-reducing flags (-short) would only leave
-	// the adaptive value generous, but work-increasing ones (-race,
-	// -count=N) make it too tight, and the failure is silent: the mutant
-	// lands TIMED_OUT, which sits outside the killed/lived efficacy
-	// denominator, so a survivor disappears from the score instead of
-	// showing up in it. When set, For() falls back to Global — sound,
-	// because Global derives from the baseline, and the baseline *is*
-	// measured with --test-flags applied.
-	Unmeasured bool
 }
 
 // For returns the per-mutant timeout for `m`, consulting `tm` for
@@ -73,21 +58,21 @@ type TimeoutPolicy struct {
 //     Used when no per-test set is known — typically when the mutated
 //     line isn't in any covered block, so the runner falls back to
 //     running the whole package.
-//  3. Global. Last resort: no measurements available at all, or the ones
-//     we have don't describe this run (Unmeasured).
+//  3. Global. Last resort: no measurements available at all.
+//
+// Added to it is the time the mutant's `go test` invocations spend
+// rebuilding their test binaries with the mutant in place, which the
+// deadline covers too: the measured rebuild of every package they run in
+// (see rebuildCost). A package whose rebuild wasn't measured means Global
+// as well — the floor alone can be shorter than a link under load, and a
+// deadline that runs out mid-build turns the mutant TIMED_OUT, which
+// drops it from the efficacy denominator.
 //
 // The output is clamped: max(scaled, Min), then min(that, Global).
 // Both clamps fail safe — too-tight measurements widen to Min, and a
 // pathological multiplication can never escape Global.
 func (p TimeoutPolicy) For(tm *coverage.TestMap, m mutator.Mutant) time.Duration {
 	if !p.Adaptive {
-		return p.Global
-	}
-
-	// Kept as its own early return rather than folded into the guard
-	// above: the two carry different reasons (opted out vs. no usable
-	// measurement) and each has to stay independently observable.
-	if p.Unmeasured {
 		return p.Global
 	}
 
@@ -114,10 +99,37 @@ func (p TimeoutPolicy) For(tm *coverage.TestMap, m mutator.Mutant) time.Duration
 		// No data at all — fall back to global. Conservative: longer is safer.
 		return p.Global
 	}
+	rebuild, measured := rebuildCost(tm, refs, m.Pkg)
+	if !measured {
+		return p.Global
+	}
 
 	// Use max/min builtins so the clamps don't surface as
 	// CONDITIONALS_BOUNDARY mutation targets (the previous if-form had
 	// equivalent mutants on the equality cases). Same idiom as Worker.Test
 	// uses for its capped-buffer clamp.
-	return min(p.Global, max(p.Min, time.Duration(float64(base)*p.Margin)))
+	return min(p.Global, max(p.Min, time.Duration(float64(base+rebuild)*p.Margin)))
+}
+
+// rebuildCost sums the measured rebuild durations (see
+// coverage.TestMap.RebuildDuration) of the packages a mutant's `go test`
+// invocations run in: those of its covering tests, or its own package
+// when it has none, as in Worker.testInvocations. measured is false when
+// any of them has no measurement.
+func rebuildCost(tm *coverage.TestMap, refs []coverage.TestRef, ownPkg string) (total time.Duration, measured bool) {
+	pkgs := map[string]bool{}
+	for _, r := range refs {
+		pkgs[r.Pkg] = true
+	}
+	if len(pkgs) == 0 {
+		pkgs[ownPkg] = true
+	}
+	for pkg := range pkgs {
+		d, ok := tm.RebuildDuration(pkg)
+		if !ok {
+			return 0, false
+		}
+		total += d
+	}
+	return total, true
 }

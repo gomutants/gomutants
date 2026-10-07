@@ -866,29 +866,19 @@ func TestCheckTestFlagsAccepts(t *testing.T) {
 	}
 }
 
-// TestTimeoutPolicyFor covers the config→policy mapping, and in
-// particular the one field that isn't a straight read: Unmeasured must
-// track whether --test-flags is in effect. The timing phase never sees
-// those flags, so with them set the recorded durations describe different
-// work than the deadline is being sized for — a `-race` run given a
-// no-race deadline turns survivors into TIMED_OUT, which drops them out
-// of the efficacy denominator instead of into it. STATEMENT_REMOVE on any
-// assignment here leaves that field zero.
+// TestTimeoutPolicyFor covers the config→policy mapping. --test-flags no
+// longer changes it: the per-test timings are measured with the same
+// flags as the mutant runs, so they can size deadlines either way.
+// Compared as a whole struct so a STATEMENT_REMOVE on any assignment in
+// timeoutPolicyFor shows up, without a per-field if apiece.
 func TestTimeoutPolicyFor(t *testing.T) {
 	const (
 		global = 42 * time.Second
 		margin = 2.5
 		floor  = 3 * time.Second
 	)
-	// want is the expected policy with only the two derived switches left
-	// to vary; the three pass-through fields are the same every time.
-	// Compared as a whole struct so a STATEMENT_REMOVE on any assignment
-	// in timeoutPolicyFor shows up, without a per-field if apiece.
-	want := func(adaptive, unmeasured bool) runner.TimeoutPolicy {
-		return runner.TimeoutPolicy{
-			Global: global, Margin: margin, Min: floor,
-			Adaptive: adaptive, Unmeasured: unmeasured,
-		}
+	want := func(adaptive bool) runner.TimeoutPolicy {
+		return runner.TimeoutPolicy{Global: global, Margin: margin, Min: floor, Adaptive: adaptive}
 	}
 	off := false
 	cases := []struct {
@@ -896,14 +886,9 @@ func TestTimeoutPolicyFor(t *testing.T) {
 		cfg  config.Config
 		want runner.TimeoutPolicy
 	}{
-		{"no test flags", config.Config{}, want(true, false)},
-		{"test flags set", config.Config{TestFlags: "-race"}, want(true, true)},
-		// Whitespace-only is not a flag: the runner appends nothing, so
-		// giving up adaptive sizing here would cost speed for nothing.
-		{"whitespace-only test flags", config.Config{TestFlags: "   "}, want(true, false)},
-		// The two switches are independent — a --test-flags run with
-		// adaptive already off must not read as adaptive.
-		{"adaptive off with test flags", config.Config{TestFlags: "-short", AdaptiveTimeout: &off}, want(false, true)},
+		{"no test flags", config.Config{}, want(true)},
+		{"test flags set", config.Config{TestFlags: "-race"}, want(true)},
+		{"adaptive off", config.Config{TestFlags: "-short", AdaptiveTimeout: &off}, want(false)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1643,6 +1628,48 @@ func TestRunBuildTestMapWarningOnError(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Building per-test coverage map... skipped") {
 		t.Errorf("stdout missing 'skipped' PhaseDone; got: %q — CONDITIONALS_NEGATION on `err != nil` flips the branch", out.String())
+	}
+}
+
+// TestRunBuildTestMapInterrupted: an interrupt during the per-test map
+// stops the run with the cancellation, rather than reading as a map
+// failure and going on without one.
+func TestRunBuildTestMapInterrupted(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
+		cancel()
+		return nil, context.Canceled
+	}
+
+	var out, errBuf bytes.Buffer
+	origStdout := stdout
+	origStderr := stderr
+	stdout = &out
+	stderr = &errBuf
+	defer func() {
+		stdout = origStdout
+		stderr = origStderr
+	}()
+
+	err := run(ctx, []string{
+		"--only", "ARITHMETIC_BASE",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("run = %v, want the cancellation", err)
+	}
+	if strings.Contains(errBuf.String(), "per-test coverage map failed") {
+		t.Errorf("stderr reads as a map failure: %q", errBuf.String())
 	}
 }
 

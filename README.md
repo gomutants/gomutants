@@ -653,11 +653,11 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--test-cpu` | | 0 (omit) | Value passed to inner `go test -cpu` per mutant; 0 lets go test use `GOMAXPROCS` |
 | `--timeout-coefficient` | | 10 | Multiplier applied to baseline test time for the **global timeout ceiling** (also the per-mutant timeout when `--adaptive-timeout=false`) |
 | `--adaptive-timeout` | | true | Use the per-test durations recorded during the coverage build to size each mutant's timeout. Pass `=false` to fall back to the single global ceiling. |
-| `--timeout-margin` | | 3.0 | When adaptive: `per-mutant timeout = sum(selected test durations) × this`, clamped to `[--timeout-min, --timeout-coefficient × baseline]` |
+| `--timeout-margin` | | 3.0 | When adaptive: `per-mutant timeout = (sum(selected test durations) + rebuild time) × this`, clamped to `[--timeout-min, --timeout-coefficient × baseline]` |
 | `--timeout-min` | | 2s | Floor for the per-mutant adaptive timeout. Absorbs cold-start, child fork, and GC pause overhead that doesn't scale with the underlying test work. |
 | `--coverpkg` | | | Coverage package pattern (forwarded to `go test -coverpkg`) |
 | `--tags` | | | Comma-separated build tags forwarded as `-tags` to every inner `go list` / `go test` (including `go test -c`/`-list`), so mutation testing reaches code behind `//go:build` constraints (gremlins-compat) |
-| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Part of the cache identity, so changing the value discards cached verdicts rather than replaying them. Setting it also stands adaptive timeouts down to the global ceiling, since the per-test timings are measured without these flags. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
+| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Part of the cache identity, so changing the value discards cached verdicts rather than replaying them. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
 | `--output` | `-o` | `mutation-report.json` | JSON report path |
 | `--config` | | `.gomutants.yml` | Config file path |
 | `--disable` | | | Comma-separated mutator types to disable |
@@ -741,7 +741,11 @@ gomutants --changed-since main --test-flags '-short' ./...
 Four things to know:
 
 - **`go test` only.** The flags reach the per-mutant runs, the coverage run,
-  and the baseline run — never `go list` or the build steps. This is why
+  the baseline run, and the per-test coverage map — never `go list`. The
+  map compiles each test binary once with `go test -c` and runs it
+  directly, so gomutants splits your flags as `go test` would: build flags
+  such as `-race` or `-tags` go to the compile, the rest to the binary.
+  This is why
   `GOFLAGS` is not a workaround. Go applies a GOFLAGS entry only "when the
   given flag is known by the current command" (`go help environment`), so
   you cannot say which invocations a flag reaches: `-short` is silently
@@ -762,19 +766,10 @@ Four things to know:
   Whitespace-only differences don't count as a change. Flag order does:
   arbitrary test-binary flags can interact while they are parsed, so the
   cache conservatively keeps `-race -short` and `-short -race` separate.
-- **The per-test timing phase does not see the flags,** so adaptive timeouts
-  stand down. That phase compiles with `go test -c` and runs the binary
-  directly with `-test.*`-namespaced flags, where `-short` would need
-  translating. Its durations therefore describe a run your flags have
-  changed, which is unusable as a deadline in either direction — under
-  `-race` a deadline measured without it would fire early, turning survivors
-  into `TIMED_OUT` and quietly dropping them out of the efficacy
-  denominator. With `--test-flags` set, every mutant gets the global
-  `baseline × --timeout-coefficient` ceiling instead (the baseline *is*
-  measured with your flags), exactly as under `--adaptive-timeout=false`.
-  This also caps the speedup: the timing phase runs each test once at full
-  cost regardless, so a suite dominated by it improves less than the
-  per-mutant arithmetic suggests.
+- **Adaptive timeouts keep working.** The per-test timings come from the
+  coverage map's runs, which apply the same flags, so they describe the
+  runs they size: a `-race` deadline is measured under `-race`, and
+  `-short` shrinks the timing phase along with the mutant runs.
 
 Your flags are placed **after** the package argument, which is what lets
 flags belonging to the *test binary* rather than to `go test` work at all.
@@ -820,7 +815,7 @@ so `--test-flags '-race -args -x'` works either way.
 2. **Collect coverage** with `go test -coverprofile`. Mutants on uncovered lines are filtered upfront as `NOT_COVERED`.
 3. **Measure baseline test time** to set the global timeout ceiling (`baseline × --timeout-coefficient`). With `--adaptive-timeout=false` this also becomes every mutant's deadline.
 4. **Discover mutants** by walking the AST and emitting byte-level patches. Address-of `&` is recognised and skipped; unary `-` is emitted by exactly one mutator.
-5. **Build per-test coverage map.** Test binaries are compiled once; each test runs in isolation with `-test.run=<one>` to record the lines it covers — and its wall-time, used for adaptive per-mutant timeouts.
+5. **Build per-test coverage map.** Test binaries are compiled once; each test runs in isolation with `-test.run=<one>` to record the lines it covers — and its wall-time, used for adaptive per-mutant timeouts. Each package's test binary is also rebuilt once from a changed file, as a mutant's `go test` rebuilds it, to time that rebuild.
 6. **Test mutants** in parallel:
    - Each worker owns a stable temp source file + overlay JSON.
    - Mutations are applied as byte-level patches; the original tree is never written to.
@@ -835,7 +830,7 @@ so `--test-flags '-race -args -x'` works either way.
 
 Performance optimizations layered on top:
 
-- **Per-mutant adaptive timeout.** Each mutant's deadline is `clamp(sum(selected test durations) × --timeout-margin, --timeout-min, global ceiling)`. A 50ms unit test gets a 2s floor instead of waiting out a multi-minute whole-suite ceiling, so infinite-loop mutants on fast packages trip in seconds rather than minutes. Falls back to the per-package sum when no per-test set is known, then to the global ceiling. Disable with `--adaptive-timeout=false`.
+- **Per-mutant adaptive timeout.** Each mutant's deadline is `clamp((sum(selected test durations) + rebuild time) × --timeout-margin, --timeout-min, global ceiling)`, where the rebuild time is what its `go test` runs spend recompiling and relinking their test binaries. A 50ms unit test gets a 2s floor instead of waiting out a multi-minute whole-suite ceiling, so infinite-loop mutants on fast packages trip in seconds rather than minutes. Falls back to the per-package sum when no per-test set is known, then to the global ceiling. Disable with `--adaptive-timeout=false`.
 - **`GOMAXPROCS=NumCPU/workers` per child.** Without this, `--workers=10` on a 10-core box would have each child also assume 10 cores, oversubscribing 100×. With it, each child compiles + tests within its share.
 - **Sort pending mutants by `(Pkg, File, Offset)` before dispatch.** The first mutant in a package pays the cold compile; subsequent ones reuse the build cache for deps and stdlib. This sort alone was a 17% wall-clock reduction.
 - **`-vet=off` on the inner `go test`.** Vet runs in the user's CI on clean source; re-running it for every mutant is wasted work. Measured 17–39% per-mutant wall-clock reduction on representative packages.

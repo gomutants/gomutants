@@ -807,6 +807,11 @@ func run(ctx context.Context, args []string) error {
 		TestFlags:   coverageTestFlags(cfg.TestFlagFields(), runner.ShortFlagFromEnv()),
 	})
 	if err != nil {
+		// An interrupt stops the run here, as in every other phase; it
+		// isn't a map failure to work around.
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		// Non-fatal: fall back to running all tests per mutant.
 		fmt.Fprintf(stderr, "warning: per-test coverage map failed: %v\n", err)
 		testMap = nil
@@ -1088,22 +1093,15 @@ func runGoVersion(ctx context.Context) string {
 
 // timeoutPolicyFor builds the per-mutant deadline policy. global is the
 // baseline×coefficient ceiling, which stays the absolute cap in every
-// mode.
-//
-// Unmeasured is the one field that isn't a straight config read:
-// --test-flags reaches the per-mutant `go test` but not the timing phase
-// that fills the TestMap, so with flags in effect those durations describe
-// different work than the deadline is being set for, and adaptive sizing
-// has to stand down (see TimeoutPolicy.Unmeasured). Derived from the split
-// fields rather than the raw string so a whitespace-only value doesn't
-// needlessly give up adaptive sizing.
+// mode. --test-flags needs no special case: the per-test timings come
+// from the coverage map's runs, which apply the same flags as the mutant
+// runs (see coverageTestFlags).
 func timeoutPolicyFor(cfg *config.Config, global time.Duration) runner.TimeoutPolicy {
 	return runner.TimeoutPolicy{
-		Global:     global,
-		Margin:     cfg.TimeoutMargin,
-		Min:        cfg.TimeoutMin,
-		Adaptive:   cfg.AdaptiveTimeoutEnabled(),
-		Unmeasured: len(cfg.TestFlagFields()) > 0,
+		Global:   global,
+		Margin:   cfg.TimeoutMargin,
+		Min:      cfg.TimeoutMin,
+		Adaptive: cfg.AdaptiveTimeoutEnabled(),
 	}
 }
 

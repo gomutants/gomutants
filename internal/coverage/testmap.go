@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -28,9 +29,11 @@ var (
 	listTestsFunc         = listTests
 	listBinTestsFunc      = listBinTests
 	testBinaryArgsFunc    = testBinaryArgs
+	testDepsFunc          = testDeps
 	parseFileFunc         = ParseFile
 	compileTestBinaryFunc = compileTestBinary
 	runCompiledTestFunc   = runCompiledTest
+	measureRebuildFunc    = measureRebuild
 	statFileFunc          = os.Stat
 )
 
@@ -71,10 +74,29 @@ type TestMap struct {
 	// runner runs these packages in full instead (see FullRunPkgs).
 	unmapped map[string]UnmappedPkg
 
+	// unmappedOrder is, per unmapped package, the listing order of the
+	// test its reason comes from, or -1 for a reason that concerns the
+	// whole package (see markUnmapped).
+	unmappedOrder map[string]int
+
+	// unmappedSorted is unmapped's values sorted by import path, kept in
+	// step by markUnmapped so per-mutant reads don't sort.
+	unmappedSorted []UnmappedPkg
+
+	// rebuilds is, per package, how long a mutant's `go test` takes to
+	// rebuild its test binary (see measureRebuild).
+	rebuilds map[string]time.Duration
+
 	// crossPkg reports whether the test binaries were built with
 	// -coverpkg, so a test can record coverage outside its own package
-	// and an unmapped package's tests may cover a mutant anywhere.
+	// and an unmapped package's tests may cover a mutant in any package
+	// their binary links.
 	crossPkg bool
+
+	// testDeps maps an unmapped package to the packages its test binary
+	// links (see testDeps); it is read only with crossPkg. An unmapped
+	// package without an entry is taken to reach every package.
+	testDeps map[string]map[string]bool
 }
 
 // UnmappedPkg is a package whose tests the coverage map could not cover
@@ -87,20 +109,30 @@ type UnmappedPkg struct {
 
 func newTestMap(crossPkg bool) *TestMap {
 	return &TestMap{
-		index:        make(map[string]map[testKey]bool),
-		durations:    make(map[testKey]time.Duration),
-		pkgDurations: make(map[string]time.Duration),
-		unmapped:     make(map[string]UnmappedPkg),
-		crossPkg:     crossPkg,
+		index:         make(map[string]map[testKey]bool),
+		durations:     make(map[testKey]time.Duration),
+		pkgDurations:  make(map[string]time.Duration),
+		unmapped:      make(map[string]UnmappedPkg),
+		unmappedOrder: make(map[string]int),
+		rebuilds:      make(map[string]time.Duration),
+		crossPkg:      crossPkg,
 	}
 }
 
-// markUnmapped records that pkg's tests can't be routed individually. The
-// first reason is kept: it is the one a user would fix first.
-func (tm *TestMap) markUnmapped(importPath, dir, reason string) {
-	if _, ok := tm.unmapped[importPath]; !ok {
-		tm.unmapped[importPath] = UnmappedPkg{ImportPath: importPath, Dir: dir, Reason: reason}
+// markUnmapped records that pkg's tests can't be routed individually.
+// Of several reasons, the one from the test listed first is kept — order
+// is that test's place in its package's listing, or -1 for a reason about
+// the whole package. It is the likeliest cause of the rest, and it
+// doesn't depend on which test's run happened to finish first.
+func (tm *TestMap) markUnmapped(importPath, dir, reason string, order int) {
+	if prev, ok := tm.unmappedOrder[importPath]; ok && prev <= order {
+		return
 	}
+	tm.unmapped[importPath] = UnmappedPkg{ImportPath: importPath, Dir: dir, Reason: reason}
+	tm.unmappedOrder[importPath] = order
+	tm.unmappedSorted = slices.SortedFunc(maps.Values(tm.unmapped), func(a, b UnmappedPkg) int {
+		return strings.Compare(a.ImportPath, b.ImportPath)
+	})
 }
 
 // Unmapped returns every package the map could not cover test by test,
@@ -109,26 +141,37 @@ func (tm *TestMap) Unmapped() []UnmappedPkg {
 	if tm == nil {
 		return nil
 	}
-	pkgs := slices.Collect(maps.Values(tm.unmapped))
-	slices.SortFunc(pkgs, func(a, b UnmappedPkg) int { return strings.Compare(a.ImportPath, b.ImportPath) })
-	return pkgs
+	return slices.Clone(tm.unmappedSorted)
 }
 
 // FullRunPkgs returns the unmapped packages whose whole test suite must
 // run for a mutant in pkg, sorted by import path. Without -coverpkg a test
 // covers only its own package, so that is pkg itself when it is unmapped;
-// with it, any unmapped package's tests may cover the mutant.
+// with it, any unmapped package whose test binary links pkg.
 func (tm *TestMap) FullRunPkgs(pkg string) []UnmappedPkg {
 	if tm == nil {
 		return nil
 	}
 	if tm.crossPkg {
-		return tm.Unmapped()
+		var pkgs []UnmappedPkg
+		for _, u := range tm.unmappedSorted {
+			if tm.reaches(u.ImportPath, pkg) {
+				pkgs = append(pkgs, u)
+			}
+		}
+		return pkgs
 	}
 	if u, ok := tm.unmapped[pkg]; ok {
 		return []UnmappedPkg{u}
 	}
 	return nil
+}
+
+// reaches reports whether unmapped package u's tests can run code in pkg:
+// u is pkg, its test binary links pkg, or what it links is unknown.
+func (tm *TestMap) reaches(u, pkg string) bool {
+	deps, known := tm.testDeps[u]
+	return u == pkg || !known || deps[pkg]
 }
 
 // testKey identifies a single (pkg, test) timing entry. Using a struct
@@ -144,11 +187,15 @@ type testCoverage struct {
 	pkg      string
 	dir      string
 	testName string
+	// order is the test's place in its package's listing.
+	order    int
 	duration time.Duration
 	blocks   []Block
 	// failure, when set, says why the test's solo run left no usable
 	// coverage; its package is then unmapped.
 	failure string
+	// skipped reports that the test skipped when run alone.
+	skipped bool
 }
 
 // compiledPkg holds a pre-compiled test binary for a package.
@@ -157,6 +204,7 @@ type compiledPkg struct {
 	importPath string   // Package import path.
 	dir        string   // Package directory (for running the binary).
 	testArgs   []string // Arguments every run of the binary gets (see setTestArgs).
+	probeFile  string   // The file measureRebuild changes (see resolvedPkg).
 }
 
 // BuildOptions configures BuildTestMap.
@@ -207,11 +255,12 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 	}
 	tm := newTestMap(opts.CoverPkg != "")
 	for _, f := range compileFailures {
-		tm.markUnmapped(f.pkg.importPath, f.pkg.dir, "its test binary failed to compile")
+		tm.markUnmapped(f.pkg.importPath, f.pkg.dir, "its test binary failed to compile", -1)
 	}
 	if err := setTestArgs(ctx, projectDir, opts, pkgBins); err != nil {
 		return nil, err
 	}
+	tm.rebuilds = measureRebuilds(ctx, projectDir, opts, pkgBins)
 
 	// 2. List each binary's tests. Keying them by the binary's import path
 	// means every listed test has a binary to run against by construction.
@@ -219,19 +268,20 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 	// once the ctx is done.
 	tests, listFailures := listTestsFunc(ctx, pkgBins, opts.TestTimeout, opts.Workers)
 	for pkg, reason := range listFailures {
-		tm.markUnmapped(pkg, pkgBins[pkg].dir, reason)
+		tm.markUnmapped(pkg, pkgBins[pkg].dir, reason, -1)
 	}
 
 	// 3. Run tests in parallel using compiled binaries.
 	work := make(chan testEntry, len(tests))
 	results := make(chan testCoverage, opts.Workers)
 
+	failed := &firstFailures{at: make(map[string]int)}
 	var wg sync.WaitGroup
 	for i := range opts.Workers {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-			processWork(ctx, work, pkgBins, opts.TmpDir, workerID, opts.TestTimeout, results)
+			processWork(ctx, work, pkgBins, opts.TmpDir, workerID, opts.TestTimeout, failed, results)
 		}(i)
 	}
 
@@ -247,8 +297,12 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 	}()
 
 	// 4. Collect and index results.
+	soloSkips := make(map[string][]testEntry)
 	for tc := range results {
 		tm.ingestResult(tc)
+		if tc.skipped {
+			soloSkips[tc.pkg] = append(soloSkips[tc.pkg], testEntry{name: tc.testName, pkg: tc.pkg, order: tc.order})
+		}
 	}
 	// Tests skipped after a cancellation leave the map partial, and a
 	// partial map routes mutants away from tests that were never run.
@@ -256,6 +310,25 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 		return nil, err
 	}
 
+	// 5. A package already unmapped runs in full whatever its skips say.
+	for pkg := range soloSkips {
+		if _, ok := tm.unmapped[pkg]; ok {
+			delete(soloSkips, pkg)
+		}
+	}
+	for pkg, f := range checkSoloSkips(ctx, pkgBins, tests, soloSkips, opts.TestTimeout, opts.Workers) {
+		tm.markUnmapped(pkg, pkgBins[pkg].dir, f.reason, f.order)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	// An unmapped package runs in full only for the mutants its tests can
+	// reach. Without knowing what they reach it runs for every mutant, so
+	// failing to read it costs speed, never a missed kill.
+	if tm.crossPkg && len(tm.unmapped) > 0 {
+		tm.testDeps, _ = testDepsFunc(ctx, projectDir, opts.Tags, slices.Sorted(maps.Keys(tm.unmapped)))
+	}
 	return tm, nil
 }
 
@@ -272,7 +345,7 @@ func (tm *TestMap) ingestResult(tc testCoverage) {
 	// its package's other tests would skip it. Only the whole package
 	// reproduces the order it passes in.
 	if tc.failure != "" {
-		tm.markUnmapped(tc.pkg, tc.dir, tc.failure)
+		tm.markUnmapped(tc.pkg, tc.dir, tc.failure, tc.order)
 	}
 }
 
@@ -311,38 +384,78 @@ func (tm *TestMap) addBlocks(pkg, testName string, blocks []Block) {
 }
 
 // processWork processes test entries from the work channel.
-func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]*compiledPkg, tmpDir string, workerID int, testTimeout time.Duration, results chan<- testCoverage) {
+//
+// A test listed after one of its package's tests already failed alone is
+// not run: the failure unmaps the package, so its coverage would go
+// unused, and a test that hangs alone would hold a worker for the whole
+// timeout. Tests listed before the failure still run, as one of them may
+// fail too and the earliest failure is the reason reported.
+func processWork(ctx context.Context, work <-chan testEntry, pkgBins map[string]*compiledPkg, tmpDir string, workerID int, testTimeout time.Duration, failed *firstFailures, results chan<- testCoverage) {
 	for test := range work {
 		if ctx.Err() != nil {
 			return
 		}
 		cp := pkgBins[test.pkg]
-		if cp == nil {
+		if cp == nil || failed.before(test.pkg, test.order) {
 			continue
 		}
 		profilePath := filepath.Join(tmpDir, fmt.Sprintf("testmap-%d.cov", workerID))
-		blocks, dur, err := runCompiledTestFunc(ctx, cp, test.name, profilePath, testTimeout)
+		blocks, dur, skipped, err := runCompiledTestFunc(ctx, cp, test.name, profilePath, testTimeout)
 		// Forward the timing even when the test produced no blocks: the
 		// mutant covering this test still executes it, so its duration
 		// matters for the per-mutant timeout. Without this, a fast unit
 		// test that touches no shared coverage line gets a 0 contribution
 		// and the package sum understates real wall time. A failure is
 		// always forwarded, as it unmaps the package.
-		if len(blocks) == 0 && dur <= 0 && err == nil {
+		if len(blocks) == 0 && dur <= 0 && err == nil && !skipped {
 			continue
 		}
 		tc := testCoverage{
 			pkg:      test.pkg,
 			dir:      cp.dir,
 			testName: test.name,
+			order:    test.order,
 			duration: dur,
 			blocks:   blocks,
+			skipped:  skipped,
 		}
 		if err != nil {
 			tc.failure = err.Error()
+			failed.record(test.pkg, test.order)
 		}
 		results <- tc
 	}
+}
+
+// firstFailures records, per package, the listing order of the earliest
+// test that failed when run alone. The coverage workers share it; a nil
+// one records nothing.
+type firstFailures struct {
+	mu sync.Mutex
+	at map[string]int
+}
+
+// record notes that the test at order in pkg failed alone.
+func (f *firstFailures) record(pkg string, order int) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if prev, ok := f.at[pkg]; !ok || order < prev {
+		f.at[pkg] = order
+	}
+}
+
+// before reports whether a test listed before order in pkg failed alone.
+func (f *firstFailures) before(pkg string, order int) bool {
+	if f == nil {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	prev, ok := f.at[pkg]
+	return ok && prev < order
 }
 
 // feedWork sends test entries to the work channel, respecting context cancellation.
@@ -397,10 +510,19 @@ var errNoTestBinary = errors.New("no test files")
 // from a missing output file (wrapping errNoTestBinary) are folded into
 // the returned error so callers can `continue` on a single check.
 //
-// opts.TestFlags follow the package, as in the mutant runs: `go test -c`
-// applies the build flags among them and ignores the rest.
+// The build flags among opts.TestFlags follow the package, as in the
+// mutant runs; see buildFlags.
+//
+// Each binary gets a directory of its own. A file name flattened from the
+// import path can collide (m/api_v1 and m/api/v1 both flatten to
+// m_api_v1), and one package's compile would then overwrite another's
+// binary.
 func compileTestBinary(ctx context.Context, projectDir string, opts BuildOptions, pkg resolvedPkg) (*compiledPkg, error) {
-	binPath := filepath.Join(opts.TmpDir, "testbin-"+sanitize(pkg.importPath)+".test")
+	binDir, err := os.MkdirTemp(opts.TmpDir, "testbin-")
+	if err != nil {
+		return nil, fmt.Errorf("go test -c %s: %w", pkg.importPath, err)
+	}
+	binPath := filepath.Join(binDir, path.Base(pkg.importPath)+".test")
 	args := []string{"test", "-c", "-o", binPath, "-cover"}
 	if opts.CoverPkg != "" {
 		args = append(args, "-coverpkg="+opts.CoverPkg)
@@ -409,7 +531,7 @@ func compileTestBinary(ctx context.Context, projectDir string, opts BuildOptions
 		args = append(args, tagsBuildFlag+opts.Tags)
 	}
 	args = append(args, pkg.importPath)
-	args = append(args, opts.TestFlags...)
+	args = append(args, buildFlags(opts.TestFlags)...)
 
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = projectDir
@@ -425,7 +547,130 @@ func compileTestBinary(ctx context.Context, projectDir string, opts BuildOptions
 		binPath:    binPath,
 		importPath: pkg.importPath,
 		dir:        pkg.dir,
+		probeFile:  pkg.probeFile,
 	}, nil
+}
+
+// measureRebuilds measures, for every compiled package, how long a mutant's
+// `go test` spends rebuilding its test binary (see measureRebuild),
+// `opts.Workers` at a time, so the builds contend as the mutant runs' do.
+// A package whose measurement fails gets no entry.
+func measureRebuilds(ctx context.Context, projectDir string, opts BuildOptions, pkgBins map[string]*compiledPkg) map[string]time.Duration {
+	rebuilds := make(map[string]time.Duration, len(pkgBins))
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, max(1, opts.Workers))
+	)
+	for pkg, cp := range pkgBins {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			d, err := measureRebuildFunc(ctx, projectDir, opts, cp)
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			rebuilds[pkg] = d
+		})
+	}
+	wg.Wait()
+	return rebuilds
+}
+
+// measureRebuild times what a mutant's `go test` of cp's package spends
+// before its tests start: the package recompiled from a changed file, and
+// its test binary relinked. The coverage compile doesn't show this, as a
+// second run serves it from the build cache. The change is a comment,
+// unique to this call, appended to cp.probeFile through an overlay; the
+// flags are the mutant runs' build flags. Building also warms the cache
+// the mutant runs then use.
+func measureRebuild(ctx context.Context, projectDir string, opts BuildOptions, cp *compiledPkg) (time.Duration, error) {
+	if cp.probeFile == "" {
+		return 0, errors.New("no Go file to change")
+	}
+	src, err := os.ReadFile(cp.probeFile)
+	if err != nil {
+		return 0, err
+	}
+	dir, err := os.MkdirTemp(opts.TmpDir, "rebuild-")
+	if err != nil {
+		return 0, err
+	}
+	defer os.RemoveAll(dir)
+	changed := filepath.Join(dir, filepath.Base(cp.probeFile))
+	src = fmt.Appendf(src, "\n// gomutants rebuild probe %d\n", time.Now().UnixNano())
+	if err := os.WriteFile(changed, src, 0o644); err != nil {
+		return 0, err
+	}
+	ov, err := json.Marshal(map[string]map[string]string{"Replace": {cp.probeFile: changed}})
+	if err != nil {
+		return 0, err
+	}
+	ovPath := filepath.Join(dir, "overlay.json")
+	if err := os.WriteFile(ovPath, ov, 0o644); err != nil {
+		return 0, err
+	}
+
+	args := []string{"test", "-c", "-vet=off", "-o", filepath.Join(dir, "probe.test"), "-overlay=" + ovPath}
+	if opts.Tags != "" {
+		args = append(args, tagsBuildFlag+opts.Tags)
+	}
+	args = append(args, cp.importPath)
+	args = append(args, buildFlags(opts.TestFlags)...)
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = projectDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	start := time.Now()
+	if err := cmd.Run(); err != nil {
+		return 0, fmt.Errorf("go test -c %s: %w\n%s", cp.importPath, err, stderr.String())
+	}
+	return time.Since(start), nil
+}
+
+// goBuildFlags are the `go build` flags that shape a test binary, each
+// mapped to whether it takes a value. Flags that only change go's own
+// output (-n, -x, -v, -work, -json), must come first (-C) or are set by
+// compileTestBinary itself (coverage, -o) are left out.
+var goBuildFlags = map[string]bool{
+	"a": false, "asan": false, "buildvcs": false, "linkshared": false,
+	"modcacherw": false, "msan": false, "race": false, "trimpath": false,
+	"asmflags": true, "buildmode": true, "compiler": true, "gccgoflags": true,
+	"gcflags": true, "installsuffix": true, "ldflags": true, "mod": true,
+	"modfile": true, "p": true, "pgo": true, "pkgdir": true, "tags": true,
+	"toolexec": true,
+}
+
+// buildFlags returns the build flags among testFlags, read as `go test`
+// reads them: up to -args or `--`, with a value given as the next field.
+// `go test -c` can't take the rest: it rejects any flag it doesn't know,
+// such as a property framework's -rapid.checks=100, where `go test` would
+// hand it to the test binary. Test flags reach the binary through
+// testArgs instead.
+func buildFlags(testFlags []string) []string {
+	var out []string
+	for i := 0; i < len(testFlags); i++ {
+		f := testFlags[i]
+		if f == "-args" || f == "--args" || f == "--" {
+			break
+		}
+		if !strings.HasPrefix(f, "-") {
+			continue
+		}
+		name, _, inline := strings.Cut(strings.TrimPrefix(f[1:], "-"), "=")
+		takesValue, ok := goBuildFlags[name]
+		if !ok {
+			continue
+		}
+		out = append(out, f)
+		if takesValue && !inline && i+1 < len(testFlags) {
+			i++
+			out = append(out, testFlags[i])
+		}
+	}
+	return out
 }
 
 // runCompiledTest runs a pre-compiled test binary for a single test with
@@ -447,38 +692,158 @@ func compileTestBinary(ctx context.Context, projectDir string, opts BuildOptions
 //
 // A run cut off by `timeout` reports the timeout as its duration.
 //
+// skipped reports that the test skipped (see checkSoloSkips).
+//
 // The error says why the run left no usable coverage — the test failed,
 // timed out, or its profile couldn't be read — and reads as the reason its
 // package can't be mapped.
-func runCompiledTest(ctx context.Context, cp *compiledPkg, testName, profilePath string, timeout time.Duration) ([]Block, time.Duration, error) {
+func runCompiledTest(ctx context.Context, cp *compiledPkg, testName, profilePath string, timeout time.Duration) (blocks []Block, dur time.Duration, skipped bool, err error) {
 	// Ours go first: a positional argument among testArgs (after -args)
 	// ends the binary's flag parsing.
 	args := append([]string{
 		fmt.Sprintf("-test.run=^%s$", regexp.QuoteMeta(testName)),
 		"-test.coverprofile=" + profilePath,
+		"-test.v=true",
 	}, cp.testArgs...)
 
 	runCtx, cancel := withTestTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(runCtx, cp.binPath, args...)
-	cmd.Dir = cp.dir
+	cmd := testBinaryCmd(runCtx, cp, args)
+	var skips skipScanner
+	cmd.Stdout = &skips
 
 	start := time.Now()
 	runErr := cmd.Run()
-	dur := time.Since(start)
+	dur = time.Since(start)
 
-	if runErr != nil {
+	// ErrWaitDelay: the test passed, but a process it left behind held
+	// the output open.
+	if runErr != nil && !errors.Is(runErr, exec.ErrWaitDelay) {
 		if runCtx.Err() == context.DeadlineExceeded {
-			return nil, dur, fmt.Errorf("%s timed out after %s when run alone", testName, timeout)
+			return nil, dur, false, fmt.Errorf("%s timed out after %s when run alone", testName, timeout)
 		}
-		return nil, dur, fmt.Errorf("%s failed when run alone: %w", testName, runErr)
+		return nil, dur, false, fmt.Errorf("%s failed when run alone: %w", testName, runErr)
 	}
 
 	profile, err := parseFileFunc(profilePath)
 	if err != nil {
-		return nil, dur, fmt.Errorf("%s: reading its coverage profile: %w", testName, err)
+		return nil, dur, false, fmt.Errorf("%s: reading its coverage profile: %w", testName, err)
 	}
-	return profile.blocks, dur, nil
+	return profile.blocks, dur, slices.Contains(skips.skipped, testName), nil
+}
+
+// skipLinePrefix starts the line a -test.v run prints for a top-level
+// test that skipped: "--- SKIP: TestX (0.00s)". A subtest's is indented.
+const skipLinePrefix = "--- SKIP: "
+
+// maxScannedLine bounds how much of one output line skipScanner keeps;
+// a skip line is far shorter.
+const maxScannedLine = 4096
+
+// skipScanner collects the top-level tests a -test.v run reports skipped,
+// keeping only the start of the line being read.
+type skipScanner struct {
+	line    []byte
+	skipped []string
+}
+
+func (s *skipScanner) Write(p []byte) (int, error) {
+	n := len(p)
+	for len(p) > 0 {
+		chunk, rest, eol := bytes.Cut(p, []byte{'\n'})
+		room := max(0, maxScannedLine-len(s.line))
+		s.line = append(s.line, chunk[:min(len(chunk), room)]...)
+		if !eol {
+			break
+		}
+		if name, ok := bytes.CutPrefix(s.line, []byte(skipLinePrefix)); ok {
+			name, _, _ = bytes.Cut(name, []byte(" "))
+			s.skipped = append(s.skipped, string(name))
+		}
+		s.line = s.line[:0]
+		p = rest
+	}
+	return n, nil
+}
+
+// soloSkipFailure is why checkSoloSkips unmaps a package, and the listing
+// order of the test it concerns.
+type soloSkipFailure struct {
+	reason string
+	order  int
+}
+
+// checkSoloSkips finds the packages with a test that skips when run alone
+// but not in its package's order — one that skips until an earlier test
+// has set something up. Mapped from the coverage of its skip, it would
+// lose the mutants only its assertions kill. For each package in skips
+// (the tests that skipped alone), the tests listed up to the last of them
+// run together, in listing order; a skipped-alone test that doesn't skip
+// there, or a run that fails, unmaps the package. `workers` packages are
+// checked at a time.
+func checkSoloSkips(ctx context.Context, pkgBins map[string]*compiledPkg, tests []testEntry, skips map[string][]testEntry, timeout time.Duration, workers int) map[string]soloSkipFailure {
+	listed := make(map[string][]testEntry)
+	for _, t := range tests {
+		if _, ok := skips[t.pkg]; ok {
+			listed[t.pkg] = append(listed[t.pkg], t)
+		}
+	}
+	failures := make(map[string]soloSkipFailure)
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, max(1, workers))
+	)
+	for pkg, skipped := range skips {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			f, ok := checkPkgSkips(ctx, pkgBins[pkg], listed[pkg], skipped, timeout)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			failures[pkg] = f
+		})
+	}
+	wg.Wait()
+	return failures
+}
+
+// checkPkgSkips runs one package's check for checkSoloSkips. listed is
+// the package's tests and skipped those that skipped alone, both in any
+// order.
+func checkPkgSkips(ctx context.Context, cp *compiledPkg, listed, skipped []testEntry, timeout time.Duration) (soloSkipFailure, bool) {
+	byOrder := func(a, b testEntry) int { return a.order - b.order }
+	slices.SortFunc(listed, byOrder)
+	slices.SortFunc(skipped, byOrder)
+	last := skipped[len(skipped)-1].order
+	var names []string
+	for _, t := range listed {
+		if t.order <= last {
+			names = append(names, t.name)
+		}
+	}
+
+	runCtx, cancel := withTestTimeout(ctx, timeout)
+	defer cancel()
+	cmd := testBinaryCmd(runCtx, cp, append([]string{"-test.run=" + RunPattern(names), "-test.v=true"}, cp.testArgs...))
+	var skips skipScanner
+	cmd.Stdout = &skips
+	if err := cmd.Run(); err != nil && !errors.Is(err, exec.ErrWaitDelay) {
+		first := skipped[0]
+		if runCtx.Err() == context.DeadlineExceeded {
+			err = fmt.Errorf("timed out after %s", timeout)
+		}
+		return soloSkipFailure{order: first.order, reason: fmt.Sprintf("%s skips when run alone, and running it after the tests listed before it failed: %v", first.name, err)}, true
+	}
+	for _, t := range skipped {
+		if !slices.Contains(skips.skipped, t.name) {
+			return soloSkipFailure{order: t.order, reason: t.name + " skips when run alone but not after the tests listed before it"}, true
+		}
+	}
+	return soloSkipFailure{}, false
 }
 
 // withTestTimeout bounds one run of a compiled test binary. The deadline
@@ -490,6 +855,24 @@ func withTestTimeout(ctx context.Context, timeout time.Duration) (context.Contex
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, timeout)
+}
+
+// pipeDrainDelay bounds how long a run of a test binary waits, once the
+// binary has exited or been killed, for output pipes a process it started
+// still holds open. A var so tests can shorten it.
+var pipeDrainDelay = 5 * time.Second
+
+// testBinaryCmd returns the command for one run of cp's binary from its
+// package directory. When ctx ends, the binary is killed along with every
+// process it started (see killTreeOnCancel), and pipeDrainDelay caps the
+// wait for output held open by one that escaped, so a run that hangs can't
+// outlast its timeout for long.
+func testBinaryCmd(ctx context.Context, cp *compiledPkg, args []string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, cp.binPath, args...)
+	cmd.Dir = cp.dir
+	killTreeOnCancel(cmd)
+	cmd.WaitDelay = pipeDrainDelay
+	return cmd
 }
 
 // TestRef identifies a single covering test by its package import path and
@@ -604,6 +987,17 @@ func (tm *TestMap) PackageDuration(pkg string) time.Duration {
 	return tm.pkgDurations[pkg]
 }
 
+// RebuildDuration returns how long a mutant's `go test` of pkg took to
+// rebuild its test binary when measured (see measureRebuild), and whether
+// it was. A mutant's deadline covers that build as well as its tests.
+func (tm *TestMap) RebuildDuration(pkg string) (time.Duration, bool) {
+	if tm == nil {
+		return 0, false
+	}
+	d, ok := tm.rebuilds[pkg]
+	return d, ok
+}
+
 // NewTestMapForTesting constructs a TestMap directly from raw timing
 // data and a "file:line" → tests cover index. Exposed only because the
 // runner-package timeout selector needs to be exercised against
@@ -617,31 +1011,50 @@ func (tm *TestMap) PackageDuration(pkg string) time.Duration {
 // coverIndex: keys are "file:line"; values are the covering tests as
 // (pkg, name) references, mirroring the package-aware index BuildTestMap
 // produces.
+//
+// Every package the fixture names rebuilds in no time, so its
+// deadlines come from the test durations alone; see
+// WithRebuildsForTesting.
 func NewTestMapForTesting(perTest map[[2]string]time.Duration, coverIndex map[string][]TestRef) *TestMap {
 	tm := newTestMap(false)
 	for k, d := range perTest {
 		tm.recordDuration(k[0], k[1], d)
+		tm.rebuilds[k[0]] = 0
 	}
 	for fileLine, refs := range coverIndex {
 		set := make(map[testKey]bool, len(refs))
 		for _, r := range refs {
 			set[testKey{pkg: r.Pkg, name: r.Name}] = true
+			tm.rebuilds[r.Pkg] = 0
 		}
 		tm.index[fileLine] = set
 	}
 	return tm
 }
 
-// WithUnmappedForTesting returns tm with `unmapped` recorded as packages
-// that could not be mapped test by test, and crossPkg as whether they may
-// cover mutants outside themselves. Exposed for the runner's routing and
-// timeout tests, like NewTestMapForTesting.
+// WithUnmappedForTesting returns a copy of tm with `unmapped` recorded as
+// packages that could not be mapped test by test, and crossPkg as whether
+// they may cover mutants outside themselves. Exposed for the runner's
+// routing and timeout tests, like NewTestMapForTesting. tm itself is left
+// as it is: a built TestMap is read without locks.
 func (tm *TestMap) WithUnmappedForTesting(crossPkg bool, unmapped ...UnmappedPkg) *TestMap {
-	tm.crossPkg = crossPkg
+	c := *tm
+	c.crossPkg = crossPkg
+	c.unmapped = maps.Clone(tm.unmapped)
+	c.unmappedOrder = maps.Clone(tm.unmappedOrder)
 	for _, u := range unmapped {
-		tm.markUnmapped(u.ImportPath, u.Dir, u.Reason)
+		c.markUnmapped(u.ImportPath, u.Dir, u.Reason, -1)
 	}
-	return tm
+	return &c
+}
+
+// WithRebuildsForTesting returns a copy of tm whose rebuild durations (see
+// RebuildDuration) are exactly `rebuilds`: a package left out has none.
+// Exposed for the runner's timeout tests, like NewTestMapForTesting.
+func (tm *TestMap) WithRebuildsForTesting(rebuilds map[string]time.Duration) *TestMap {
+	c := *tm
+	c.rebuilds = maps.Clone(rebuilds)
+	return &c
 }
 
 // RunPattern returns a -run regex pattern that matches exactly the given tests.
@@ -659,6 +1072,9 @@ func RunPattern(tests []string) string {
 type testEntry struct {
 	name string
 	pkg  string
+	// order is the test's place in its package's listing, which is the
+	// order a run of the whole package runs them in.
+	order int
 }
 
 // listTests lists the tests in each compiled binary, keyed by the import
@@ -688,8 +1104,8 @@ func listTests(ctx context.Context, pkgBins map[string]*compiledPkg, timeout tim
 				unmapped[pkg] = err.Error()
 				return
 			}
-			for _, name := range names {
-				tests = append(tests, testEntry{name: name, pkg: pkg})
+			for i, name := range names {
+				tests = append(tests, testEntry{name: name, pkg: pkg, order: i})
 			}
 		})
 	}
@@ -704,14 +1120,18 @@ func listTests(ctx context.Context, pkgBins map[string]*compiledPkg, timeout tim
 func listBinTests(ctx context.Context, cp *compiledPkg, timeout time.Duration) ([]string, error) {
 	ctx, cancel := withTestTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, cp.binPath, append([]string{"-test.list=."}, cp.testArgs...)...)
-	cmd.Dir = cp.dir
+	cmd := testBinaryCmd(ctx, cp, append([]string{"-test.list=."}, cp.testArgs...))
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	if err := cmd.Run(); err != nil {
+	// ErrWaitDelay means the binary succeeded but a process it left behind
+	// still held the output open: the list it printed is complete.
+	if err := cmd.Run(); err != nil && !errors.Is(err, exec.ErrWaitDelay) {
+		if ctx.Err() == context.DeadlineExceeded {
+			return nil, fmt.Errorf("listing its tests timed out after %s", timeout)
+		}
 		// The first line is the binary's own message; a -cover binary
 		// appends a GOCOVERDIR warning after it.
 		first, _, _ := strings.Cut(strings.TrimSpace(stderr.String()), "\n")
@@ -800,11 +1220,13 @@ func testBinaryArgs(ctx context.Context, projectDir, tags, pkg string, flags []s
 
 // goTestOwnArg reports whether a test-binary argument is one `go test` adds
 // for itself rather than for the user's flags: BuildTestMap bounds runs
-// itself, and the log file and test2json framing serve go test's own
-// output handling.
+// itself, and the test2json framing serves go test's own output handling.
+// So does any path in go test's $WORK directory — the log file, and the
+// coverage directory -cover or -covermode adds — which exists only inside
+// a `go test` run: a binary given it fails to write there.
 func goTestOwnArg(arg string) bool {
 	return strings.HasPrefix(arg, "-test.timeout=") ||
-		strings.HasPrefix(arg, "-test.testlogfile=") ||
+		strings.Contains(arg, "$WORK") ||
 		arg == "-test.v=test2json"
 }
 
@@ -830,13 +1252,58 @@ func parseTestBinaryArgs(out string) ([]string, error) {
 	return nil, errors.New("go test -n printed no test binary command")
 }
 
+// testDeps returns, for each of pkgs, the packages its test binary links,
+// read from the deps of the "<pkg>.test" main package `go list -test`
+// generates, which take in the test files' imports too. A package go list
+// reports an error for is left out, as its deps may be incomplete.
+func testDeps(ctx context.Context, projectDir, tags string, pkgs []string) (map[string]map[string]bool, error) {
+	args := []string{"list", "-e", "-test", "-f", "{{if not (or .Error .DepsErrors)}}{{range .Deps}}{{$.ImportPath}}\t{{.}}\n{{end}}{{end}}"}
+	if tags != "" {
+		args = append(args, tagsBuildFlag+tags)
+	}
+	args = append(args, pkgs...)
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = projectDir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("go list -test: %w\n%s", err, stderr.String())
+	}
+
+	testMains := make(map[string]string, len(pkgs))
+	for _, p := range pkgs {
+		testMains[p+".test"] = p
+	}
+	deps := make(map[string]map[string]bool)
+	for line := range strings.Lines(string(out)) {
+		testMain, dep, _ := strings.Cut(strings.TrimSpace(line), "\t")
+		pkg, ok := testMains[testMain]
+		if !ok {
+			continue
+		}
+		if deps[pkg] == nil {
+			deps[pkg] = make(map[string]bool)
+		}
+		// A package recompiled for the test reads "p [p.test]".
+		dep, _, _ = strings.Cut(dep, " ")
+		deps[pkg][dep] = true
+	}
+	return deps, nil
+}
+
 type resolvedPkg struct {
 	importPath string
 	dir        string
+	// probeFile is the file measureRebuild changes: the package's first
+	// production file, as mutants change those, or its first test file
+	// in a package without any. Empty in a package with neither.
+	probeFile string
 }
 
 func resolvePackages(ctx context.Context, projectDir string, patterns []string, tags string) ([]resolvedPkg, error) {
-	args := []string{"list", "-f", "{{.ImportPath}}\t{{.Dir}}"}
+	args := []string{"list", "-f", "{{.ImportPath}}\t{{.Dir}}\t" +
+		"{{if .GoFiles}}{{index .GoFiles 0}}{{else if .TestGoFiles}}{{index .TestGoFiles 0}}{{else if .XTestGoFiles}}{{index .XTestGoFiles 0}}{{end}}"}
 	if tags != "" {
 		args = append(args, tagsBuildFlag+tags)
 	}
@@ -855,15 +1322,14 @@ func resolvePackages(ctx context.Context, projectDir string, patterns []string, 
 	var pkgs []resolvedPkg
 	scanner := bufio.NewScanner(&stdout)
 	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), "\t", 2)
-		if len(parts) == 2 {
-			pkgs = append(pkgs, resolvedPkg{importPath: parts[0], dir: parts[1]})
+		parts := strings.SplitN(scanner.Text(), "\t", 3)
+		if len(parts) == 3 {
+			pkg := resolvedPkg{importPath: parts[0], dir: parts[1]}
+			if parts[2] != "" {
+				pkg.probeFile = filepath.Join(parts[1], parts[2])
+			}
+			pkgs = append(pkgs, pkg)
 		}
 	}
 	return pkgs, nil
-}
-
-// sanitize makes a test name safe for use as a filename.
-func sanitize(s string) string {
-	return strings.NewReplacer("/", "_", " ", "_", "\\", "_", ".", "_").Replace(s)
 }
