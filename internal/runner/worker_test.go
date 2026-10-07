@@ -616,7 +616,7 @@ func TestShortFlagFromEnv(t *testing.T) {
 	} {
 		t.Run("env="+tt.env, func(t *testing.T) {
 			t.Setenv("GOMUTANTS_TEST_SHORT", tt.env)
-			if got := shortFlagFromEnv(); got != tt.want {
+			if got := ShortFlagFromEnv(); got != tt.want {
 				t.Errorf("env=%q: got %v, want %v — CONDITIONALS_NEGATION on `==` flips this", tt.env, got, tt.want)
 			}
 		})
@@ -892,11 +892,11 @@ func TestBuildTestArgsShortFlag(t *testing.T) {
 	w := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
 	m := mutator.Mutant{Pkg: "mymod"}
 
-	withShort := w.buildTestArgs(m, true, time.Second)
+	withShort := onlyInvocation(t, w, m, true, time.Second)
 	if !containsStr(withShort, "-short") {
 		t.Errorf("short=true: args %v missing -short", withShort)
 	}
-	withoutShort := w.buildTestArgs(m, false, time.Second)
+	withoutShort := onlyInvocation(t, w, m, false, time.Second)
 	if containsStr(withoutShort, "-short") {
 		t.Errorf("short=false: args %v should not contain -short", withoutShort)
 	}
@@ -910,13 +910,13 @@ func TestBuildTestArgsTestCPU(t *testing.T) {
 	m := mutator.Mutant{Pkg: "mymod"}
 
 	wOn := &Worker{testCPU: 2, policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOn := wOn.buildTestArgs(m, false, time.Second)
+	argsOn := onlyInvocation(t, wOn, m, false, time.Second)
 	if !containsStr(argsOn, "-cpu=2") {
 		t.Errorf("testCPU=2: args %v missing -cpu=2", argsOn)
 	}
 
 	wOff := &Worker{testCPU: 0, policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOff := wOff.buildTestArgs(m, false, time.Second)
+	argsOff := onlyInvocation(t, wOff, m, false, time.Second)
 	if anyHasPrefix(argsOff, "-cpu=") {
 		t.Errorf("testCPU=0: args %v should not contain -cpu=", argsOff)
 	}
@@ -930,13 +930,13 @@ func TestBuildTestArgsTags(t *testing.T) {
 	m := mutator.Mutant{Pkg: "mymod"}
 
 	wOn := &Worker{tags: "integration,debug", policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOn := wOn.buildTestArgs(m, false, time.Second)
+	argsOn := onlyInvocation(t, wOn, m, false, time.Second)
 	if !containsStr(argsOn, "-tags=integration,debug") {
 		t.Errorf("tags set: args %v missing -tags=integration,debug", argsOn)
 	}
 
 	wOff := &Worker{tags: "", policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOff := wOff.buildTestArgs(m, false, time.Second)
+	argsOff := onlyInvocation(t, wOff, m, false, time.Second)
 	if anyHasPrefix(argsOff, "-tags=") {
 		t.Errorf("tags empty: args %v should not contain -tags=", argsOff)
 	}
@@ -964,7 +964,7 @@ func TestBuildTestArgsTestFlags(t *testing.T) {
 		policy:      TimeoutPolicy{Global: time.Second},
 		overlayPath: "/tmp/o.json",
 	}
-	args := wOn.buildTestArgs(m, true, time.Second)
+	args := onlyInvocation(t, wOn, m, true, time.Second)
 	for _, want := range []string{"-rapid.checks=20", "-race"} {
 		if !containsStr(args, want) {
 			t.Errorf("testFlags set: args %v missing %q", args, want)
@@ -988,7 +988,7 @@ func TestBuildTestArgsTestFlags(t *testing.T) {
 	}
 
 	wOff := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOff := wOff.buildTestArgs(m, false, time.Second)
+	argsOff := onlyInvocation(t, wOff, m, false, time.Second)
 	if containsStr(argsOff, "-rapid.checks=20") {
 		t.Errorf("testFlags unset: args %v must not gain user flags", argsOff)
 	}
@@ -1016,7 +1016,7 @@ func TestBuildTestArgsRunFilterPrecedesPackage(t *testing.T) {
 		}),
 	}
 	m := mutator.Mutant{Pkg: "mymod", CoverageFile: "add.go", Line: 3}
-	args := w.buildTestArgs(m, false, time.Second)
+	args := onlyInvocation(t, w, m, false, time.Second)
 
 	runIdx := indexOfPrefix(args, "-run=")
 	pkgIdx := indexOfStr(args, "mymod")
@@ -1100,7 +1100,7 @@ func TestTestInvocationsTestFlagsTrailPackage(t *testing.T) {
 func TestBuildTestArgsPackageArgLast(t *testing.T) {
 	w := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
 	m := mutator.Mutant{Pkg: "example.com/mod/sub"}
-	args := w.buildTestArgs(m, false, time.Second)
+	args := onlyInvocation(t, w, m, false, time.Second)
 	if len(args) == 0 || args[len(args)-1] != "example.com/mod/sub" {
 		t.Errorf("last arg = %q, want package import path; full args: %v",
 			args[len(args)-1], args)
@@ -1137,7 +1137,7 @@ func TestBuildTestArgsWithTestMap(t *testing.T) {
 	mustWrite("add.go", "package testmod\n\nfunc Add(a, b int) int { return a + b }\n")
 	mustWrite("add_test.go", "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) { if Add(1, 2) != 3 { t.Fatal(\"wrong\") } }\n")
 
-	tm, err := coverage.BuildTestMap(context.Background(), dir, []string{"testmod"}, "", "", t.TempDir(), 1, 0)
+	tm, err := coverage.BuildTestMap(context.Background(), dir, []string{"testmod"}, coverage.BuildOptions{TmpDir: t.TempDir(), Workers: 1})
 	if err != nil {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
@@ -1150,12 +1150,12 @@ func TestBuildTestArgsWithTestMap(t *testing.T) {
 		Pkg:          "testmod",
 	}
 	// With map: -run=<pattern> must appear.
-	argsWith := wWith.buildTestArgs(m, false, time.Second)
+	argsWith := onlyInvocation(t, wWith, m, false, time.Second)
 	if !anyHasPrefix(argsWith, "-run=") {
 		t.Errorf("testMap non-nil with matching entry: expected -run= in %v", argsWith)
 	}
 	// Without map: -run= must not appear.
-	argsWithout := wWithout.buildTestArgs(m, false, time.Second)
+	argsWithout := onlyInvocation(t, wWithout, m, false, time.Second)
 	if anyHasPrefix(argsWithout, "-run=") {
 		t.Errorf("testMap nil: -run= must be absent, got %v", argsWithout)
 	}
@@ -1163,7 +1163,7 @@ func TestBuildTestArgsWithTestMap(t *testing.T) {
 	// Kills CONDITIONALS_BOUNDARY on `len(tests) > 0` — mutated `>= 0` would
 	// always enter the branch and append -run= with an empty pattern.
 	mMiss := mutator.Mutant{CoverageFile: "unknown/file.go", Line: 9999, Pkg: "testmod"}
-	argsMiss := wWith.buildTestArgs(mMiss, false, time.Second)
+	argsMiss := onlyInvocation(t, wWith, mMiss, false, time.Second)
 	if anyHasPrefix(argsMiss, "-run=") {
 		t.Errorf("testMap non-nil but no matches: -run= must be absent (len(tests)>0 guard), got %v", argsMiss)
 	}
@@ -1402,4 +1402,15 @@ func TestCompileErrorRegex(t *testing.T) {
 			t.Errorf("compileErrorRe.Match(%q) = %v, want %v", tc.input, got, tc.match)
 		}
 	}
+}
+
+// onlyInvocation returns the single `go test` invocation routed for m,
+// failing the test if routing produced any other number.
+func onlyInvocation(t *testing.T, w *Worker, m mutator.Mutant, short bool, timeout time.Duration) []string {
+	t.Helper()
+	invs := w.testInvocations(m, short, timeout)
+	if len(invs) != 1 {
+		t.Fatalf("got %d invocations, want 1: %v", len(invs), invs)
+	}
+	return invs[0]
 }

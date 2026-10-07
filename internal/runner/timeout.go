@@ -91,6 +91,12 @@ func (p TimeoutPolicy) For(tm *coverage.TestMap, m mutator.Mutant) time.Duration
 		return p.Global
 	}
 
+	// A package run in full because the map couldn't cover it test by test
+	// has no per-test timings that describe the run.
+	if len(tm.FullRunPkgs(m.Pkg)) > 0 {
+		return p.Global
+	}
+
 	// Try the per-test sum first, by (pkg, name) reference so a mutant
 	// routed to covering tests in importing packages (integration mode) is
 	// sized from those tests' real durations. SumDurationsForRefs returns

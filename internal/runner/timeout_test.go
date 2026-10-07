@@ -189,13 +189,13 @@ func TestWorkerComputeTimeoutWiresPolicyAndTestMap(t *testing.T) {
 	}
 }
 
-// TestWorkerBuildTestArgsUsesAdaptiveTimeout closes the loop end-to-end:
+// TestWorkerTestInvocationsUsesAdaptiveTimeout closes the loop end-to-end:
 // the per-mutant timeout chosen by computeTimeout must thread into the
 // `-timeout=` flag that `go test` actually receives. A refactor that
 // reverts to threading w.policy.Global directly would still pass
 // TestWorkerComputeTimeoutWiresPolicyAndTestMap; this test catches that
 // by asserting the args carry the adaptive value.
-func TestWorkerBuildTestArgsUsesAdaptiveTimeout(t *testing.T) {
+func TestWorkerTestInvocationsUsesAdaptiveTimeout(t *testing.T) {
 	tm := newTestMapWithDurations(t,
 		map[[2]string]time.Duration{
 			{"p", "TestA"}: 500 * time.Millisecond,
@@ -219,7 +219,7 @@ func TestWorkerBuildTestArgsUsesAdaptiveTimeout(t *testing.T) {
 		t.Fatalf("computeTimeout = %v, want %v (precondition for arg test)", timeout, wantTimeout)
 	}
 
-	args := w.buildTestArgs(m, false, timeout)
+	args := onlyInvocation(t, w, m, false, timeout)
 	wantArg := "-timeout=" + wantTimeout.String()
 	found := false
 	for _, a := range args {
@@ -229,7 +229,7 @@ func TestWorkerBuildTestArgsUsesAdaptiveTimeout(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("args missing %q; got: %v — buildTestArgs must thread the resolved adaptive timeout, not w.policy.Global", wantArg, args)
+		t.Errorf("args missing %q; got: %v — testInvocations must thread the resolved adaptive timeout, not w.policy.Global", wantArg, args)
 	}
 }
 
@@ -249,5 +249,23 @@ func TestTimeoutPolicyForNoCoveringSetUsesPackage(t *testing.T) {
 	want := 500 * time.Millisecond // pkg sum 250ms × 2
 	if got != want {
 		t.Errorf("uncovered line must use pkg fallback; got %v want %v", got, want)
+	}
+}
+
+// TestTimeoutPolicyForFullRunUsesGlobal: a mutant whose own package runs in
+// full because the map couldn't cover it test by test gets the ceiling, not
+// a deadline sized from per-test timings that don't describe that run.
+func TestTimeoutPolicyForFullRunUsesGlobal(t *testing.T) {
+	tm := newTestMapWithDurations(t,
+		map[[2]string]time.Duration{{"p", "TestA"}: 100 * time.Millisecond},
+		map[string][]coverage.TestRef{"f.go:10": {{Pkg: "p", Name: "TestA"}}},
+	).WithUnmappedForTesting(false, coverage.UnmappedPkg{ImportPath: "p"})
+	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 3, Min: time.Second, Adaptive: true}
+	if got := p.For(tm, mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 10}); got != p.Global {
+		t.Errorf("got %v; want the 30s ceiling for a package run in full", got)
+	}
+	// A mapped package beside it keeps its per-test sizing.
+	if got := p.For(tm, mutator.Mutant{Pkg: "q", CoverageFile: "f.go", Line: 10}); got != time.Second {
+		t.Errorf("mapped package: got %v; want 1s (per-test sum, clamped to Min)", got)
 	}
 }

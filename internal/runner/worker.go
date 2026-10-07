@@ -360,10 +360,10 @@ var (
 	startCommandFunc   = func(cmd *exec.Cmd) error { return cmd.Start() }
 )
 
-// shortFlagFromEnv reports whether the inner `go test` should be invoked
+// ShortFlagFromEnv reports whether the inner `go test` should be invoked
 // with -short. Extracted from Worker.Test so the env-string equality check
 // is reachable without spinning up a subprocess.
-func shortFlagFromEnv() bool {
+func ShortFlagFromEnv() bool {
 	return os.Getenv("GOMUTANTS_TEST_SHORT") == "1"
 }
 
@@ -495,7 +495,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	// cmd.Start failure surfaces as NotViable or InfraError from
 	// runMutantTest, which the non-Lived check below returns just like any
 	// other terminal outcome.
-	for _, args := range w.testInvocations(m, shortFlagFromEnv(), timeout) {
+	for _, args := range w.testInvocations(m, ShortFlagFromEnv(), timeout) {
 		status := w.runMutantTest(testCtx, args)
 		// Parent-context cancel (Ctrl-C, upstream deadline) propagates via
 		// exec.CommandContext as a non-nil cmd.Wait error that is neither
@@ -649,11 +649,10 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 	return args
 }
 
-// buildTestArgs constructs the `go test` argv for the single-package case:
-// the mutant's own package, optionally filtered to its covering tests. Used
-// when no cross-package routing applies (the common path). Kept as a
-// distinct builder so callers can verify the -short, -run, and package arg
-// wiring without spinning up a subprocess.
+// pkgTestArgs constructs the `go test` argv for one package, filtered to
+// `tests` with -run, or running the whole package when tests is nil. Kept
+// as a distinct builder so callers can verify the -short, -run, and
+// package arg wiring without spinning up a subprocess.
 //
 // The user's --test-flags go last, after the package. `go test` goes on
 // parsing its own flags past one it does not recognize, but that first
@@ -664,24 +663,26 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 // mutant reported LIVED. Trailing placement also preserves the override
 // rule — Go takes the last occurrence of a repeated flag, so a user value
 // still beats ours.
-func (w *Worker) buildTestArgs(m mutator.Mutant, short bool, timeout time.Duration) []string {
+func (w *Worker) pkgTestArgs(pkg string, tests []string, short bool, timeout time.Duration) []string {
 	args := w.baseTestArgs(short, timeout)
-	// Use per-test coverage map to run only relevant tests.
-	if w.testMap != nil {
-		if tests := w.testMap.TestsFor(m.CoverageFile, m.Line); len(tests) > 0 {
-			args = append(args, fmt.Sprintf("-run=%s", coverage.RunPattern(tests)))
-		}
+	if tests != nil {
+		args = append(args, fmt.Sprintf("-run=%s", coverage.RunPattern(tests)))
 	}
-	args = append(args, m.Pkg)
+	args = append(args, pkg)
 	return append(args, w.testFlags...)
 }
 
 // testInvocations returns the ordered set of `go test` argv lists to run for
 // one mutant. In the common case this is a single invocation against the
-// mutant's own package (identical to buildTestArgs). When the per-test
+// mutant's own package, filtered to its covering tests, or running the
+// whole package when the map has no routing info. When the per-test
 // coverage map routes the mutant to covering tests in *other* packages
 // (integration mode), it returns one invocation per covering package, each
 // filtered to that package's covering tests.
+//
+// A package the map couldn't cover test by test (see
+// coverage.TestMap.FullRunPkgs) runs in full instead: a subset of its tests
+// could miss the one that kills the mutant.
 //
 // Per-package invocations are required because `go test -run` applies its
 // regex independently per package and `-failfast` does not short-circuit
@@ -690,29 +691,24 @@ func (w *Worker) buildTestArgs(m mutator.Mutant, short bool, timeout time.Durati
 // mutant. The mutant's own package is ordered first so the cheapest, most
 // likely killer runs before any cross-package suite.
 func (w *Worker) testInvocations(m mutator.Mutant, short bool, timeout time.Duration) [][]string {
+	// groups maps each package to run to its covering tests; a nil entry
+	// runs the whole package. TestRefsFor and FullRunPkgs are nil-safe, so
+	// a nil map leaves only the fallback below.
 	groups := map[string][]string{}
-	if w.testMap != nil {
-		for _, ref := range w.testMap.TestRefsFor(m.CoverageFile, m.Line) {
-			groups[ref.Pkg] = append(groups[ref.Pkg], ref.Name)
-		}
+	for _, ref := range w.testMap.TestRefsFor(m.CoverageFile, m.Line) {
+		groups[ref.Pkg] = append(groups[ref.Pkg], ref.Name)
 	}
-
-	// No routing info: run the whole of the mutant's own package. (When the
-	// only covering package is the mutant's own, the general loop below
-	// produces the same single invocation, so no special-case is needed.)
+	// No routing info: run the whole of the mutant's own package.
 	if len(groups) == 0 {
-		return [][]string{w.buildTestArgs(m, short, timeout)}
+		groups[m.Pkg] = nil
+	}
+	for _, u := range w.testMap.FullRunPkgs(m.Pkg) {
+		groups[u.ImportPath] = nil
 	}
 
-	base := w.baseTestArgs(short, timeout)
 	invs := make([][]string, 0, len(groups))
 	for _, pkg := range orderRoutePackages(groups, m.Pkg) {
-		args := append(slices.Clone(base),
-			fmt.Sprintf("-run=%s", coverage.RunPattern(groups[pkg])), pkg)
-		// User flags trail the package here for the same reason as in
-		// buildTestArgs.
-		args = append(args, w.testFlags...)
-		invs = append(invs, args)
+		invs = append(invs, w.pkgTestArgs(pkg, groups[pkg], short, timeout))
 	}
 	return invs
 }
@@ -729,7 +725,7 @@ func orderRoutePackages(groups map[string][]string, ownPkg string) []string {
 		}
 	}
 	slices.Sort(rest)
-	if groups[ownPkg] != nil {
+	if _, ok := groups[ownPkg]; ok {
 		return append([]string{ownPkg}, rest...)
 	}
 	return rest

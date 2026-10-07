@@ -798,7 +798,14 @@ func run(ctx context.Context, args []string) error {
 	// testTimeout also bounds each test's solo coverage run: a test that
 	// can't finish in the suite's ceiling would time out every mutant it
 	// covers anyway, and a bare test binary has no timeout of its own.
-	testMap, err := buildTestMapFunc(ctx, projectDir, coveragePatterns, coverPkgEff, cfg.Tags, tmpDir, cfg.Workers, testTimeout)
+	testMap, err := buildTestMapFunc(ctx, projectDir, coveragePatterns, coverage.BuildOptions{
+		CoverPkg:    coverPkgEff,
+		Tags:        cfg.Tags,
+		TmpDir:      tmpDir,
+		Workers:     cfg.Workers,
+		TestTimeout: testTimeout,
+		TestFlags:   coverageTestFlags(cfg.TestFlagFields(), runner.ShortFlagFromEnv()),
+	})
 	if err != nil {
 		// Non-fatal: fall back to running all tests per mutant.
 		fmt.Fprintf(stderr, "warning: per-test coverage map failed: %v\n", err)
@@ -806,6 +813,7 @@ func run(ctx context.Context, args []string) error {
 		term.PhaseDone("skipped (will run all tests per mutant)")
 	} else {
 		term.PhaseDone("done")
+		warnUnmapped(stderr, testMap.Unmapped())
 	}
 
 	// 7a. Apply incremental-analysis cache (opt-in via --cache). Hits
@@ -821,31 +829,8 @@ func run(ctx context.Context, args []string) error {
 		// mutated target via -coverpkg — resolves to the right test files.
 		testIndex := cache.BuildTestIndex(rDirs)
 
-		// Resolver: every _test.go in the mutant's own package, plus the
-		// files declaring the tests the coverage map attributes to this
-		// mutant (which -coverpkg can place in another package). The
-		// local half is unconditional rather than a fallback because a
-		// package-level test helper declares no test entry point, so no
-		// coverage-derived name resolves to it — see CoveringFiles. A nil
-		// coverage map just means there are no names to add.
-		//
-		// crossPkg tells CoveringFiles whether a covering test resolving to
-		// a foreign directory can be a real cross-package dependency or is
-		// just two packages declaring the same test name. It takes an
-		// instrumentation scope wider than the package under test —
-		// --integration, or an explicit --coverpkg — for a test outside the
-		// mutant's package to record coverage on it at all; without one,
-		// TestsFor's package-agnostic names are the only way a foreign
-		// directory can turn up, and expanding on them would fold unrelated
-		// packages' sources into tests_hash.
 		crossPkg := cfg.Integration || cfg.CoverPkg != ""
-		testFilesFor = func(m mutator.Mutant) []string {
-			var names []string
-			if testMap != nil {
-				names = testMap.TestsFor(m.CoverageFile, m.Line)
-			}
-			return testIndex.CoveringFiles(filepath.Dir(m.File), names, crossPkg)
-		}
+		testFilesFor = testFilesResolver(testIndex, testMap, crossPkg)
 
 		// --run-mutant-id skips the lookup, not the resolver above: the
 		// point of naming one mutant is to measure it again after editing
@@ -1290,6 +1275,74 @@ func embedFilesByDir(pkgs []discover.Package) map[string][]string {
 		}
 	}
 	return embeds
+}
+
+// testFilesResolver returns the cache's resolver from a mutant to the test
+// files its verdict depends on: every _test.go in the mutant's own package,
+// plus the files declaring the tests the coverage map attributes to this
+// mutant (which -coverpkg can place in another package). The local half is
+// unconditional rather than a fallback because a package-level test helper
+// declares no test entry point, so no coverage-derived name resolves to
+// it — see CoveringFiles. A nil coverage map just means there are no names
+// to add.
+//
+// crossPkg tells CoveringFiles whether a covering test resolving to a
+// foreign directory can be a real cross-package dependency or is just two
+// packages declaring the same test name. It takes an instrumentation scope
+// wider than the package under test — --integration, or an explicit
+// --coverpkg — for a test outside the mutant's package to record coverage
+// on it at all; without one, TestsFor's package-agnostic names are the
+// only way a foreign directory can turn up, and expanding on them would
+// fold unrelated packages' sources into tests_hash.
+func testFilesResolver(testIndex *cache.TestIndex, testMap *coverage.TestMap, crossPkg bool) cache.TestFilesForFn {
+	return func(m mutator.Mutant) []string {
+		var names []string
+		if testMap != nil {
+			names = testMap.TestsFor(m.CoverageFile, m.Line)
+		}
+		dir := filepath.Dir(m.File)
+		files := testIndex.CoveringFiles(dir, names, crossPkg)
+		// A package the map couldn't cover test by test runs in full for
+		// this mutant, so every file of it decides the verdict. The own
+		// package is skipped for the reason CoveringFiles skips it: its
+		// sources are already the production dimension.
+		for _, u := range testMap.FullRunPkgs(m.Pkg) {
+			if u.Dir != dir {
+				files = append(files, testIndex.PackageFiles(u.Dir)...)
+			}
+		}
+		return files
+	}
+}
+
+// coverageTestFlags returns the flags the mutant runs pass to `go test`
+// after the package — -short when the runner adds it, then the user's
+// --test-flags — so the per-test coverage runs match them.
+func coverageTestFlags(userFlags []string, short bool) []string {
+	if short {
+		return append([]string{"-short"}, userFlags...)
+	}
+	return userFlags
+}
+
+// maxUnmappedListed caps the packages warnUnmapped names one by one.
+const maxUnmappedListed = 5
+
+// warnUnmapped names the packages the per-test map couldn't cover test by
+// test. Their tests run in full for every mutant they may cover: slower,
+// but routing to a subset could skip the killing test.
+func warnUnmapped(w io.Writer, pkgs []coverage.UnmappedPkg) {
+	if len(pkgs) == 0 {
+		return
+	}
+	fmt.Fprintf(w, "warning: per-test routing is off for %d package(s); their tests run in full:\n", len(pkgs))
+	for i, u := range pkgs {
+		if i == maxUnmappedListed {
+			fmt.Fprintf(w, "  ... and %d more\n", len(pkgs)-maxUnmappedListed)
+			break
+		}
+		fmt.Fprintf(w, "  %s: %s\n", u.ImportPath, u.Reason)
+	}
 }
 
 // integrationScope computes the reverse-dependency closure of the target

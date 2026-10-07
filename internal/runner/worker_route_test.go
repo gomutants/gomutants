@@ -101,6 +101,38 @@ func TestTestInvocations(t *testing.T) {
 			wantPkgs: []string{calc},
 			wantRuns: []string{""},
 		},
+		{
+			name: "unmapped own package runs whole despite covering tests",
+			tm: routeMap("f.go:1", coverage.TestRef{Pkg: calc, Name: "TestA"}).
+				WithUnmappedForTesting(false, coverage.UnmappedPkg{ImportPath: calc}),
+			ownPkg:   calc,
+			wantPkgs: []string{calc},
+			wantRuns: []string{""},
+		},
+		{
+			name: "unmapped importer runs whole after own routed tests",
+			tm: routeMap("f.go:1", coverage.TestRef{Pkg: calc, Name: "TestCalc"}).
+				WithUnmappedForTesting(true, coverage.UnmappedPkg{ImportPath: app}),
+			ownPkg:   calc,
+			wantPkgs: []string{calc, app},
+			wantRuns: []string{"-run=^(TestCalc)$", ""},
+		},
+		{
+			name: "unmapped importer overrides its own routed tests",
+			tm: routeMap("f.go:1", coverage.TestRef{Pkg: app, Name: "TestApp"}).
+				WithUnmappedForTesting(true, coverage.UnmappedPkg{ImportPath: app}),
+			ownPkg:   calc,
+			wantPkgs: []string{app},
+			wantRuns: []string{""},
+		},
+		{
+			name: "no routing plus unmapped importer runs both whole",
+			tm: routeMap("other.go:9", coverage.TestRef{Pkg: calc, Name: "TestA"}).
+				WithUnmappedForTesting(true, coverage.UnmappedPkg{ImportPath: app}),
+			ownPkg:   calc,
+			wantPkgs: []string{calc, app},
+			wantRuns: []string{"", ""},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -133,6 +165,11 @@ func TestOrderRoutePackages(t *testing.T) {
 		if got := orderRoutePackages(groups, "m/calc"); !slices.Equal(got, want) {
 			t.Fatalf("orderRoutePackages = %v, want %v", got, want)
 		}
+	}
+
+	// A whole-package (nil) entry for the own package still sorts first.
+	if got := orderRoutePackages(map[string][]string{"m/zoo": {"T"}, "m/calc": nil}, "m/calc"); !slices.Equal(got, []string{"m/calc", "m/zoo"}) {
+		t.Fatalf("orderRoutePackages (own runs whole) = %v, want [m/calc m/zoo]", got)
 	}
 
 	// Own package absent from the groups → just the sorted rest.

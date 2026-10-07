@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1614,7 +1615,7 @@ func TestRunBuildTestMapWarningOnError(t *testing.T) {
 
 	origBuild := buildTestMapFunc
 	defer func() { buildTestMapFunc = origBuild }()
-	buildTestMapFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ int, _ time.Duration) (*coverage.TestMap, error) {
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
 		return nil, errors.New("inject build-test-map failure")
 	}
 
@@ -1642,6 +1643,165 @@ func TestRunBuildTestMapWarningOnError(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Building per-test coverage map... skipped") {
 		t.Errorf("stdout missing 'skipped' PhaseDone; got: %q — CONDITIONALS_NEGATION on `err != nil` flips the branch", out.String())
+	}
+}
+
+// TestRunBuildTestMapGetsTestTimeout pins that the per-test coverage runs
+// are bounded by the suite ceiling (baseline × coefficient). A bare test
+// binary has no timeout of its own, so dropping this would let a test that
+// hangs when run alone block the coverage phase forever.
+func TestRunBuildTestMapGetsTestTimeout(t *testing.T) {
+	t.Setenv("GOMUTANTS_TEST_SHORT", "1")
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origM := measureBaselineFunc
+	defer func() { measureBaselineFunc = origM }()
+	measureBaselineFunc = func(context.Context, string, []string, string, []string) (time.Duration, error) {
+		return 3 * time.Second, nil
+	}
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	var got coverage.BuildOptions
+	buildTestMapFunc = func(_ context.Context, _ string, _ []string, opts coverage.BuildOptions) (*coverage.TestMap, error) {
+		got = opts
+		return nil, errors.New("stop after capturing options")
+	}
+
+	if _, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{
+			"--only", "ARITHMETIC_BASE", "-w", "1", "--timeout-coefficient", "4", "--test-flags=-count=1",
+			"-o", filepath.Join(dir, "r.json"), "testmod",
+		})
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got.TestTimeout != 12*time.Second {
+		t.Errorf("BuildTestMap TestTimeout = %v, want 12s (3s baseline × coefficient 4)", got.TestTimeout)
+	}
+	if got.Workers != 1 || got.TmpDir == "" {
+		t.Errorf("BuildTestMap options = %+v, want Workers 1 and a TmpDir", got)
+	}
+	if !slices.Equal(got.TestFlags, []string{"-short", "-count=1"}) {
+		t.Errorf("BuildTestMap TestFlags = %q, want the runner's -short then --test-flags", got.TestFlags)
+	}
+}
+
+// TestCoverageTestFlags: -short goes first when the runner adds it, as in
+// the mutant runs' argument order.
+func TestCoverageTestFlags(t *testing.T) {
+	user := []string{"-count=1", "-args", "-x"}
+	if got := coverageTestFlags(user, false); !slices.Equal(got, user) {
+		t.Errorf("short=false: %q, want %q", got, user)
+	}
+	if got := coverageTestFlags(user, true); !slices.Equal(got, []string{"-short", "-count=1", "-args", "-x"}) {
+		t.Errorf("short=true: %q, want -short prepended", got)
+	}
+}
+
+// TestRunWarnsUnmappedPackages: packages the map couldn't cover test by
+// test are named on stderr, since their mutants now run them in full.
+func TestRunWarnsUnmappedPackages(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
+		return coverage.NewTestMapForTesting(nil, nil).WithUnmappedForTesting(false,
+			coverage.UnmappedPkg{ImportPath: "testmod", Reason: "its test binary failed to compile"}), nil
+	}
+
+	var errBuf bytes.Buffer
+	origStderr := stderr
+	stderr = &errBuf
+	defer func() { stderr = origStderr }()
+
+	if _, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--only", "ARITHMETIC_BASE", "-w", "1", "-o", filepath.Join(dir, "r.json"), "testmod"})
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	want := "warning: per-test routing is off for 1 package(s); their tests run in full:\n  testmod: its test binary failed to compile\n"
+	if !strings.Contains(errBuf.String(), want) {
+		t.Errorf("stderr = %q, want it to contain %q", errBuf.String(), want)
+	}
+}
+
+// TestWarnUnmapped pins the warning's shape: nothing when every package is
+// mapped, and at most maxUnmappedListed packages named before a summary.
+func TestWarnUnmapped(t *testing.T) {
+	pkgs := func(n int) []coverage.UnmappedPkg {
+		var out []coverage.UnmappedPkg
+		for i := range n {
+			out = append(out, coverage.UnmappedPkg{ImportPath: fmt.Sprintf("m/p%d", i), Reason: "r"})
+		}
+		return out
+	}
+	cases := []struct {
+		n         int
+		wantLines int
+		wantMore  string
+	}{
+		{0, 0, ""},
+		{maxUnmappedListed, maxUnmappedListed + 1, ""},
+		{maxUnmappedListed + 2, maxUnmappedListed + 2, "  ... and 2 more\n"},
+	}
+	for _, c := range cases {
+		var buf bytes.Buffer
+		warnUnmapped(&buf, pkgs(c.n))
+		out := buf.String()
+		if got := strings.Count(out, "\n"); got != c.wantLines {
+			t.Errorf("%d packages: %d lines, want %d:\n%s", c.n, got, c.wantLines, out)
+		}
+		if c.wantMore != "" && !strings.HasSuffix(out, c.wantMore) {
+			t.Errorf("%d packages: output should end with %q:\n%s", c.n, c.wantMore, out)
+		}
+		if c.n > 0 && !strings.Contains(out, fmt.Sprintf("off for %d package(s)", c.n)) {
+			t.Errorf("%d packages: header lacks the count:\n%s", c.n, out)
+		}
+	}
+}
+
+// TestTestFilesResolverAddsFullRunPackages: a package run in full for a
+// mutant decides its verdict through every file, so they all key the cache;
+// the mutant's own package is left to the production dimension.
+func TestTestFilesResolverAddsFullRunPackages(t *testing.T) {
+	target := t.TempDir()
+	importer := t.TempDir()
+	for path, src := range map[string]string{
+		filepath.Join(target, "calc.go"):       "package calc\n",
+		filepath.Join(target, "calc_test.go"):  "package calc\n\nimport \"testing\"\n\nfunc TestCalc(t *testing.T) {}\n",
+		filepath.Join(importer, "app.go"):      "package app\n",
+		filepath.Join(importer, "app_test.go"): "package app\n\nimport \"testing\"\n\nfunc TestApp(t *testing.T) {}\n",
+	} {
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ti := cache.BuildTestIndex([]string{target, importer})
+	m := mutator.Mutant{Pkg: "m/calc", File: filepath.Join(target, "calc.go"), CoverageFile: "m/calc/calc.go", Line: 1}
+	base := func(files []string) []string {
+		var names []string
+		for _, f := range files {
+			names = append(names, filepath.Base(f))
+		}
+		slices.Sort(names)
+		return names
+	}
+
+	cross := coverage.NewTestMapForTesting(nil, nil).WithUnmappedForTesting(true,
+		coverage.UnmappedPkg{ImportPath: "m/calc", Dir: target},
+		coverage.UnmappedPkg{ImportPath: "m/app", Dir: importer})
+	if got := base(testFilesResolver(ti, cross, true)(m)); !slices.Equal(got, []string{"app.go", "app_test.go", "calc_test.go"}) {
+		t.Errorf("unmapped importer: files = %v, want the importer's files plus the own test file", got)
+	}
+	if got := base(testFilesResolver(ti, nil, false)(m)); !slices.Equal(got, []string{"calc_test.go"}) {
+		t.Errorf("nil map: files = %v, want only the own test file", got)
 	}
 }
 

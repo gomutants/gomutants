@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -438,5 +439,27 @@ func TestAlpha(t *testing.T) {}
 	if len(got) != 1 || filepath.Base(got[0]) != "a_test.go" {
 		t.Errorf("CoveringFiles = %v, want only a_test.go — the mutant's own "+
 			"production files belong to pkg_hash", got)
+	}
+}
+
+// TestPackageFiles: a package whose whole suite runs contributes its test
+// files and its production sources, and nothing that isn't Go.
+func TestPackageFiles(t *testing.T) {
+	importer := t.TempDir()
+	mustWrite(t, filepath.Join(importer, "e2e_test.go"), "package y\n\nimport \"testing\"\n\nfunc TestEndToEnd(t *testing.T) {}\n")
+	mustWrite(t, filepath.Join(importer, "fixtures.go"), "package y\n\nconst Want = 42\n")
+	mustWrite(t, filepath.Join(importer, "notes.txt"), "not a package input\n")
+
+	ti := BuildTestIndex([]string{importer})
+	var names []string
+	for _, f := range ti.PackageFiles(importer) {
+		names = append(names, filepath.Base(f))
+	}
+	sort.Strings(names)
+	if strings.Join(names, ",") != "e2e_test.go,fixtures.go" {
+		t.Errorf("PackageFiles = %v, want [e2e_test.go fixtures.go]", names)
+	}
+	if got := ti.PackageFiles(t.TempDir()); got != nil {
+		t.Errorf("PackageFiles(unindexed dir) = %v, want nil", got)
 	}
 }
