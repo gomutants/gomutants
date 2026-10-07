@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -77,8 +78,8 @@ type TestMap struct {
 	unmapped map[string]UnmappedPkg
 
 	// unmappedOrder is, per unmapped package, the listing order of the
-	// test its reason comes from, or -1 for a reason that concerns the
-	// whole package (see markUnmapped).
+	// test its reason comes from, or math.MinInt for a reason that
+	// concerns the whole package (see markUnmappedAt).
 	unmappedOrder map[string]int
 
 	// unmappedSorted is unmapped's values sorted by import path, kept in
@@ -121,12 +122,18 @@ func newTestMap(crossPkg bool) *TestMap {
 	}
 }
 
-// markUnmapped records that pkg's tests can't be routed individually.
-// Of several reasons, the one from the test listed first is kept — order
-// is that test's place in its package's listing, or -1 for a reason about
-// the whole package. It is the likeliest cause of the rest, and it
-// doesn't depend on which test's run happened to finish first.
-func (tm *TestMap) markUnmapped(importPath, dir, reason string, order int) {
+// markUnmapped records that pkg's tests can't be routed individually, for
+// a reason about the whole package, which outranks any test's.
+func (tm *TestMap) markUnmapped(importPath, dir, reason string) {
+	tm.markUnmappedAt(importPath, dir, reason, math.MinInt)
+}
+
+// markUnmappedAt records that pkg's tests can't be routed individually,
+// for a reason about the test at order in its package's listing. Of
+// several reasons, the one from the test listed first is kept: it is the
+// likeliest cause of the rest, and it doesn't depend on which test's run
+// happened to finish first.
+func (tm *TestMap) markUnmappedAt(importPath, dir, reason string, order int) {
 	if prev, ok := tm.unmappedOrder[importPath]; ok && prev <= order {
 		return
 	}
@@ -257,7 +264,7 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 	}
 	tm := newTestMap(opts.CoverPkg != "")
 	for _, f := range compileFailures {
-		tm.markUnmapped(f.pkg.importPath, f.pkg.dir, "its test binary failed to compile", -1)
+		tm.markUnmapped(f.pkg.importPath, f.pkg.dir, "its test binary failed to compile")
 	}
 	if err := setTestArgs(ctx, projectDir, opts, pkgBins); err != nil {
 		return nil, err
@@ -270,7 +277,7 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 	// once the ctx is done.
 	tests, listFailures := listTestsFunc(ctx, pkgBins, opts.TestTimeout, opts.Workers)
 	for pkg, reason := range listFailures {
-		tm.markUnmapped(pkg, pkgBins[pkg].dir, reason, -1)
+		tm.markUnmapped(pkg, pkgBins[pkg].dir, reason)
 	}
 
 	// 3. Run tests in parallel using compiled binaries.
@@ -307,14 +314,12 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 			soloSkips[tc.pkg] = append(soloSkips[tc.pkg], testEntry{name: tc.testName, pkg: tc.pkg, order: tc.order})
 		}
 	}
-	// Tests skipped after a cancellation leave the map partial, and a
-	// partial map routes mutants away from tests that were never run.
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
 
 	// 5. Check the tests that skipped alone (see checkSoloSkips).
 	tm.unmapSoloSkips(ctx, pkgBins, tests, soloSkips, opts)
+	// Tests or checks skipped after a cancellation leave the map partial,
+	// and a partial map routes mutants away from tests that were never
+	// run.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -339,7 +344,7 @@ func (tm *TestMap) unmapSoloSkips(ctx context.Context, pkgBins map[string]*compi
 		}
 	}
 	for pkg, f := range checkSoloSkipsFunc(ctx, pkgBins, tests, skips, opts.TestTimeout, opts.Workers) {
-		tm.markUnmapped(pkg, pkgBins[pkg].dir, f.reason, f.order)
+		tm.markUnmappedAt(pkg, pkgBins[pkg].dir, f.reason, f.order)
 	}
 }
 
@@ -356,7 +361,7 @@ func (tm *TestMap) ingestResult(tc testCoverage) {
 	// its package's other tests would skip it. Only the whole package
 	// reproduces the order it passes in.
 	if tc.failure != "" {
-		tm.markUnmapped(tc.pkg, tc.dir, tc.failure, tc.order)
+		tm.markUnmappedAt(tc.pkg, tc.dir, tc.failure, tc.order)
 	}
 }
 
@@ -454,9 +459,10 @@ func (f *firstFailures) record(pkg string, order int) {
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if prev, ok := f.at[pkg]; !ok || order < prev {
-		f.at[pkg] = order
+	if prev, ok := f.at[pkg]; ok {
+		order = min(prev, order)
 	}
+	f.at[pkg] = order
 }
 
 // before reports whether a test listed before order in pkg failed alone.
@@ -545,8 +551,7 @@ func compileTestBinary(ctx context.Context, projectDir string, opts BuildOptions
 	args = append(args, pkg.importPath)
 	args = append(args, buildFlags(opts.TestFlags)...)
 
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = projectDir
+	cmd := goCmd(ctx, projectDir, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
@@ -572,7 +577,7 @@ func measureRebuilds(ctx context.Context, projectDir string, opts BuildOptions, 
 	var (
 		mu  sync.Mutex
 		wg  sync.WaitGroup
-		sem = make(chan struct{}, max(1, opts.Workers))
+		sem = make(chan struct{}, opts.Workers)
 	)
 	for pkg, cp := range pkgBins {
 		sem <- struct{}{}
@@ -598,19 +603,15 @@ func measureRebuilds(ctx context.Context, projectDir string, opts BuildOptions, 
 // unique to this call, appended to cp.probeFile through an overlay; the
 // flags are the mutant runs' build flags. Building also warms the cache
 // the mutant runs then use.
+//
+// The changed file and overlay go next to cp's test binary, in its own
+// directory; the probe's binary is removed once built.
 func measureRebuild(ctx context.Context, projectDir string, opts BuildOptions, cp *compiledPkg) (time.Duration, error) {
-	if cp.probeFile == "" {
-		return 0, errors.New("no Go file to change")
-	}
 	src, err := os.ReadFile(cp.probeFile)
 	if err != nil {
 		return 0, err
 	}
-	dir, err := os.MkdirTemp(opts.TmpDir, "rebuild-")
-	if err != nil {
-		return 0, err
-	}
-	defer func() { _ = os.RemoveAll(dir) }()
+	dir := filepath.Dir(cp.binPath)
 	changed := filepath.Join(dir, filepath.Base(cp.probeFile))
 	src = fmt.Appendf(src, "\n// gomutants rebuild probe %d\n", time.Now().UnixNano())
 	ov, _ := json.Marshal(map[string]map[string]string{"Replace": {cp.probeFile: changed}})
@@ -619,14 +620,15 @@ func measureRebuild(ctx context.Context, projectDir string, opts BuildOptions, c
 		return 0, err
 	}
 
-	args := []string{"test", "-c", "-vet=off", "-o", filepath.Join(dir, "probe.test"), "-overlay=" + ovPath}
+	probeBin := filepath.Join(dir, "probe.test")
+	defer func() { _ = os.Remove(probeBin) }()
+	args := []string{"test", "-c", "-vet=off", "-o", probeBin, "-overlay=" + ovPath}
 	if opts.Tags != "" {
 		args = append(args, tagsBuildFlag+opts.Tags)
 	}
 	args = append(args, cp.importPath)
 	args = append(args, buildFlags(opts.TestFlags)...)
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = projectDir
+	cmd := goCmd(ctx, projectDir, args...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	start := time.Now()
@@ -755,12 +757,13 @@ type skipScanner struct {
 
 func (s *skipScanner) Write(p []byte) (int, error) {
 	n := len(p)
-	for len(p) > 0 {
+	for {
 		chunk, rest, eol := bytes.Cut(p, []byte{'\n'})
-		room := max(0, maxScannedLine-len(s.line))
+		// s.line never outgrows maxScannedLine, so room is never negative.
+		room := maxScannedLine - len(s.line)
 		s.line = append(s.line, chunk[:min(len(chunk), room)]...)
 		if !eol {
-			break
+			return n, nil
 		}
 		if name, ok := bytes.CutPrefix(s.line, []byte(skipLinePrefix)); ok {
 			name, _, _ = bytes.Cut(name, []byte(" "))
@@ -769,7 +772,6 @@ func (s *skipScanner) Write(p []byte) (int, error) {
 		s.line = s.line[:0]
 		p = rest
 	}
-	return n, nil
 }
 
 // soloSkipFailure is why checkSoloSkips unmaps a package, and the listing
@@ -798,7 +800,7 @@ func checkSoloSkips(ctx context.Context, pkgBins map[string]*compiledPkg, tests 
 	var (
 		mu  sync.Mutex
 		wg  sync.WaitGroup
-		sem = make(chan struct{}, max(1, workers))
+		sem = make(chan struct{}, workers)
 	)
 	for pkg, skipped := range skips {
 		sem <- struct{}{}
@@ -819,11 +821,10 @@ func checkSoloSkips(ctx context.Context, pkgBins map[string]*compiledPkg, tests 
 
 // checkPkgSkips runs one package's check for checkSoloSkips. listed is
 // the package's tests and skipped those that skipped alone, both in any
-// order.
+// order: the run's -test.run pattern selects by name, and the binary runs
+// what it selects in listing order.
 func checkPkgSkips(ctx context.Context, cp *compiledPkg, listed, skipped []testEntry, timeout time.Duration) (soloSkipFailure, bool) {
-	byOrder := func(a, b testEntry) int { return a.order - b.order }
-	slices.SortFunc(listed, byOrder)
-	slices.SortFunc(skipped, byOrder)
+	slices.SortFunc(skipped, func(a, b testEntry) int { return a.order - b.order })
 	last := skipped[len(skipped)-1].order
 	var names []string
 	for _, t := range listed {
@@ -1051,7 +1052,7 @@ func (tm *TestMap) WithUnmappedForTesting(crossPkg bool, unmapped ...UnmappedPkg
 	c.unmapped = maps.Clone(tm.unmapped)
 	c.unmappedOrder = maps.Clone(tm.unmappedOrder)
 	for _, u := range unmapped {
-		c.markUnmapped(u.ImportPath, u.Dir, u.Reason, -1)
+		c.markUnmapped(u.ImportPath, u.Dir, u.Reason)
 	}
 	return &c
 }
@@ -1217,15 +1218,11 @@ func testBinaryArgs(ctx context.Context, projectDir, tags, pkg string, flags []s
 		args = append(args, tagsBuildFlag+tags)
 	}
 	args = append(append(args, pkg), flags...)
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = projectDir
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("go test -n %s: %w\n%s", pkg, err, out.String())
+	out, err := goCmd(ctx, projectDir, args...).CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("go test -n %s: %w\n%s", pkg, err, out)
 	}
-	return parseTestBinaryArgs(out.String())
+	return parseTestBinaryArgs(string(out))
 }
 
 // goTestOwnArg reports whether a test-binary argument is one `go test` adds
@@ -1257,7 +1254,8 @@ func parseTestBinaryArgs(out string) ([]string, error) {
 			!strings.HasSuffix(strings.TrimSuffix(fields[0], ".exe"), ".test") {
 			continue
 		}
-		return slices.DeleteFunc(fields[1:], goTestOwnArg), nil
+		// The binary itself is in $WORK, so goTestOwnArg drops it too.
+		return slices.DeleteFunc(fields, goTestOwnArg), nil
 	}
 	return nil, errors.New("go test -n printed no test binary command")
 }
@@ -1265,20 +1263,17 @@ func parseTestBinaryArgs(out string) ([]string, error) {
 // testDeps returns, for each of pkgs, the packages its test binary links,
 // read from the deps of the "<pkg>.test" main package `go list -test`
 // generates, which take in the test files' imports too. A package go list
-// reports an error for is left out, as its deps may be incomplete.
+// reports an error for is left out, as its deps may be incomplete. The
+// caller discards a failure, so it isn't dressed up.
 func testDeps(ctx context.Context, projectDir, tags string, pkgs []string) (map[string]map[string]bool, error) {
 	args := []string{"list", "-e", "-test", "-f", "{{if not (or .Error .DepsErrors)}}{{range .Deps}}{{$.ImportPath}}\t{{.}}\n{{end}}{{end}}"}
 	if tags != "" {
 		args = append(args, tagsBuildFlag+tags)
 	}
 	args = append(args, pkgs...)
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = projectDir
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("go list -test: %w\n%s", err, stderr.String())
+	out, err := goCmd(ctx, projectDir, args...).Output()
+	if err != nil {
+		return nil, err
 	}
 
 	testMains := make(map[string]string, len(pkgs))
@@ -1286,7 +1281,7 @@ func testDeps(ctx context.Context, projectDir, tags string, pkgs []string) (map[
 		testMains[p+".test"] = p
 	}
 	deps := make(map[string]map[string]bool)
-	for line := range strings.Lines(stdout.String()) {
+	for line := range strings.Lines(string(out)) {
 		testMain, dep, _ := strings.Cut(strings.TrimSpace(line), "\t")
 		pkg, ok := testMains[testMain]
 		if !ok {
@@ -1302,12 +1297,19 @@ func testDeps(ctx context.Context, projectDir, tags string, pkgs []string) (map[
 	return deps, nil
 }
 
+// goCmd returns a `go` command run from projectDir.
+func goCmd(ctx context.Context, projectDir string, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "go", args...)
+	cmd.Dir = projectDir
+	return cmd
+}
+
 type resolvedPkg struct {
 	importPath string
 	dir        string
 	// probeFile is the file measureRebuild changes: the package's first
 	// production file, as mutants change those, or its first test file
-	// in a package without any. Empty in a package with neither.
+	// in a package without any.
 	probeFile string
 }
 
@@ -1318,8 +1320,7 @@ func resolvePackages(ctx context.Context, projectDir string, patterns []string, 
 		args = append(args, tagsBuildFlag+tags)
 	}
 	args = append(args, patterns...)
-	cmd := exec.CommandContext(ctx, "go", args...)
-	cmd.Dir = projectDir
+	cmd := goCmd(ctx, projectDir, args...)
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -1332,14 +1333,10 @@ func resolvePackages(ctx context.Context, projectDir string, patterns []string, 
 	var pkgs []resolvedPkg
 	scanner := bufio.NewScanner(&stdout)
 	for scanner.Scan() {
-		parts := strings.SplitN(scanner.Text(), "\t", 3)
-		if len(parts) == 3 {
-			pkg := resolvedPkg{importPath: parts[0], dir: parts[1]}
-			if parts[2] != "" {
-				pkg.probeFile = filepath.Join(parts[1], parts[2])
-			}
-			pkgs = append(pkgs, pkg)
-		}
+		importPath, rest, _ := strings.Cut(scanner.Text(), "\t")
+		dir, file, _ := strings.Cut(rest, "\t")
+		// go list lists only packages with a Go file, so file is set.
+		pkgs = append(pkgs, resolvedPkg{importPath: importPath, dir: dir, probeFile: filepath.Join(dir, file)})
 	}
 	return pkgs, nil
 }

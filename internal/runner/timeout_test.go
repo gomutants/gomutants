@@ -98,6 +98,19 @@ func TestTimeoutPolicyForUnmeasuredRebuild(t *testing.T) {
 	}
 }
 
+// TestRebuildCost: a measured rebuild sum for the packages run, and none
+// at all — not a partial sum — once one of them is unmeasured.
+func TestRebuildCost(t *testing.T) {
+	tm := coverage.NewTestMapForTesting(nil, nil).WithRebuildsForTesting(map[string]time.Duration{"p": time.Second, "q": 2 * time.Second})
+	refs := []coverage.TestRef{{Pkg: "p", Name: "TestA"}, {Pkg: "q", Name: "TestB"}, {Pkg: "p", Name: "TestC"}}
+	if total, ok := rebuildCost(tm, refs, "z"); total != 3*time.Second || !ok {
+		t.Errorf("rebuildCost(p, q) = (%v, %v), want (3s, true)", total, ok)
+	}
+	if total, ok := rebuildCost(tm, append(refs, coverage.TestRef{Pkg: "r", Name: "TestD"}), "z"); total != 0 || ok {
+		t.Errorf("rebuildCost with r unmeasured = (%v, %v), want (0, false)", total, ok)
+	}
+}
+
 func TestTimeoutPolicyForUsesPerTestSum(t *testing.T) {
 	tm := newTestMapWithDurations(t,
 		map[[2]string]time.Duration{

@@ -143,3 +143,68 @@ func TestKillTreeOnCancelFallsBackToProcess(t *testing.T) {
 		t.Fatal("cancelling didn't kill the process")
 	}
 }
+
+// leakModule's TestMain starts a `sleep` holding the binary's stdout,
+// records its pid in $LEAK_PID_DIR, and then runs the tests normally, so
+// the binary exits while the sleep keeps its output open.
+var leakModule = map[string]string{
+	"go.mod": "module leakmod\n\ngo 1.26\n",
+	"l.go":   "package leakmod\n\nfunc F() int { return 1 }\n",
+	"l_test.go": `package leakmod
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"testing"
+)
+
+func TestMain(m *testing.M) {
+	cmd := exec.Command("sleep", "60")
+	cmd.Stdout = os.Stdout
+	if err := cmd.Start(); err != nil {
+		os.Exit(2)
+	}
+	pid := strconv.Itoa(cmd.Process.Pid)
+	os.WriteFile(filepath.Join(os.Getenv("LEAK_PID_DIR"), pid), nil, 0o644)
+	os.Exit(m.Run())
+}
+
+func TestF(t *testing.T) { F() }
+
+func TestSkip(t *testing.T) { t.Skip("always") }
+`,
+}
+
+// TestRunsSurviveLeftoverOutput: a binary that succeeds but leaves a
+// process holding its output open still lists, runs and checks fine once
+// pipeDrainDelay gives up on that output — the binary's own is complete.
+func TestRunsSurviveLeftoverOutput(t *testing.T) {
+	orig := pipeDrainDelay
+	t.Cleanup(func() { pipeDrainDelay = orig })
+	pipeDrainDelay = 100 * time.Millisecond
+	pidDir := t.TempDir()
+	t.Setenv("LEAK_PID_DIR", pidDir)
+	t.Cleanup(func() {
+		entries, _ := os.ReadDir(pidDir)
+		for _, e := range entries {
+			if pid, err := strconv.Atoi(e.Name()); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	dir := writeModule(t, leakModule)
+	cp := compileFixture(t, dir, "leakmod")
+
+	if names, err := listBinTests(context.Background(), cp, 0); err != nil || len(names) != 2 {
+		t.Errorf("listBinTests = (%v, %v), want both tests", names, err)
+	}
+	if blocks, _, skipped, err := runCompiledTest(context.Background(), cp, "TestF", filepath.Join(t.TempDir(), "f.cov"), 0); err != nil || len(blocks) == 0 || skipped {
+		t.Errorf("runCompiledTest = (%d blocks, skipped %v, %v), want TestF's coverage", len(blocks), skipped, err)
+	}
+	skip := []testEntry{{name: "TestSkip", pkg: "leakmod", order: 1}}
+	if f, failed := checkPkgSkips(context.Background(), cp, skip, skip, 0); failed {
+		t.Errorf("checkPkgSkips = %+v, want TestSkip's skip confirmed", f)
+	}
+}
