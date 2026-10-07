@@ -975,6 +975,17 @@ func TestProcessWorkSkipsAfterEarlierFailure(t *testing.T) {
 	}
 }
 
+// writeInChunks writes out to s in writes of size bytes, each of which
+// must be taken whole.
+func writeInChunks(t *testing.T, s *skipScanner, out string, size int) {
+	t.Helper()
+	for chunk := range slices.Chunk([]byte(out), size) {
+		if n, err := s.Write(chunk); n != len(chunk) || err != nil {
+			t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(chunk))
+		}
+	}
+}
+
 // TestSkipScanner reads skip lines from -test.v output however it is
 // split into writes: top-level skips only. Of an overlong line only the
 // first 4096 bytes are kept, which still holds a whole skip line.
@@ -985,22 +996,14 @@ func TestSkipScanner(t *testing.T) {
 		long + "\n" + strings.Repeat("y", 3*4096) + "\n--- SKIP: TestC (0.01s)\n--- SKIP: TestD"
 	for _, size := range []int{1, 7, len(out)} {
 		var s skipScanner
-		for chunk := range slices.Chunk([]byte(out), size) {
-			if n, err := s.Write(chunk); n != len(chunk) || err != nil {
-				t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(chunk))
-			}
-		}
+		writeInChunks(t, &s, out, size)
 		if want := []string{"TestA", long[len(skipLinePrefix):], "TestC"}; !slices.Equal(s.skipped, want) {
 			t.Errorf("writes of %d: skipped = %.40q, want %.40q", size, s.skipped, want)
 		}
 	}
 
 	var s skipScanner
-	for chunk := range slices.Chunk([]byte(strings.Repeat("y", 3*4096)), 1000) {
-		if n, err := s.Write(chunk); n != len(chunk) || err != nil {
-			t.Fatalf("Write = (%d, %v), want (%d, nil)", n, err, len(chunk))
-		}
-	}
+	writeInChunks(t, &s, strings.Repeat("y", 3*4096), 1000)
 	if len(s.line) != 4096 {
 		t.Errorf("an unfinished overlong line written in parts: kept %d bytes, want 4096", len(s.line))
 	}
