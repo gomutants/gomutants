@@ -266,7 +266,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	mr := &mutationRun{cfg: cfg, opts: opts, filters: filters}
+	mr := &mutationRun{cfg: cfg, opts: opts.runOptions, filters: filters}
 
 	if err := mr.setup(ctx); err != nil {
 		return err
@@ -276,10 +276,14 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// 2. Create temp directory.
-	mr.tmpDir, err = mkdirTempFunc("", "gomutants-*")
-	if err != nil {
-		return fmt.Errorf("creating temp dir: %w", err)
+	if err := mr.findMutants(); err != nil {
+		return err
+	}
+
+	mr.resolveCoverageScope(ctx)
+
+	if err := mr.makeTempDir(); err != nil {
+		return err
 	}
 	defer func() { _ = os.RemoveAll(mr.tmpDir) }()
 
@@ -310,17 +314,9 @@ func run(ctx context.Context, args []string) error {
 
 	mr.applyCache()
 
-	term2 := report.NewTerminal(stdout, mr.pendingCount, mr.cfg.Verbose, mr.cfg.Quiet)
-	// Idle "(compiling)" heartbeat so the TTY doesn't sit silent during
-	// the first per-package go-test compile (no OnResult until the first
-	// mutant completes). First OnResult auto-stops it; the defer covers
-	// the all-cached / zero-pending paths where OnResult never fires.
-	term2.StartHeartbeat()
-	defer term2.StopHeartbeat()
+	mr.runMutants(ctx)
 
-	mr.runMutants(ctx, term2)
-
-	r, err := mr.writeReports(term2)
+	r, err := mr.writeReports()
 	if err != nil {
 		return err
 	}

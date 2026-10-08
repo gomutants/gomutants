@@ -17,6 +17,15 @@ import (
 type cliOptions struct {
 	flags      config.Flags
 	configPath string
+	runOptions
+	showVersion  bool
+	listMutators bool
+}
+
+// runOptions are the CLI-only settings the mutation run itself reads. They
+// are kept apart from flags so the run can't read a raw flag value that
+// .gomutants.yml should have been merged with.
+type runOptions struct {
 	// packages is the positional package patterns, defaulted to ./... .
 	packages []string
 
@@ -25,8 +34,21 @@ type cliOptions struct {
 	annotations       string
 	thresholdEfficacy float64
 	thresholdMcover   float64
-	showVersion       bool
-	listMutators      bool
+}
+
+// boolFlagFunc registers a BoolFunc flag that parses its value and hands it
+// to set. BoolFunc rather than BoolVar lets set record that the flag was
+// given at all: the merge layer in (*Config).ApplyFlags relies on that .Set
+// bit to let an explicit value (=false included) override YAML.
+func boolFlagFunc(fs *flag.FlagSet, name, usage string, set func(bool)) {
+	fs.BoolFunc(name, usage, func(s string) error {
+		v, err := strconv.ParseBool(s)
+		if err != nil {
+			return fmt.Errorf("--%s: %w", name, err)
+		}
+		set(v)
+		return nil
+	})
 }
 
 // parseFlags parses args into cliOptions and runs the checks that need
@@ -42,71 +64,25 @@ func parseFlags(args []string) (*cliOptions, error) {
 	fs := flag.NewFlagSet("gomutants", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	var (
-		workers            int
-		testCPU            int
-		timeoutCoefficient int
-		timeoutMargin      float64
-		timeoutMin         time.Duration
-		adaptiveTimeout    config.AdaptiveTimeoutFlag
-		detectEquivalent   config.DetectEquivalentFlag
-		checkpointInterval config.CheckpointIntervalFlag
+	o := &cliOptions{}
+	f := &o.flags
+	// --test-flags is repeatable; the values are joined once parsing ends.
+	var testFlags []string
 
-		excludeCallsDefaults config.ExcludeCallsDefaultsFlag
-
-		coverPkg          string
-		tags              string
-		testFlags         []string
-		output            string
-		configPath        string
-		disable           string
-		only              string
-		excludeFiles      string
-		excludeCalls      string
-		changedSince      string
-		runMutantID       string
-		cachePath         string
-		annotations       string
-		strykerOutput     string
-		htmlOutput        string
-		thresholdEfficacy float64
-		thresholdMcover   float64
-		dryRun            bool
-		verbose           bool
-		quiet             bool
-		integration       bool
-		showVersion       bool
-		listMutators      bool
-	)
-
-	fs.IntVar(&workers, "workers", 0, "parallel workers (default: NumCPU)")
-	fs.IntVar(&workers, "w", 0, "parallel workers (shorthand)")
-	fs.IntVar(&testCPU, "test-cpu", 0, "value passed to inner go test -cpu per mutant (0 omits the flag; go test then uses GOMAXPROCS)")
-	fs.IntVar(&timeoutCoefficient, "timeout-coefficient", 0, "multiply baseline test time for the global timeout ceiling (default: 10)")
-	fs.Float64Var(&timeoutMargin, "timeout-margin", 0, fmt.Sprintf("scale per-test sums into the per-mutant adaptive timeout (default: %g)", config.DefaultTimeoutMargin))
-	fs.DurationVar(&timeoutMin, "timeout-min", 0, fmt.Sprintf("floor for the per-mutant adaptive timeout (default: %s)", config.DefaultTimeoutMin))
-	// BoolFunc lets us distinguish "user set --adaptive-timeout=false"
-	// from "user did not pass the flag" — the merge layer in
-	// (*Config).ApplyFlags relies on the .Set bit to override YAML.
-	fs.BoolFunc("adaptive-timeout", "use per-test durations to size each mutant's timeout (default: true; pass =false to disable)", func(s string) error {
-		v, err := strconv.ParseBool(s)
-		if err != nil {
-			return fmt.Errorf("--adaptive-timeout: %w", err)
-		}
-		adaptiveTimeout = config.AdaptiveTimeoutFlag{Set: true, Value: v}
-		return nil
+	fs.IntVar(&f.Workers, "workers", 0, "parallel workers (default: NumCPU)")
+	fs.IntVar(&f.Workers, "w", 0, "parallel workers (shorthand)")
+	fs.IntVar(&f.TestCPU, "test-cpu", 0, "value passed to inner go test -cpu per mutant (0 omits the flag; go test then uses GOMAXPROCS)")
+	fs.IntVar(&f.TimeoutCoefficient, "timeout-coefficient", 0, "multiply baseline test time for the global timeout ceiling (default: 10)")
+	fs.Float64Var(&f.TimeoutMargin, "timeout-margin", 0, fmt.Sprintf("scale per-test sums into the per-mutant adaptive timeout (default: %g)", config.DefaultTimeoutMargin))
+	fs.DurationVar(&f.TimeoutMin, "timeout-min", 0, fmt.Sprintf("floor for the per-mutant adaptive timeout (default: %s)", config.DefaultTimeoutMin))
+	boolFlagFunc(fs, "adaptive-timeout", "use per-test durations to size each mutant's timeout (default: true; pass =false to disable)", func(v bool) {
+		f.AdaptiveTimeout = config.AdaptiveTimeoutFlag{Set: true, Value: v}
 	})
-	// Opt-in TCE pass. BoolFunc (like --adaptive-timeout) so ApplyFlags can
-	// tell "not provided" from an explicit value via the .Set bit.
-	fs.BoolFunc("detect-equivalent", "after testing, compile each surviving mutant with -gcflags=-S and mark it EQUIVALENT when the generated assembly is identical to the original (Trivial Compiler Equivalence; default false, adds one package compile per survivor)", func(s string) error {
-		v, err := strconv.ParseBool(s)
-		if err != nil {
-			return fmt.Errorf("--detect-equivalent: %w", err)
-		}
-		detectEquivalent = config.DetectEquivalentFlag{Set: true, Value: v}
-		return nil
+	// Opt-in TCE pass.
+	boolFlagFunc(fs, "detect-equivalent", "after testing, compile each surviving mutant with -gcflags=-S and mark it EQUIVALENT when the generated assembly is identical to the original (Trivial Compiler Equivalence; default false, adds one package compile per survivor)", func(v bool) {
+		f.DetectEquivalent = config.DetectEquivalentFlag{Set: true, Value: v}
 	})
-	// fs.Func (like the BoolFunc above) lets us distinguish "user set
+	// fs.Func (like boolFlagFunc) lets us distinguish "user set
 	// --checkpoint-interval" from "user did not pass the flag", which
 	// (*Config).ApplyFlags needs because 0 is a valid value (disable) and
 	// can't be told apart from the unset zero value otherwise.
@@ -118,11 +94,11 @@ func parseFlags(args []string) (*cliOptions, error) {
 		if d < 0 {
 			return fmt.Errorf("--checkpoint-interval must be >= 0, got %s", d)
 		}
-		checkpointInterval = config.CheckpointIntervalFlag{Set: true, Value: d}
+		f.CheckpointInterval = config.CheckpointIntervalFlag{Set: true, Value: d}
 		return nil
 	})
-	fs.StringVar(&coverPkg, "coverpkg", "", "coverage package pattern")
-	fs.StringVar(&tags, "tags", "", "comma-separated build tags forwarded as -tags to the inner go list/go test (gremlins-compat)")
+	fs.StringVar(&f.CoverPkg, "coverpkg", "", "coverage package pattern")
+	fs.StringVar(&f.Tags, "tags", "", "comma-separated build tags forwarded as -tags to the inner go list/go test (gremlins-compat)")
 	// fs.Func rather than StringVar so repeated --test-flags accumulate
 	// instead of the last one silently winning; a user building the value
 	// up across a wrapper script and a CI invocation expects both to apply.
@@ -134,105 +110,61 @@ func parseFlags(args []string) (*cliOptions, error) {
 		testFlags = append(testFlags, s)
 		return nil
 	})
-	fs.StringVar(&output, "output", "", "JSON report path")
-	fs.StringVar(&output, "o", "", "JSON report path (shorthand)")
-	fs.StringVar(&configPath, "config", ".gomutants.yml", "config file path")
-	fs.StringVar(&disable, "disable", "", "comma-separated mutator types to disable")
-	fs.StringVar(&only, "only", "", "comma-separated mutator types to run (disables all others)")
-	fs.StringVar(&excludeFiles, "exclude-files", "", "comma-separated regexps; skip mutating production files whose module-relative path matches any (e.g. \"vendor/,_gen\\\\.go$\")")
-	fs.StringVar(&excludeCalls, "exclude-calls", "", "comma-separated selector globs; suppress mutants inside calls whose selector matches any (e.g. \"log.Print*,*.Debug\"). Extends the built-in stdlib-logging set")
-	// BoolFunc (like --adaptive-timeout) so ApplyFlags can tell "not
-	// provided" from an explicit value via the .Set bit — this default is
-	// on, so the explicit =false has to be distinguishable.
-	fs.BoolFunc("exclude-calls-defaults", "apply the built-in --exclude-calls set for Go's standard-library logging (default: true; pass =false to narrow or replace it)", func(s string) error {
-		v, err := strconv.ParseBool(s)
-		if err != nil {
-			return fmt.Errorf("--exclude-calls-defaults: %w", err)
-		}
-		excludeCallsDefaults = config.ExcludeCallsDefaultsFlag{Set: true, Value: v}
-		return nil
+	fs.StringVar(&f.Output, "output", "", "JSON report path")
+	fs.StringVar(&f.Output, "o", "", "JSON report path (shorthand)")
+	fs.StringVar(&o.configPath, "config", ".gomutants.yml", "config file path")
+	fs.StringVar(&f.Disable, "disable", "", "comma-separated mutator types to disable")
+	fs.StringVar(&f.Only, "only", "", "comma-separated mutator types to run (disables all others)")
+	fs.StringVar(&f.ExcludeFiles, "exclude-files", "", "comma-separated regexps; skip mutating production files whose module-relative path matches any (e.g. \"vendor/,_gen\\\\.go$\")")
+	fs.StringVar(&f.ExcludeCalls, "exclude-calls", "", "comma-separated selector globs; suppress mutants inside calls whose selector matches any (e.g. \"log.Print*,*.Debug\"). Extends the built-in stdlib-logging set")
+	// Default on, so the explicit =false has to be distinguishable.
+	boolFlagFunc(fs, "exclude-calls-defaults", "apply the built-in --exclude-calls set for Go's standard-library logging (default: true; pass =false to narrow or replace it)", func(v bool) {
+		f.ExcludeCallsDefaults = config.ExcludeCallsDefaultsFlag{Set: true, Value: v}
 	})
-	fs.StringVar(&changedSince, "changed-since", "", "only test mutants on lines changed vs git ref (e.g. main, HEAD~1)")
+	fs.StringVar(&f.ChangedSince, "changed-since", "", "only test mutants on lines changed vs git ref (e.g. main, HEAD~1)")
 	// The back-quoted `id` is the value placeholder flag's UnquoteUsage
 	// prints in --help; see the --test-flags comment above for why its
 	// position within the string matters.
-	fs.StringVar(&runMutantID, "run-mutant-id", "", "run only the mutant with this stable `id` (the id field of a JSON report entry; a unique prefix is accepted). Skips the incremental cache for that mutant so the verdict is always freshly measured")
-	fs.StringVar(&cachePath, "cache", "", "path to incremental-analysis cache file; skips mutants whose source package and covering tests are byte-identical to the cached run. Default .gomutants-cache.json. Pass --cache=off to disable")
-	fs.StringVar(&annotations, "annotations", "", "emit annotations for surviving mutants (values: github)")
-	fs.StringVar(&strykerOutput, "stryker-output", "", "also write a Stryker mutation-testing-elements report at this path (HTML viewer / dashboard)")
-	fs.StringVar(&htmlOutput, "html-output", "", "also write a self-contained interactive HTML mutation report at this path (Stryker mutation-testing-elements viewer, no network deps)")
-	fs.Float64Var(&thresholdEfficacy, "threshold-efficacy", 0, "minimum test efficacy %% (KILLED/(KILLED+LIVED)); exit 10 if not met. 0 disables (gremlins-compat)")
-	fs.Float64Var(&thresholdMcover, "threshold-mcover", 0, "minimum mutant coverage %% ((KILLED+LIVED)/(KILLED+LIVED+NOT_COVERED)); exit 11 if not met. 0 disables (gremlins-compat)")
-	fs.BoolVar(&dryRun, "dry-run", false, "list mutants without testing")
-	fs.BoolVar(&verbose, "verbose", false, "show each mutant as tested")
-	fs.BoolVar(&verbose, "v", false, "verbose (shorthand)")
-	fs.BoolVar(&quiet, "quiet", false, "suppress header, phase lines, and per-mutant progress; only the final summary prints (warnings still go to stderr)")
-	fs.BoolVar(&quiet, "q", false, "quiet (shorthand)")
-	fs.BoolVar(&integration, "integration", false, "cross-package mode: route each mutant to covering tests in any package that imports it (widens coverage + the per-test build to the reverse-dependency closure). Manages -coverpkg itself; passing --coverpkg too is an error")
-	fs.BoolVar(&showVersion, "version", false, "print version and exit")
-	fs.BoolVar(&listMutators, "list-mutators", false, "print every mutator type with its description and example, then exit")
+	fs.StringVar(&f.RunMutantID, "run-mutant-id", "", "run only the mutant with this stable `id` (the id field of a JSON report entry; a unique prefix is accepted). Skips the incremental cache for that mutant so the verdict is always freshly measured")
+	fs.StringVar(&f.Cache, "cache", "", "path to incremental-analysis cache file; skips mutants whose source package and covering tests are byte-identical to the cached run. Default .gomutants-cache.json. Pass --cache=off to disable")
+	fs.StringVar(&o.annotations, "annotations", "", "emit annotations for surviving mutants (values: github)")
+	fs.StringVar(&o.strykerOutput, "stryker-output", "", "also write a Stryker mutation-testing-elements report at this path (HTML viewer / dashboard)")
+	fs.StringVar(&o.htmlOutput, "html-output", "", "also write a self-contained interactive HTML mutation report at this path (Stryker mutation-testing-elements viewer, no network deps)")
+	fs.Float64Var(&o.thresholdEfficacy, "threshold-efficacy", 0, "minimum test efficacy %% (KILLED/(KILLED+LIVED)); exit 10 if not met. 0 disables (gremlins-compat)")
+	fs.Float64Var(&o.thresholdMcover, "threshold-mcover", 0, "minimum mutant coverage %% ((KILLED+LIVED)/(KILLED+LIVED+NOT_COVERED)); exit 11 if not met. 0 disables (gremlins-compat)")
+	fs.BoolVar(&f.DryRun, "dry-run", false, "list mutants without testing")
+	fs.BoolVar(&f.Verbose, "verbose", false, "show each mutant as tested")
+	fs.BoolVar(&f.Verbose, "v", false, "verbose (shorthand)")
+	fs.BoolVar(&f.Quiet, "quiet", false, "suppress header, phase lines, and per-mutant progress; only the final summary prints (warnings still go to stderr)")
+	fs.BoolVar(&f.Quiet, "q", false, "quiet (shorthand)")
+	fs.BoolVar(&f.Integration, "integration", false, "cross-package mode: route each mutant to covering tests in any package that imports it (widens coverage + the per-test build to the reverse-dependency closure). Manages -coverpkg itself; passing --coverpkg too is an error")
+	fs.BoolVar(&o.showVersion, "version", false, "print version and exit")
+	fs.BoolVar(&o.listMutators, "list-mutators", false, "print every mutator type with its description and example, then exit")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, usageError(err)
 	}
+	f.TestFlags = strings.Join(testFlags, " ")
 
-	if testCPU < 0 {
-		return nil, usageErrorf("--test-cpu must be >= 0, got %d", testCPU)
+	if f.TestCPU < 0 {
+		return nil, usageErrorf("--test-cpu must be >= 0, got %d", f.TestCPU)
 	}
 
-	if quiet && verbose {
+	if f.Quiet && f.Verbose {
 		return nil, usageErrorf("--quiet and --verbose cannot be used together")
 	}
 
-	switch annotations {
+	switch o.annotations {
 	case "", "github":
 	default:
-		return nil, usageErrorf("--annotations=%q not recognized (supported: github)", annotations)
+		return nil, usageErrorf("--annotations=%q not recognized (supported: github)", o.annotations)
 	}
 
-	packages := fs.Args()
-	if len(packages) == 0 {
-		packages = []string{"./..."}
+	o.packages = fs.Args()
+	if len(o.packages) == 0 {
+		o.packages = []string{"./..."}
 	}
-
-	return &cliOptions{
-		flags: config.Flags{
-			Workers:            workers,
-			TestCPU:            testCPU,
-			TimeoutCoefficient: timeoutCoefficient,
-			TimeoutMargin:      timeoutMargin,
-			TimeoutMin:         timeoutMin,
-			AdaptiveTimeout:    adaptiveTimeout,
-			DetectEquivalent:   detectEquivalent,
-			CheckpointInterval: checkpointInterval,
-			CoverPkg:           coverPkg,
-			Tags:               tags,
-			TestFlags:          strings.Join(testFlags, " "),
-			Output:             output,
-			Disable:            disable,
-			Only:               only,
-			ExcludeFiles:       excludeFiles,
-			ExcludeCalls:       excludeCalls,
-			ChangedSince:       changedSince,
-			RunMutantID:        runMutantID,
-			Cache:              cachePath,
-			DryRun:             dryRun,
-			Verbose:            verbose,
-			Quiet:              quiet,
-			Integration:        integration,
-
-			ExcludeCallsDefaults: excludeCallsDefaults,
-		},
-		configPath:        configPath,
-		packages:          packages,
-		strykerOutput:     strykerOutput,
-		htmlOutput:        htmlOutput,
-		annotations:       annotations,
-		thresholdEfficacy: thresholdEfficacy,
-		thresholdMcover:   thresholdMcover,
-		showVersion:       showVersion,
-		listMutators:      listMutators,
-	}, nil
+	return o, nil
 }
 
 // runFilters are the user-supplied exclusion patterns, compiled once the

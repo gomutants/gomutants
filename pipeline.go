@@ -24,12 +24,15 @@ import (
 // what earlier phases set and may set or narrow fields for later ones.
 type mutationRun struct {
 	cfg     config.Config
-	opts    *cliOptions
+	opts    runOptions
 	filters runFilters
 
 	projectDir string
 	goModule   string
-	term       *report.Terminal
+	// term prints the header and phase lines; progress, created once the
+	// pending count is known, prints per-mutant results and the summary.
+	term     *report.Terminal
+	progress *report.Terminal
 
 	enabledMutators []mutator.Mutator
 
@@ -49,9 +52,8 @@ type mutationRun struct {
 	// they don't stay reachable for the whole mutation run.
 	fset       *token.FileSet
 	discovered *discover.Result
-	// mutants is narrowed to the --run-mutant-id match by resolvePackages,
-	// or set to every discovered mutant by discoverMutants, which then
-	// filters it; pool.Run records verdicts on it in place.
+	// mutants is set by findMutants, narrowed by discoverMutants's filters,
+	// and given its verdicts in place by pool.Run.
 	mutants []mutator.Mutant
 	// suppressed holds every mutant a directive or --exclude-calls
 	// removed; callSuppressed is the --exclude-calls share of it.
@@ -70,6 +72,8 @@ type mutationRun struct {
 	coverStart time.Time
 	// profile is cleared once discoverMutants has filtered by coverage,
 	// profileBytes once runMutants has stamped it into the cache.
+	// profileBytes stays nil when the profile came from the cache, which
+	// already holds it.
 	profile      *coverage.Profile
 	profileBytes []byte
 	coverageKey  string
@@ -137,8 +141,8 @@ func (mr *mutationRun) setup(ctx context.Context) error {
 	return nil
 }
 
-// resolvePackages resolves the package patterns, applies --exclude-files,
-// resolves --run-mutant-id early, and fixes the coverage scope.
+// resolvePackages resolves the package patterns and applies
+// --exclude-files.
 func (mr *mutationRun) resolvePackages(ctx context.Context) error {
 	var err error
 	packages := mr.opts.packages
@@ -165,38 +169,63 @@ func (mr *mutationRun) resolvePackages(ctx context.Context) error {
 		resolveMsg = fmt.Sprintf("done (%d packages, %d files excluded)", len(mr.pkgs), excludedFiles)
 	}
 	mr.term.PhaseDone(resolveMsg)
+	return nil
+}
 
-	// Resolve --run-mutant-id here, not in discoverMutants. Discovery is
-	// pure AST work over the packages just resolved, so an unknown or
-	// ambiguous id costs nothing to diagnose; leaving it to discoverMutants
-	// would charge a full `go test -cover` plus a baseline run before
-	// reporting a typo or a stale id — on the one flag whose purpose is to
-	// avoid paying for the whole package. discoverMutants reuses the result
-	// rather than re-parsing.
+// findMutants parses the resolved packages for mutants and, under
+// --run-mutant-id, narrows them to the one named. discoverMutants filters
+// the result once coverage is known.
+//
+// It runs before coverage collection: discovery is pure AST work over the
+// packages just resolved, so an unknown or ambiguous id costs nothing to
+// diagnose here. Later, it would charge a full `go test -cover` plus a
+// baseline run before reporting a typo or a stale id — on the one flag
+// whose purpose is to avoid paying for the whole package.
+func (mr *mutationRun) findMutants() error {
 	mr.fset = token.NewFileSet()
-	if mr.cfg.RunMutantID != "" {
-		mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
-		// Runs before every other filter so that "no mutant matches this
-		// id" is diagnosed against the full discovered set rather than
-		// against whatever --changed-since happened to leave behind. Both
-		// drop mutants, so the order doesn't change the intersection.
-		mr.mutants, err = discover.FilterByStableID(mr.discovered.Mutants, mr.cfg.RunMutantID)
-		if err != nil {
-			return usageError(err)
-		}
+	mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
+	mr.mutants = mr.discovered.Mutants
+	if mr.cfg.RunMutantID == "" {
+		return nil
 	}
+	// Runs before every other filter so that "no mutant matches this id"
+	// is diagnosed against the full discovered set rather than against
+	// whatever --changed-since happened to leave behind. Both drop
+	// mutants, so the order doesn't change the intersection.
+	var err error
+	mr.mutants, err = discover.FilterByStableID(mr.mutants, mr.cfg.RunMutantID)
+	if err != nil {
+		return usageError(err)
+	}
+	return nil
+}
 
+// resolveCoverageScope fixes the packages coverage and the baseline run
+// over, widening them to the reverse-dependency closure under
+// --integration.
+func (mr *mutationRun) resolveCoverageScope(ctx context.Context) {
 	// Integration mode widens coverage collection, the baseline run, and the
 	// per-test map to the reverse-dependency closure R of the target packages
 	// (T) — so a mutant in T can be killed by a covering test in any package
 	// that imports it — with -coverpkg pinned to T so those importing tests
 	// record coverage on the mutated code. Mutant *discovery* stays on T.
 	// Non-integration runs leave the patterns and -coverpkg untouched.
-	mr.coveragePatterns = packages
+	mr.coveragePatterns = mr.opts.packages
 	mr.coverPkgEff = mr.cfg.CoverPkg
 	mr.rDirs = dirsOfPackages(mr.pkgs)
 	if mr.cfg.Integration {
 		mr.coveragePatterns, mr.rDirs, mr.coverPkgEff = integrationScope(ctx, mr.projectDir, mr.goModule, mr.pkgs, mr.cfg.Tags, stderr)
+	}
+}
+
+// makeTempDir creates the directory the coverage, test-map and mutant
+// runs write into. run() removes it.
+func (mr *mutationRun) makeTempDir() error {
+	// 2. Create temp directory.
+	var err error
+	mr.tmpDir, err = mkdirTempFunc("", "gomutants-*")
+	if err != nil {
+		return fmt.Errorf("creating temp dir: %w", err)
 	}
 	return nil
 }
@@ -273,9 +302,10 @@ func (mr *mutationRun) cachedCoverageProfile(ctx context.Context) bool {
 		}
 	}
 	if mr.coverageKey != "" && mr.coverageKey == mr.loadedCache.CoverageKey && mr.loadedCache.CoverageProfile != "" {
+		// profileBytes stays nil: the cache already holds this key and
+		// profile, so runMutants has nothing to stamp.
 		if p, perr := parseBytesFunc([]byte(mr.loadedCache.CoverageProfile)); perr == nil {
 			mr.profile = p
-			mr.profileBytes = []byte(mr.loadedCache.CoverageProfile)
 			return true
 		}
 	}
@@ -304,18 +334,12 @@ func (mr *mutationRun) measureBaseline(ctx context.Context) error {
 	return nil
 }
 
-// discoverMutants finds every mutant in the resolved packages and applies
-// the --changed-since, coverage, directive and --exclude-calls filters.
+// discoverMutants applies the --changed-since, coverage, directive and
+// --exclude-calls filters to the mutants findMutants parsed.
 func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	var err error
 	// 5. Discover mutants.
 	mr.term.Phase("Discovering mutants...")
-	// discovered is already set when resolvePackages resolved
-	// --run-mutant-id, along with the single mutant it narrowed to.
-	if mr.discovered == nil {
-		mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
-		mr.mutants = mr.discovered.Mutants
-	}
 	if mr.cfg.ChangedSince != "" {
 		gitRoot, err := discover.GitRoot(ctx, mr.projectDir)
 		if err != nil {
@@ -506,7 +530,15 @@ func demoteEquivalents(mutants []mutator.Mutant) {
 
 // runMutants tests every pending mutant, runs the opt-in equivalence pass
 // over the survivors, and flushes the cache, checkpointing as it goes.
-func (mr *mutationRun) runMutants(ctx context.Context, term2 *report.Terminal) {
+func (mr *mutationRun) runMutants(ctx context.Context) {
+	mr.progress = report.NewTerminal(stdout, mr.pendingCount, mr.cfg.Verbose, mr.cfg.Quiet)
+	// Idle "(compiling)" heartbeat so the TTY doesn't sit silent during
+	// the first per-package go-test compile (no OnResult until the first
+	// mutant completes). First OnResult auto-stops it; the defer covers
+	// the all-cached / zero-pending paths where OnResult never fires.
+	mr.progress.StartHeartbeat()
+	defer mr.progress.StopHeartbeat()
+
 	// 8. Run mutation testing. pool.Run mutates the slice in place.
 	// TimeoutPolicy resolves per-mutant deadlines from the per-test
 	// durations recorded on the testMap, falling back to the global
@@ -529,7 +561,7 @@ func (mr *mutationRun) runMutants(ctx context.Context, term2 *report.Terminal) {
 	// interval into the run, not on the very first mutant.
 	mr.lastCheckpoint = time.Now()
 	pool.Run(ctx, mr.mutants, func(m mutator.Mutant) {
-		term2.OnResult(m)
+		mr.progress.OnResult(m)
 		mr.checkpoint(false)
 	})
 
@@ -581,14 +613,14 @@ func (mr *mutationRun) checkpoint(force bool) {
 }
 
 // writeReports prints the summary and writes every requested report.
-func (mr *mutationRun) writeReports(term2 *report.Terminal) (*report.Report, error) {
+func (mr *mutationRun) writeReports() (*report.Report, error) {
 	// 9. Generate report.
 	totalElapsed := time.Since(mr.coverStart)
 	r := report.Generate(mr.mutants, mr.goModule, totalElapsed, len(mr.suppressed))
 	// Breakdown only; the aggregate stays in MutantsSuppressed so the two
 	// suppression sources share one bucket everywhere else.
 	r.MutantsSuppressedByCalls = len(mr.callSuppressed)
-	term2.Summary(r)
+	mr.progress.Summary(r)
 
 	if err := report.WriteJSON(r, mr.cfg.Output); err != nil {
 		return nil, fmt.Errorf("writing report: %w", err)

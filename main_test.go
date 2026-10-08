@@ -2733,7 +2733,7 @@ func TestRunMutantIDWithoutVerdictIsError(t *testing.T) {
 // checkThresholds must not index an empty mutants slice: discoverMutants
 // guards against that in run(), but the guard lives in another phase.
 func TestCheckThresholdsRunMutantIDWithoutMutants(t *testing.T) {
-	mr := &mutationRun{cfg: config.Config{RunMutantID: "a#1"}, opts: &cliOptions{}}
+	mr := &mutationRun{cfg: config.Config{RunMutantID: "a#1"}}
 	err := mr.checkThresholds(&report.Report{})
 	want := `--run-mutant-id "a#1" produced no verdict: 0 mutants to report, want 1`
 	if err == nil || err.Error() != want {
