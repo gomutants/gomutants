@@ -52,8 +52,8 @@ type mutationRun struct {
 	// bytes, so they don't stay reachable for the whole mutation run.
 	fset       *token.FileSet
 	discovered *discover.Result
-	// mutants is set by findMutants, narrowed by discoverMutants's filters,
-	// and given its verdicts in place by pool.Run.
+	// mutants is set by discoverMutants, narrowed by its filters, and
+	// given its verdicts in place by pool.Run.
 	mutants []mutator.Mutant
 	// runTarget is the one mutant --run-mutant-id names. It points into
 	// mutants, so it carries the verdict pool.Run records; nil on every
@@ -176,37 +176,25 @@ func (mr *mutationRun) resolvePackages(ctx context.Context) error {
 	return nil
 }
 
-// parseMutants parses the resolved packages and collects every candidate
-// mutant, keeping the parse cache for the filters and preReadSources.
-func (mr *mutationRun) parseMutants() {
-	mr.fset = token.NewFileSet()
-	mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
-	mr.mutants = mr.discovered.Mutants
-}
-
-// findMutants, under --run-mutant-id, parses the resolved packages and
-// narrows the mutants to the one named. discoverMutants filters the result
-// once coverage is known.
-//
-// Only that flag parses this early: discovery is pure AST work over the
+// checkRunMutantID, under --run-mutant-id, fails fast when the id names
+// no mutant or more than one. Discovery is pure AST work over the
 // packages just resolved, so an unknown or ambiguous id costs nothing to
-// diagnose here. Later, it would charge a full `go test -cover` plus a
-// baseline run before reporting a typo or a stale id — on the one flag
-// whose purpose is to avoid paying for the whole package. Every other run
-// parses in discoverMutants, so the parse cache isn't held through
-// coverage and the baseline, and a failed coverage run doesn't pay for it.
-func (mr *mutationRun) findMutants() error {
+// diagnose here; left to discoverMutants, it would charge a full
+// `go test -cover` plus a baseline run before reporting a typo or a stale
+// id — on the one flag whose purpose is to avoid paying for the whole
+// package.
+//
+// The parse is thrown away: discoverMutants parses again after the
+// baseline, so the bytes the overlays patch are no older than the sibling
+// files and the TCE reference build, which both read from disk. Dropping
+// it also keeps every AST from being held through coverage and the
+// baseline.
+func (mr *mutationRun) checkRunMutantID() error {
 	if mr.cfg.RunMutantID == "" {
 		return nil
 	}
-	mr.parseMutants()
-	// Runs before every other filter so that "no mutant matches this id"
-	// is diagnosed against the full discovered set rather than against
-	// whatever --changed-since happened to leave behind. Both drop
-	// mutants, so the order doesn't change the intersection.
-	var err error
-	mr.mutants, err = discover.FilterByStableID(mr.mutants, mr.cfg.RunMutantID)
-	if err != nil {
+	found := discover.Discover(token.NewFileSet(), mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
+	if _, err := discover.FilterByStableID(found.Mutants, mr.cfg.RunMutantID); err != nil {
 		return usageError(err)
 	}
 	return nil
@@ -346,14 +334,29 @@ func (mr *mutationRun) measureBaseline(ctx context.Context) error {
 	return nil
 }
 
-// discoverMutants parses the packages, unless findMutants already has, and
-// applies the --changed-since, coverage, directive and --exclude-calls
-// filters to the mutants found.
+// discoverMutants parses the packages, keeping the parse cache for the
+// filters and preReadSources, and applies the --run-mutant-id,
+// --changed-since, coverage, directive and --exclude-calls filters to the
+// mutants found.
 func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	// 5. Discover mutants.
 	mr.term.Phase("Discovering mutants...")
-	if mr.discovered == nil {
-		mr.parseMutants()
+	mr.fset = token.NewFileSet()
+	mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
+	mr.mutants = mr.discovered.Mutants
+	if mr.cfg.RunMutantID != "" {
+		// checkRunMutantID resolved the id against the source as it was
+		// before coverage and the baseline; an edit since can change the
+		// answer. Runs before every other filter so that "no mutant
+		// matches this id" is diagnosed against the full discovered set
+		// rather than against whatever --changed-since happened to leave
+		// behind. Both drop mutants, so the order doesn't change the
+		// intersection.
+		var err error
+		mr.mutants, err = discover.FilterByStableID(mr.mutants, mr.cfg.RunMutantID)
+		if err != nil {
+			return usageError(err)
+		}
 	}
 	if mr.cfg.ChangedSince != "" {
 		gitRoot, err := discover.GitRoot(ctx, mr.projectDir)
@@ -536,9 +539,7 @@ func (mr *mutationRun) applyCache() {
 	if !mr.cfg.DetectEquivalentEnabled() {
 		demoteEquivalents(mr.mutants)
 	}
-	if !mr.cfg.Quiet {
-		fmt.Fprintf(stdout, "Cache: %d mutant outcomes reused from %s\n", hits, mr.cfg.Cache)
-	}
+	mr.term.Info("Cache: %d mutant outcomes reused from %s", hits, mr.cfg.Cache)
 }
 
 // demoteEquivalents reports every EQUIVALENT mutant as LIVED.
@@ -647,26 +648,20 @@ func (mr *mutationRun) writeReports() (*report.Report, error) {
 	if err := report.WriteJSON(r, mr.cfg.Output); err != nil {
 		return nil, fmt.Errorf("writing report: %w", err)
 	}
-	if !mr.cfg.Quiet {
-		fmt.Fprintf(stdout, "Report: %s\n", mr.cfg.Output)
-	}
+	mr.term.Info("Report: %s", mr.cfg.Output)
 
 	if mr.opts.strykerOutput != "" {
 		if err := report.WriteStryker(mr.opts.strykerOutput, mr.mutants, mr.projectDir, effectiveVersion()); err != nil {
 			return nil, fmt.Errorf("writing Stryker report: %w", err)
 		}
-		if !mr.cfg.Quiet {
-			fmt.Fprintf(stdout, "Stryker report: %s\n", mr.opts.strykerOutput)
-		}
+		mr.term.Info("Stryker report: %s", mr.opts.strykerOutput)
 	}
 
 	if mr.opts.htmlOutput != "" {
 		if err := report.WriteHTML(mr.opts.htmlOutput, mr.mutants, mr.projectDir, effectiveVersion()); err != nil {
 			return nil, fmt.Errorf("writing HTML report: %w", err)
 		}
-		if !mr.cfg.Quiet {
-			fmt.Fprintf(stdout, "HTML report: %s\n", mr.opts.htmlOutput)
-		}
+		mr.term.Info("HTML report: %s", mr.opts.htmlOutput)
 	}
 
 	if mr.opts.annotations == "github" {

@@ -2548,6 +2548,45 @@ func TestRunMutantIDResolvesBeforeCoverage(t *testing.T) {
 	}
 }
 
+// TestRunMutantIDResolvesAgainAfterBaseline: the early check's parse must
+// not be what the run patches. An edit saved while coverage or the
+// baseline runs has to be seen, or the overlay would patch stale bytes
+// into a package whose other files and TCE reference build come from disk.
+func TestRunMutantIDResolvesAgainAfterBaseline(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origM := measureBaselineFunc
+	defer func() { measureBaselineFunc = origM }()
+	baselineRan := false
+	measureBaselineFunc = func(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
+		baselineRan = true
+		d, err := origM(ctx, projectDir, packages, tags, testFlags)
+		// Drop the only arithmetic, so the id no longer names anything.
+		if werr := os.WriteFile(filepath.Join(dir, "add.go"), []byte("package testmod\n\nfunc Add(a, b int) int {\n\treturn a\n}\n"), 0o644); werr != nil {
+			t.Fatal(werr)
+		}
+		return d, err
+	}
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE",
+		"-w", "1", "--cache=off",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	if !baselineRan {
+		t.Fatalf("the id must resolve before the edit, so the run reaches the baseline; got: %v", err)
+	}
+	requireExitCode(t, err, exitCodeUsageError)
+	if !strings.Contains(err.Error(), "no mutant matches") {
+		t.Errorf("the id must be resolved again against the source as it is after the baseline, got: %v", err)
+	}
+}
+
 // TestRunMutantIDRejectsDryRun: --dry-run returns before anything is
 // compiled or tested, so the pair would exit 0 for a mutant that was never
 // measured — which a script reads as a kill.

@@ -276,7 +276,7 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if err := mr.findMutants(); err != nil {
+	if err := mr.checkRunMutantID(); err != nil {
 		return err
 	}
 

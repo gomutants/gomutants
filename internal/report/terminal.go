@@ -87,6 +87,15 @@ func (t *Terminal) PhaseDone(msg string) {
 	fmt.Fprintf(t.w, " %s\n", msg)
 }
 
+// Info prints one informational line, such as a report path. Like the
+// phase lines it is silenced by quiet; the summary is not.
+func (t *Terminal) Info(format string, args ...any) {
+	if t.quiet {
+		return
+	}
+	fmt.Fprintf(t.w, format+"\n", args...)
+}
+
 // StartHeartbeat begins painting an idle progress line every
 // heartbeatInterval so the user sees forward motion while workers
 // compile the first per-package test binary (no OnResult fires until
