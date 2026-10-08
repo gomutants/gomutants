@@ -16,6 +16,7 @@ import (
 	"github.com/szhekpisov/gomutants/internal/mutator"
 	"github.com/szhekpisov/gomutants/internal/report"
 	"github.com/szhekpisov/gomutants/internal/runner"
+	"github.com/szhekpisov/gomutants/internal/tce"
 )
 
 // mutationRun is the state one gomutants invocation carries from phase to
@@ -481,4 +482,182 @@ func (mr *mutationRun) applyCache() {
 			}
 		}
 	}
+}
+
+// runMutants tests every pending mutant, runs the opt-in equivalence pass
+// over the survivors, and flushes the cache, checkpointing as it goes.
+func (mr *mutationRun) runMutants(ctx context.Context, term2 *report.Terminal) {
+	// 8. Run mutation testing. pool.Run mutates the slice in place.
+	// TimeoutPolicy resolves per-mutant deadlines from the per-test
+	// durations recorded on the testMap, falling back to the global
+	// baseline×coefficient ceiling. testTimeout stays the absolute cap.
+	policy := timeoutPolicyFor(&mr.cfg, mr.testTimeout)
+
+	// Stamp the coverage memo once, before the run loop: the profile and
+	// its key are fixed for the whole run, so there's no reason to
+	// re-serialize the (potentially large) profile on every checkpoint.
+	// An empty coverageKey means hashing failed earlier and we silently
+	// fell back to a fresh run; don't poison the cache with a missing key.
+	if mr.loadedCache != nil && mr.coverageKey != "" && len(mr.profileBytes) > 0 {
+		mr.loadedCache.CoverageKey = mr.coverageKey
+		mr.loadedCache.CoverageProfile = string(mr.profileBytes)
+	}
+
+	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields()}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
+	// Seed lastCheckpoint so the first periodic checkpoint fires one full
+	// interval into the run, not on the very first mutant.
+	mr.lastCheckpoint = time.Now()
+	pool.Run(ctx, mr.mutants, func(m mutator.Mutant) {
+		term2.OnResult(m)
+		mr.checkpoint(false)
+	})
+
+	// 8b. Trivial Compiler Equivalence pass (opt-in). Recompile each
+	// surviving (LIVED) mutant with package-scoped `-gcflags=-S` and
+	// reclassify it as EQUIVALENT when the assembly matches the original —
+	// a compiler-proven non-gap. Verdicts are checkpointed as they land (the
+	// throttled checkpoint callback, serialized with the workers' writes by
+	// the detector), so a hard kill mid-pass keeps the equivalence work done
+	// so far. Cached EQUIVALENT survivors stay EQUIVALENT and are skipped
+	// (their Status is no longer LIVED).
+	if mr.cfg.DetectEquivalentEnabled() {
+		mr.term.Phase("Detecting equivalent mutants...")
+		det := tce.NewDetector(mr.projectDir, mr.cfg.Tags, mr.srcCache)
+		equiv := det.Run(ctx, mr.mutants, mr.cfg.Workers, mr.tmpDir, func(mutator.Mutant) {
+			mr.checkpoint(false)
+		})
+		mr.term.PhaseDone(fmt.Sprintf("%d equivalent", equiv))
+	}
+
+	// Final flush. force=true bypasses the throttle and the disable
+	// switch, so even --checkpoint-interval=0 still writes the cache once.
+	mr.checkpoint(true)
+}
+
+// checkpoint flushes completed mutant outcomes to the cache file,
+// throttled to cfg.CheckpointInterval. cache.Update only emits
+// terminal-status mutants, so flushing a partially-complete slice
+// mid-run is safe — pending mutants are simply omitted. No locking
+// needed: pool.Run invokes onResult from a single goroutine, so the
+// mutants-slice reads here are serialized with the collector's writes.
+// Write failures are non-fatal — a stale cache only costs speed.
+func (mr *mutationRun) checkpoint(force bool) {
+	if mr.loadedCache == nil {
+		return
+	}
+	if !force && mr.cfg.CheckpointInterval <= 0 {
+		return
+	}
+	if !force && time.Since(mr.lastCheckpoint) < mr.cfg.CheckpointInterval {
+		return
+	}
+	mr.loadedCache.Update(mr.mutants, mr.hasher, mr.projectDir, mr.testFilesFor)
+	if err := cacheSaveFunc(mr.loadedCache, mr.cfg.Cache); err != nil {
+		fmt.Fprintf(stderr, "warning: writing cache to %s: %v\n", mr.cfg.Cache, err)
+		return // leave lastCheckpoint stale so the next onResult retries
+	}
+	mr.lastCheckpoint = time.Now()
+}
+
+// writeReports prints the summary and writes every requested report.
+func (mr *mutationRun) writeReports(term2 *report.Terminal) (*report.Report, error) {
+	// 9. Generate report.
+	totalElapsed := time.Since(mr.coverStart)
+	r := report.Generate(mr.mutants, mr.goModule, totalElapsed, len(mr.suppressed))
+	// Breakdown only; the aggregate stays in MutantsSuppressed so the two
+	// suppression sources share one bucket everywhere else.
+	r.MutantsSuppressedByCalls = len(mr.callSuppressed)
+	term2.Summary(r)
+
+	if err := report.WriteJSON(r, mr.cfg.Output); err != nil {
+		return nil, fmt.Errorf("writing report: %w", err)
+	}
+	if !mr.cfg.Quiet {
+		fmt.Fprintf(stdout, "Report: %s\n", mr.cfg.Output)
+	}
+
+	if mr.opts.strykerOutput != "" {
+		if err := report.WriteStryker(mr.opts.strykerOutput, mr.mutants, mr.projectDir, effectiveVersion()); err != nil {
+			return nil, fmt.Errorf("writing Stryker report: %w", err)
+		}
+		if !mr.cfg.Quiet {
+			fmt.Fprintf(stdout, "Stryker report: %s\n", mr.opts.strykerOutput)
+		}
+	}
+
+	if mr.opts.htmlOutput != "" {
+		if err := report.WriteHTML(mr.opts.htmlOutput, mr.mutants, mr.projectDir, effectiveVersion()); err != nil {
+			return nil, fmt.Errorf("writing HTML report: %w", err)
+		}
+		fmt.Fprintf(stdout, "HTML report: %s\n", mr.opts.htmlOutput)
+	}
+
+	if mr.opts.annotations == "github" {
+		if err := report.WriteGitHubAnnotations(stdout, r); err != nil {
+			return nil, fmt.Errorf("writing annotations: %w", err)
+		}
+	}
+	return r, nil
+}
+
+// checkThresholds turns the finished report into run()'s exit status.
+func (mr *mutationRun) checkThresholds(r *report.Report) error {
+	// Threshold gates. Exit codes 10/11 match gremlins's surface so scripts
+	// that distinguish the two failure modes keep working. Mutant coverage
+	// uses the gremlins formula (KILLED+LIVED)/(KILLED+LIVED+NOT_COVERED);
+	// r.MutationsCoverage in the JSON uses a different denominator and is
+	// kept as-is for backward-compat with existing report consumers.
+	//
+	// We deviate from gremlins on two points: a gate is *skipped* (with a
+	// stderr note) when its denominator is zero — empty discovery is almost
+	// always a config issue, not a test-quality issue, and reporting "0.00%
+	// below 80.00%" hides that. Error messages always include both
+	// percentages so a single read shows the full state.
+	// EQUIVALENT mutants are neither KILLED nor LIVED, so they fall out of
+	// both gates' denominators here — a compiler-proven non-gap shouldn't
+	// move efficacy or mutant coverage in either direction. INFRA ERROR
+	// mutants fall out the same way, but unlike EQUIVALENT they represent a
+	// *missing* measurement, so the run warns before evaluating the gates.
+	warnInfraErrors(stderr, r)
+	// --run-mutant-id exists to answer one question — "did the test I just
+	// wrote kill this mutant?" — from an exit code. Every status other than
+	// KILLED and LIVED leaves that unanswered, and the gates below would
+	// still exit 0: those statuses drop out of the efficacy denominator,
+	// and a zero denominator skips the gate entirely. Report the non-answer
+	// rather than let a script read it as a kill. mutants holds exactly the
+	// one FilterByStableID returned; anything that empties it has already
+	// returned above.
+	if mr.cfg.RunMutantID != "" {
+		if s := mr.mutants[0].Status; s != mutator.StatusKilled && s != mutator.StatusLived {
+			return fmt.Errorf("--run-mutant-id %q produced no verdict: the mutant is %s", mr.cfg.RunMutantID, s)
+		}
+	}
+	tested := r.MutantsKilled + r.MutantsLived
+	mcoverDenom := tested + r.MutantsNotCovered
+	mcover := 0.0
+	if mcoverDenom > 0 {
+		mcover = float64(tested) / float64(mcoverDenom) * 100
+	}
+
+	if mr.opts.thresholdEfficacy > 0 {
+		if tested == 0 {
+			fmt.Fprintln(stderr, "gomutants: no testable mutants discovered; --threshold-efficacy not evaluated")
+		} else if r.TestEfficacy < mr.opts.thresholdEfficacy {
+			return &exitError{
+				code: exitCodeEfficacy,
+				err:  fmt.Errorf("test efficacy %.2f%% below --threshold-efficacy=%.2f%% (mutant coverage: %.2f%%)", r.TestEfficacy, mr.opts.thresholdEfficacy, mcover),
+			}
+		}
+	}
+	if mr.opts.thresholdMcover > 0 {
+		if mcoverDenom == 0 {
+			fmt.Fprintln(stderr, "gomutants: no covered or testable mutants discovered; --threshold-mcover not evaluated")
+		} else if mcover < mr.opts.thresholdMcover {
+			return &exitError{
+				code: exitCodeMutantCoverage,
+				err:  fmt.Errorf("mutant coverage %.2f%% below --threshold-mcover=%.2f%% (test efficacy: %.2f%%)", mcover, mr.opts.thresholdMcover, r.TestEfficacy),
+			}
+		}
+	}
+	return nil
 }
