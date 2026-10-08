@@ -179,26 +179,40 @@ func (mr *mutationRun) resolvePackages(ctx context.Context) error {
 }
 
 // checkRunMutantID, under --run-mutant-id, fails fast when the id names
-// no mutant or more than one. Discovery is pure AST work over the
-// packages just resolved, so an unknown or ambiguous id costs nothing to
-// diagnose here; left to discoverMutants, it would charge a full
-// `go test -cover` plus a baseline run before reporting a typo or a stale
-// id — on the one flag whose purpose is to avoid paying for the whole
-// package.
+// no mutant, more than one, or one that --changed-since, a directive or
+// --exclude-calls drops. None of that needs coverage, so a typo, a stale
+// id or a suppressed target costs nothing to diagnose here; left to
+// discoverMutants, it would charge a full `go test -cover` plus a baseline
+// run first — on the one flag whose purpose is to avoid paying for the
+// whole package. Only the files the id could name are parsed.
 //
 // The parse is thrown away: discoverMutants parses again after the
 // baseline, so the bytes the overlays patch are no older than the sibling
-// files and the TCE reference build, which both read from disk. Dropping
-// it also keeps every AST from being held through coverage and the
-// baseline.
-func (mr *mutationRun) checkRunMutantID() error {
-	if mr.cfg.RunMutantID == "" {
+// files and the TCE reference build, which both read from disk.
+func (mr *mutationRun) checkRunMutantID(ctx context.Context) error {
+	id := mr.cfg.RunMutantID
+	if id == "" {
 		return nil
 	}
-	found := discover.Discover(token.NewFileSet(), mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
-	target, err := discover.FilterByStableID(found.Mutants, mr.cfg.RunMutantID)
+	scope := discover.ScopeToStableID(mr.pkgs, id, mr.projectDir)
+	if !slices.ContainsFunc(scope, func(p discover.Package) bool { return len(p.GoFiles) > 0 }) {
+		return usageError(fmt.Errorf(
+			"no mutant matches --run-mutant-id %q: no source file in the resolved packages has a path it could name; check the package argument and that the id came from a report for this revision",
+			id))
+	}
+	fset := token.NewFileSet()
+	found := discover.Discover(fset, scope, mr.enabledMutators, mr.projectDir, mr.goModule)
+	target, err := discover.FilterByStableID(found.Mutants, id)
 	if err != nil {
 		return usageError(err)
+	}
+	// Silent: discoverMutants filters this file again and warns there.
+	kept, suppressed, _, err := mr.filterBySource(ctx, fset, target, found.Files, false)
+	if err != nil {
+		return err
+	}
+	if len(kept) == 0 {
+		return usageError(runMutantDroppedError(id, mr.cfg.ChangedSince, suppressed))
 	}
 	mr.earlyTarget = target[0]
 	return nil
@@ -381,29 +395,15 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 			return usageError(err)
 		}
 	}
-	if mr.cfg.ChangedSince != "" {
-		gitRoot, err := discover.GitRoot(ctx, mr.projectDir)
-		if err != nil {
-			return fmt.Errorf("--changed-since requires a git repository: %w", err)
-		}
-		ranges, err := discover.RunGitDiff(ctx, mr.projectDir, mr.cfg.ChangedSince)
-		if err != nil {
-			return err
-		}
-		mr.mutants = discover.FilterByDiff(mr.mutants, ranges, gitRoot)
+	var err error
+	mr.mutants, mr.suppressed, mr.callSuppressed, err = mr.filterBySource(ctx, mr.fset, mr.mutants, mr.discovered.Files, true)
+	if err != nil {
+		return err
 	}
+	// Coverage only sets a status, so it can run after the filters that
+	// drop: it then skips the mutants they removed.
 	discover.FilterByCoverage(mr.mutants, mr.profile, mr.pkgs, mr.goModule)
 	mr.profile = nil
-
-	var err error
-	mr.mutants, mr.suppressed, err = discover.FilterByDirectivesWithCache(mr.fset, mr.mutants, mr.discovered.Files)
-	if err != nil {
-		return fmt.Errorf("applying directives: %w", err)
-	}
-	// Directives run first so that where both could apply, the reason
-	// surfaced under --verbose is the one a human wrote at the site.
-	mr.mutants, mr.callSuppressed = discover.FilterByCalls(mr.fset, mr.mutants, mr.discovered.Files, mr.filters.callExcluder)
-	mr.suppressed = append(mr.suppressed, mr.callSuppressed...)
 	if mr.cfg.Verbose {
 		for _, s := range mr.suppressed {
 			reason := s.Reason
@@ -415,7 +415,9 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 		}
 	}
 	// FilterByStableID resolved the id, but a later filter can still drop
-	// what it found. Without this the run would test nothing, print
+	// what it found: checkRunMutantID ran the same filters, but an edit
+	// since — a directive added during the baseline, say — can change
+	// their answer. Without this the run would test nothing, print
 	// "0 found" and exit 0 — indistinguishable, to a script reading the
 	// exit code, from the mutant having been killed.
 	// Otherwise mutants holds exactly the one FilterByStableID returned:
@@ -439,6 +441,38 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	}
 	mr.term.PhaseDone(fmt.Sprintf("%d found (%d not covered, %d to test)", len(mr.mutants), notCoveredCount, mr.pendingCount))
 	return nil
+}
+
+// filterBySource applies the filters that need only the source and git:
+// --changed-since, then directives, then --exclude-calls. suppressed holds
+// every mutant the last two dropped, callSuppressed the --exclude-calls
+// share of it. warn=false silences directive warnings, for a pre-check
+// whose files the run filters again.
+func (mr *mutationRun) filterBySource(ctx context.Context, fset *token.FileSet, mutants []mutator.Mutant, files map[string]*discover.ParsedFile, warn bool) (kept []mutator.Mutant, suppressed, callSuppressed []discover.Suppression, err error) {
+	kept = mutants
+	if mr.cfg.ChangedSince != "" {
+		gitRoot, gerr := discover.GitRoot(ctx, mr.projectDir)
+		if gerr != nil {
+			return nil, nil, nil, fmt.Errorf("--changed-since requires a git repository: %w", gerr)
+		}
+		ranges, gerr := discover.RunGitDiff(ctx, mr.projectDir, mr.cfg.ChangedSince)
+		if gerr != nil {
+			return nil, nil, nil, gerr
+		}
+		kept = discover.FilterByDiff(kept, ranges, gitRoot)
+	}
+	filterDirectives := discover.FilterByDirectivesWithCache
+	if !warn {
+		filterDirectives = discover.FilterByDirectivesSilently
+	}
+	kept, suppressed, err = filterDirectives(fset, kept, files)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("applying directives: %w", err)
+	}
+	// Directives run first so that where both could apply, the reason
+	// surfaced under --verbose is the one a human wrote at the site.
+	kept, callSuppressed = discover.FilterByCalls(fset, kept, files, mr.filters.callExcluder)
+	return kept, append(suppressed, callSuppressed...), callSuppressed, nil
 }
 
 // printDryRun lists the discovered mutants for --dry-run.

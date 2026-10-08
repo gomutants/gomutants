@@ -231,6 +231,70 @@ func F(a, b int) int { return a + b }
 	}
 }
 
+// TestFilterByDirectivesSilently: same verdicts as the warning variant,
+// with nothing written to stderr for a directive that would warn.
+func TestFilterByDirectivesSilently(t *testing.T) {
+	src := `package p
+
+func F(a, b int) int { return a + b } // gomutants:disable reason=unterminated"
+
+func G(a, b int) int { return a - b } // gomutants:disable ARITHMETIC_BASE
+`
+	mutants, _ := writeFixture(t, src)
+
+	var (
+		kept       []mutator.Mutant
+		suppressed []Suppression
+		err        error
+	)
+	out := captureStderr(t, func() {
+		kept, suppressed, err = FilterByDirectivesSilently(token.NewFileSet(), mutants, nil)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out != "" {
+		t.Errorf("FilterByDirectivesSilently wrote to stderr: %q", out)
+	}
+
+	var warn bytes.Buffer
+	wantKept, wantSuppressed, err := filterByDirectives(token.NewFileSet(), mutants, nil, &warn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if warn.Len() == 0 {
+		t.Fatal("fixture should carry a directive that warns")
+	}
+	if len(kept) != len(wantKept) || len(suppressed) != len(wantSuppressed) || len(suppressed) == 0 {
+		t.Errorf("kept=%d suppressed=%d, want kept=%d suppressed=%d (>0)",
+			len(kept), len(suppressed), len(wantKept), len(wantSuppressed))
+	}
+}
+
+// captureStderr redirects os.Stderr through a pipe for the duration of fn
+// and returns whatever was written.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = orig }()
+
+	done := make(chan struct{})
+	var captured strings.Builder
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(&captured, r)
+	}()
+	fn()
+	w.Close()
+	<-done
+	return captured.String()
+}
+
 func TestParseDirectiveRegexpUnknownMutatorHintsWhitespace(t *testing.T) {
 	// `disable-regexp foo bar` — `bar` becomes the mutator name and is
 	// unknown; under the all-unknown-drops-directive rule the directive

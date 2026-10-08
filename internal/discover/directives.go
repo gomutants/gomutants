@@ -77,6 +77,14 @@ func FilterByDirectivesWithCache(fset *token.FileSet, mutants []mutator.Mutant, 
 	return filterByDirectives(fset, mutants, files, os.Stderr)
 }
 
+// FilterByDirectivesSilently is FilterByDirectivesWithCache without the
+// warnings, for a pre-check whose files a later FilterByDirectivesWithCache
+// call indexes again: the warnings belong to that call, and printing them
+// from both would show every malformed directive twice.
+func FilterByDirectivesSilently(fset *token.FileSet, mutants []mutator.Mutant, files map[string]*ParsedFile) ([]mutator.Mutant, []Suppression, error) {
+	return filterByDirectives(fset, mutants, files, io.Discard)
+}
+
 func filterByDirectives(fset *token.FileSet, mutants []mutator.Mutant, files map[string]*ParsedFile, warn io.Writer) ([]mutator.Mutant, []Suppression, error) {
 	if len(mutants) == 0 {
 		return mutants, nil, nil
