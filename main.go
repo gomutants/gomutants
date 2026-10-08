@@ -13,7 +13,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
-	"slices"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -293,173 +292,24 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// 5. Discover mutants.
-	mr.term.Phase("Discovering mutants...")
-	// discovered is already set when --run-mutant-id resolved it above,
-	// along with the single mutant it narrowed to.
-	if mr.discovered == nil {
-		mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
-		mr.mutants = mr.discovered.Mutants
+	if err := mr.discoverMutants(ctx); err != nil {
+		return err
 	}
-	if mr.cfg.ChangedSince != "" {
-		gitRoot, err := discover.GitRoot(ctx, mr.projectDir)
-		if err != nil {
-			return fmt.Errorf("--changed-since requires a git repository: %w", err)
-		}
-		ranges, err := discover.RunGitDiff(ctx, mr.projectDir, mr.cfg.ChangedSince)
-		if err != nil {
-			return err
-		}
-		mr.mutants = discover.FilterByDiff(mr.mutants, ranges, gitRoot)
-	}
-	discover.FilterByCoverage(mr.mutants, mr.profile, mr.pkgs, mr.goModule)
-
-	mr.mutants, mr.suppressed, err = discover.FilterByDirectivesWithCache(mr.fset, mr.mutants, mr.discovered.Files)
-	if err != nil {
-		return fmt.Errorf("applying directives: %w", err)
-	}
-	// Directives run first so that where both could apply, the reason
-	// surfaced under --verbose is the one a human wrote at the site.
-	mr.mutants, mr.callSuppressed = discover.FilterByCalls(mr.fset, mr.mutants, mr.discovered.Files, mr.filters.callExcluder)
-	mr.suppressed = append(mr.suppressed, mr.callSuppressed...)
-	if mr.cfg.Verbose {
-		for _, s := range mr.suppressed {
-			reason := s.Reason
-			if reason == "" {
-				reason = "no reason"
-			}
-			fmt.Fprintf(stderr, "suppressed %s at %s:%d (%s)\n",
-				s.Mutant.Type, s.Mutant.RelFile, s.Mutant.Line, reason)
-		}
-	}
-	// FilterByStableID resolved the id, but a later filter can still drop
-	// what it found. Without this the run would test nothing, print
-	// "0 found" and exit 0 — indistinguishable, to a script reading the
-	// exit code, from the mutant having been killed.
-	if mr.cfg.RunMutantID != "" && len(mr.mutants) == 0 {
-		return usageError(runMutantDroppedError(mr.cfg.RunMutantID, mr.cfg.ChangedSince, mr.suppressed))
-	}
-
-	mr.pendingCount = 0
-	notCoveredCount := 0
-	for _, m := range mr.mutants {
-		switch m.Status {
-		case mutator.StatusPending:
-			mr.pendingCount++
-		case mutator.StatusNotCovered:
-			notCoveredCount++
-		}
-	}
-	mr.term.PhaseDone(fmt.Sprintf("%d found (%d not covered, %d to test)", len(mr.mutants), notCoveredCount, mr.pendingCount))
 
 	if mr.cfg.DryRun {
-		for _, m := range mr.mutants {
-			fmt.Fprintf(stdout, "[%s] %s:%d:%d  %s → %s  (%s)\n",
-				m.Status.String(), m.RelFile, m.Line, m.Col,
-				m.Original, m.Replacement, m.Type)
-		}
+		mr.printDryRun()
 		return nil
 	}
 
-	// 6. Pre-read source files.
-	mr.srcCache, err = preReadFilesFunc(mr.pkgs)
-	if err != nil {
-		return fmt.Errorf("pre-reading source files: %w", err)
-	}
-	if mr.hasher != nil {
-		// Hasher was created early (before PreReadFiles) for the
-		// coverage-key calc; attach the in-memory source map now so
-		// per-mutant Lookup's prodHash calls skip disk reads. Files
-		// hashed during the coverage-key phase remain in the hasher's
-		// internal memo, so this only affects newly seen paths.
-		mr.hasher.SetSrcCache(mr.srcCache)
+	if err := mr.preReadSources(); err != nil {
+		return err
 	}
 
-	// 7. Build per-test coverage map.
-	mr.term.Phase("Building per-test coverage map...")
-	// testTimeout also bounds each test's solo coverage run: a test that
-	// can't finish in the suite's ceiling would time out every mutant it
-	// covers anyway, and a bare test binary has no timeout of its own.
-	mr.testMap, err = buildTestMapFunc(ctx, mr.projectDir, mr.coveragePatterns, coverage.BuildOptions{
-		CoverPkg:    mr.coverPkgEff,
-		Tags:        mr.cfg.Tags,
-		TmpDir:      mr.tmpDir,
-		Workers:     mr.cfg.Workers,
-		TestTimeout: mr.testTimeout,
-		TestFlags:   coverageTestFlags(mr.cfg.TestFlagFields(), runner.ShortFlagFromEnv(), mr.cfg.TestCPU),
-	})
-	if err != nil {
-		// An interrupt stops the run here, as in every other phase; it
-		// isn't a map failure to work around.
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		// With -coverpkg the map fails only when it can't tell which
-		// packages have tests (see coverage.BuildTestMap). Those are
-		// the suites a mutant's verdict rests on beyond its own package's:
-		// without them a mutant only an importer's tests kill reads LIVED.
-		if mr.coverPkgEff != "" {
-			return fmt.Errorf("per-test coverage map: %w", err)
-		}
-		// Non-fatal: fall back to running all tests per mutant.
-		fmt.Fprintf(stderr, "warning: per-test coverage map failed: %v\n", err)
-		mr.testMap = nil
-		mr.term.PhaseDone("skipped (will run all tests per mutant)")
-	} else {
-		mr.term.PhaseDone("done")
-		for _, w := range mr.testMap.Warnings() {
-			fmt.Fprintf(stderr, "warning: per-test coverage map: %s\n", w)
-		}
+	if err := mr.buildTestMap(ctx); err != nil {
+		return err
 	}
 
-	// 7a. Apply incremental-analysis cache (opt-in via --cache). Hits
-	// flip the mutant from Pending to its prior terminal status, which
-	// makes the runner's Pending-only filter naturally skip them.
-	// loadedCache + hasher were created at module-read time so the
-	// coverage phase could already consult them — here we just build
-	// the test-files resolver and run the lookup.
-	if mr.loadedCache != nil {
-		// TestIndex is built from the reverse-dependency closure's directories
-		// (rDirs; equal to the target dirs when integration mode is off) so
-		// cross-package coverage — tests in an importing package exercising a
-		// mutated target via -coverpkg — resolves to the right test files.
-		// The map's suites join them: each can decide a survivor's verdict
-		// (see testFilesResolver), and one need not be in rDirs — a package
-		// --exclude-files emptied is gone from pkgs, but its tests still
-		// run under --coverpkg, and a file the index lacks is in no key.
-		testIndex := cache.BuildTestIndex(slices.Concat(mr.rDirs, suiteDirs(mr.testMap)))
-
-		crossPkg := mr.cfg.Integration || mr.cfg.CoverPkg != ""
-		mr.testFilesFor = testFilesResolver(testIndex, mr.testMap, crossPkg)
-
-		// --run-mutant-id skips the lookup, not the resolver above: the
-		// point of naming one mutant is to measure it again after editing
-		// a test, and a cache hit would replay the previous verdict
-		// instead of running anything. testFilesFor is still needed by
-		// checkpoint's loadedCache.Update, so the fresh verdict lands in
-		// the cache file as usual.
-		hits := 0
-		if mr.cfg.RunMutantID == "" {
-			hits = mr.loadedCache.Lookup(mr.mutants, mr.hasher, mr.testFilesFor)
-		}
-		if hits > 0 {
-			mr.pendingCount -= hits
-			// When equivalence detection is off this run, a cached EQUIVALENT
-			// must not surface — report the survivor honestly as LIVED. The
-			// reuse already validated prod+tests hashes (EQUIVALENT needs a
-			// tests hash), so a LIVED reading is sound.
-			if !mr.cfg.DetectEquivalentEnabled() {
-				for i := range mr.mutants {
-					if mr.mutants[i].Status == mutator.StatusEquivalent {
-						mr.mutants[i].Status = mutator.StatusLived
-					}
-				}
-			}
-			if !mr.cfg.Quiet {
-				fmt.Fprintf(stdout, "Cache: %d mutant outcomes reused from %s\n", hits, mr.cfg.Cache)
-			}
-		}
-	}
+	mr.applyCache()
 
 	// 8. Run mutation testing. pool.Run mutates the slice in place.
 	// TimeoutPolicy resolves per-mutant deadlines from the per-test
