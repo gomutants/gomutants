@@ -34,6 +34,7 @@ var (
 	compileTestBinaryFunc = compileTestBinary
 	runCompiledTestFunc   = runCompiledTest
 	measureRebuildFunc    = measureRebuild
+	groupPassesFunc       = groupPasses
 	statFileFunc          = os.Stat
 	writeFileFunc         = os.WriteFile
 )
@@ -195,6 +196,10 @@ type BuildOptions struct {
 	// package (the user's --test-flags, plus -short when the runner adds
 	// it), so the coverage runs build and run tests the same way.
 	TestFlags []string
+	// Lines holds the positions (see LineKey) of the mutants to be
+	// tested: only the groups of tests covering them are checked to pass
+	// together (see checkGroups). Nil checks every covered line's.
+	Lines map[string]bool
 }
 
 // BuildTestMap compiles each package's test binary once, lists the tests
@@ -284,6 +289,19 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 		return nil, err
 	}
 
+	// 5. Check that each group of tests a mutant will run passes together
+	// without any mutant, and stop routing to those that don't.
+	failed := checkGroups(ctx, tm.testGroups(opts.Lines), pkgBins, opts.TestTimeout, opts.Workers)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if len(failed) > 0 {
+		tm.dropGroups(failed)
+		tm.warnings = append(tm.warnings, fmt.Sprintf(
+			"test groups that fail when run together without any mutant: %d, so mutants on their lines run whole suites instead; first: %s",
+			len(failed), failed[0]))
+	}
+
 	// A package's suite decides a mutant's verdict only if its tests can
 	// reach the mutant. Without knowing what they reach it decides every
 	// verdict, so failing to read it costs speed, never a missed kill —
@@ -371,13 +389,145 @@ func (tm *TestMap) addBlocks(pkg, testName string, blocks []Block) {
 			continue
 		}
 		for line := b.StartLine; line <= b.EndLine; line++ {
-			key := b.File + ":" + fmt.Sprint(line)
+			key := LineKey(b.File, line)
 			if tm.index[key] == nil {
 				tm.index[key] = make(map[testKey]bool)
 			}
 			tm.index[key][testKey{pkg: pkg, name: testName}] = true
 		}
 	}
+}
+
+// LineKey returns the coverage map's key for line in file, a coverage
+// profile path such as a mutant's CoverageFile.
+func LineKey(file string, line int) string {
+	return file + ":" + fmt.Sprint(line)
+}
+
+// testGroup is the tests of one package that cover a line, sorted: what a
+// mutant on the line runs in that package.
+type testGroup struct {
+	pkg   string
+	tests []string
+}
+
+func (g testGroup) key() string {
+	return g.pkg + "\x00" + strings.Join(g.tests, "\x00")
+}
+
+func (g testGroup) String() string {
+	return g.pkg + ": " + strings.Join(g.tests, ", ")
+}
+
+func compareGroups(a, b testGroup) int {
+	if c := strings.Compare(a.pkg, b.pkg); c != 0 {
+		return c
+	}
+	return slices.Compare(a.tests, b.tests)
+}
+
+// lineGroups splits the tests covering a line by package.
+func lineGroups(set map[testKey]bool) []testGroup {
+	byPkg := map[string][]string{}
+	for k := range set {
+		byPkg[k.pkg] = append(byPkg[k.pkg], k.name)
+	}
+	var groups []testGroup
+	for pkg, tests := range byPkg {
+		slices.Sort(tests)
+		groups = append(groups, testGroup{pkg: pkg, tests: tests})
+	}
+	return groups
+}
+
+// testGroups returns the distinct groups of two or more tests covering a
+// line in lines (every line when lines is nil), sorted. A group of one
+// test already passed alone when the map was built (see processWork).
+func (tm *TestMap) testGroups(lines map[string]bool) []testGroup {
+	keys := maps.Keys(tm.index)
+	if lines != nil {
+		keys = maps.Keys(lines)
+	}
+	seen := map[string]bool{}
+	var groups []testGroup
+	for key := range keys {
+		for _, g := range lineGroups(tm.index[key]) {
+			if len(g.tests) > 1 && !seen[g.key()] {
+				seen[g.key()] = true
+				groups = append(groups, g)
+			}
+		}
+	}
+	slices.SortFunc(groups, compareGroups)
+	return groups
+}
+
+// dropGroups removes the failed groups from the map: from each line whose
+// tests in a group's package are exactly that group, those tests. A line
+// that runs some of them alongside others keeps them, as its own group
+// was checked on its own. A line left without tests runs its mutant's
+// whole package.
+func (tm *TestMap) dropGroups(failed []testGroup) {
+	drop := make(map[string]bool, len(failed))
+	for _, g := range failed {
+		drop[g.key()] = true
+	}
+	for key, set := range tm.index {
+		for _, g := range lineGroups(set) {
+			if !drop[g.key()] {
+				continue
+			}
+			for _, name := range g.tests {
+				delete(set, testKey{pkg: g.pkg, name: name})
+			}
+		}
+		if len(set) == 0 {
+			delete(tm.index, key)
+		}
+	}
+}
+
+// checkGroups runs each group once against its package's compiled binary,
+// across `workers` goroutines, and returns those that failed or timed out,
+// sorted. Each of their tests passed alone, so typically one leaves state
+// behind that breaks another, and a test the full suite runs in between
+// resets it. Routing a mutant to such a group would fail with or without
+// the mutant, a false kill. Every group's package has a binary: the map
+// indexes only tests that ran against one. Once ctx is cancelled the
+// remaining runs fail to start, and the caller reports the cancellation.
+func checkGroups(ctx context.Context, groups []testGroup, pkgBins map[string]*compiledPkg, timeout time.Duration, workers int) []testGroup {
+	var (
+		failed []testGroup
+		mu     sync.Mutex
+		wg     sync.WaitGroup
+		sem    = make(chan struct{}, workers)
+	)
+	for _, g := range groups {
+		sem <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-sem }()
+			if groupPassesFunc(ctx, pkgBins[g.pkg], g.tests, timeout) {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			failed = append(failed, g)
+		})
+	}
+	wg.Wait()
+	slices.SortFunc(failed, compareGroups)
+	return failed
+}
+
+// groupPasses runs tests together, once, against cp's binary from its
+// package directory, and reports whether they all passed within timeout.
+func groupPasses(ctx context.Context, cp *compiledPkg, tests []string, timeout time.Duration) bool {
+	ctx, cancel := withTestTimeout(ctx, timeout)
+	defer cancel()
+	// Ours go first: a positional argument among testArgs (after -args)
+	// ends the binary's flag parsing.
+	args := append([]string{"-test.run=" + RunPattern(tests)}, cp.testArgs...)
+	return testBinaryCmd(ctx, cp, args).Run() == nil
 }
 
 // processWork processes test entries from the work channel.
@@ -387,7 +537,8 @@ func (tm *TestMap) addBlocks(pkg, testName string, blocks []Block) {
 // setup, and routing a mutant to it alone would fail with or without the
 // mutant, a false kill. Its lines route to the other tests covering them,
 // or to the whole package, and a survivor is re-checked against the
-// whole package either way (see SuitePkgs).
+// whole package either way (see SuitePkgs). Tests that pass alone but
+// fail together are caught afterwards (see checkGroups).
 //
 // Once one of a package's tests times out alone, its remaining tests are
 // not run: they likely hang the same way, each holding a worker for the
@@ -752,7 +903,7 @@ func (tm *TestMap) TestRefsFor(file string, line int) []TestRef {
 	if tm == nil {
 		return nil
 	}
-	key := file + ":" + fmt.Sprint(line)
+	key := LineKey(file, line)
 	testSet := tm.index[key]
 	if len(testSet) == 0 {
 		return nil
@@ -772,7 +923,7 @@ func (tm *TestMap) TestsFor(file string, line int) []string {
 	if tm == nil {
 		return nil
 	}
-	key := file + ":" + fmt.Sprint(line)
+	key := LineKey(file, line)
 	testSet := tm.index[key]
 	if len(testSet) == 0 {
 		return nil

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1864,6 +1865,77 @@ func TestRunRechecksOrderDependentSurvivor(t *testing.T) {
 	}
 	if !strings.Contains(out, "Re-checked:   1  (1 killed by tests the coverage map missed)") {
 		t.Errorf("summary lacks the re-check line; got:\n%s", out)
+	}
+}
+
+// TestRunGroupFailingTogetherLives is the end-to-end gate for covering
+// tests that pass alone but fail together: TestBreak leaves state behind
+// that fails TestUse unless TestReset runs in between. Both cover Max's
+// condition, neither checks Max's result, so its mutant can't be killed.
+// Routed to the two of them it read KILLED, as they fail with or without
+// it; the map now drops them, and the whole package passes it.
+func TestRunGroupFailingTogetherLives(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"go.mod": "module testmod\n\ngo 1.26\n",
+		"max.go": "package testmod\n\nfunc Max(a, b int) int {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n",
+		"max_test.go": "package testmod\n\nimport \"testing\"\n\nvar broken bool\n\n" +
+			"func TestBreak(t *testing.T) { broken = true; _ = Max(2, 1) }\n\n" +
+			"func TestReset(t *testing.T) { broken = false }\n\n" +
+			"func TestUse(t *testing.T) {\n\tif broken {\n\t\tt.Fatal(\"broken\")\n\t}\n\t_ = Max(1, 2)\n}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	outPath := filepath.Join(dir, "r.json")
+	warnings, err := captureStderr(t, func() error {
+		_, err := captureOutput(t, func() error {
+			return run(context.Background(), []string{"--only", "CONDITIONALS_NEGATION", "-w", "1", "-o", outPath, "./..."})
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading report: %v", err)
+	}
+	var r struct {
+		MutantsKilled int `json:"mutants_killed"`
+		MutantsLived  int `json:"mutants_lived"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatalf("parsing report: %v", err)
+	}
+	if r.MutantsKilled != 0 || r.MutantsLived != 1 {
+		t.Errorf("report = %+v, want the one mutant LIVED", r)
+	}
+	if !strings.Contains(warnings, "first: testmod: TestBreak, TestUse") {
+		t.Errorf("stderr lacks the failing group's warning; got:\n%s", warnings)
+	}
+}
+
+// TestPendingLines keys the map's group check by the lines of the mutants
+// still to be tested, in the map's own key format.
+func TestPendingLines(t *testing.T) {
+	got := pendingLines([]mutator.Mutant{
+		{CoverageFile: "m/a.go", Line: 3, Status: mutator.StatusPending},
+		{CoverageFile: "m/a.go", Line: 3, Status: mutator.StatusPending},
+		{CoverageFile: "m/a.go", Line: 7, Status: mutator.StatusNotCovered},
+		{CoverageFile: "m/b.go", Line: 9, Status: mutator.StatusPending},
+	})
+	want := map[string]bool{coverage.LineKey("m/a.go", 3): true, coverage.LineKey("m/b.go", 9): true}
+	if !maps.Equal(got, want) {
+		t.Errorf("pendingLines = %v, want %v", got, want)
+	}
+	if got := pendingLines(nil); got == nil || len(got) != 0 {
+		t.Errorf("pendingLines(nil) = %#v, want an empty, non-nil set: nil would check every line", got)
 	}
 }
 

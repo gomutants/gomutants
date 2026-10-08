@@ -1200,6 +1200,114 @@ func TestBuildTestMapLeavesOutOrderDependentTest(t *testing.T) {
 	}
 }
 
+// groupModule's tests each pass alone, and the suite passes, but TestBreak
+// leaves state behind that fails TestUse and stalls TestStall unless
+// TestReset runs in between. TestBreak and TestUse both cover Max's
+// condition (lib.go:4); TestBreak and TestMin both cover Min's (lib.go:11),
+// and pass together. TestNeedsShort fails alone unless -short is set.
+var groupModule = map[string]string{
+	"go.mod": "module groupmod\n\ngo 1.26\n",
+	"lib.go": "package groupmod\n\nfunc Max(a, b int) int {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n\n" +
+		"func Min(a, b int) int {\n\tif a < b {\n\t\treturn a\n\t}\n\treturn b\n}\n",
+	"lib_test.go": `package groupmod
+
+import (
+	"testing"
+	"time"
+)
+
+var broken bool
+
+func TestBreak(t *testing.T) { broken = true; Max(2, 1); Min(1, 2) }
+
+func TestReset(t *testing.T) { broken = false }
+
+func TestUse(t *testing.T) {
+	if broken {
+		t.Fatal("TestBreak's state is still set")
+	}
+	Max(1, 2)
+}
+
+func TestMin(t *testing.T) { Min(2, 1) }
+
+func TestStall(t *testing.T) {
+	if broken {
+		time.Sleep(time.Hour)
+	}
+}
+
+func TestNeedsShort(t *testing.T) {
+	if !testing.Short() {
+		t.Fatal("needs -short")
+	}
+}
+`,
+}
+
+// TestBuildTestMapDropsTestsFailingTogether is the end-to-end gate for
+// tests that pass alone but fail together: a mutant on Max's condition
+// would fail them with or without the mutant, a false kill, so the line
+// routes to no test and its mutants run the whole package. Min's
+// condition, whose tests pass together, stays routed.
+func TestBuildTestMapDropsTestsFailingTogether(t *testing.T) {
+	dir := writeModule(t, groupModule)
+
+	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 2})
+	if err != nil {
+		t.Fatalf("BuildTestMap: %v", err)
+	}
+	if tests := tm.TestsFor("groupmod/lib.go", 4); tests != nil {
+		t.Errorf("TestsFor(lib.go:4) = %v, want none", tests)
+	}
+	tests := tm.TestsFor("groupmod/lib.go", 11)
+	slices.Sort(tests)
+	if !slices.Equal(tests, []string{"TestBreak", "TestMin"}) {
+		t.Errorf("TestsFor(lib.go:11) = %v, want [TestBreak TestMin]", tests)
+	}
+	if tests := tm.TestsFor("groupmod/lib.go", 5); !slices.Equal(tests, []string{"TestBreak"}) {
+		t.Errorf("TestsFor(lib.go:5) = %v, want [TestBreak]", tests)
+	}
+	if w := strings.Join(tm.Warnings(), "\n"); !strings.Contains(w, "first: groupmod: TestBreak, TestUse") {
+		t.Errorf("Warnings() = %q, want the failing group named", w)
+	}
+}
+
+// TestGroupPasses runs groupModule's tests together in source order, with
+// the binary's own arguments.
+func TestGroupPasses(t *testing.T) {
+	cp := compileFixture(t, writeModule(t, groupModule), "groupmod")
+	for _, tc := range []struct {
+		tests []string
+		args  []string
+		want  bool
+	}{
+		{[]string{"TestBreak", "TestUse"}, nil, false},
+		{[]string{"TestBreak", "TestReset", "TestUse"}, nil, true},
+		{[]string{"TestBreak", "TestMin"}, nil, true},
+		{[]string{"TestMin", "TestNeedsShort"}, nil, false},
+		{[]string{"TestMin", "TestNeedsShort"}, []string{"-test.short"}, true},
+	} {
+		cp.testArgs = tc.args
+		if got := groupPasses(context.Background(), cp, tc.tests, 0); got != tc.want {
+			t.Errorf("groupPasses(%v, args %v) = %v, want %v", tc.tests, tc.args, got, tc.want)
+		}
+	}
+}
+
+// TestGroupPassesTimesOut: a group that hangs together fails once its
+// timeout runs out.
+func TestGroupPassesTimesOut(t *testing.T) {
+	cp := compileFixture(t, writeModule(t, groupModule), "groupmod")
+	start := time.Now()
+	if groupPasses(context.Background(), cp, []string{"TestBreak", "TestStall"}, 300*time.Millisecond) {
+		t.Error("groupPasses of a hanging group = true, want false")
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("groupPasses took %s, want it cut off near its 300ms timeout", took)
+	}
+}
+
 // flagModule's TestMain refuses to run without the custom -need flag, and
 // TestShort fails unless -short is set: both pass only when the user's
 // test flags reach every run of the binary.

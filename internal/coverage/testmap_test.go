@@ -926,8 +926,8 @@ func TestProcessWorkSkipsStalledPackages(t *testing.T) {
 
 // stubBuildTestMapDeps swaps BuildTestMap's go-tool seams for stubs: every
 // resolved package compiles, listTests returns `tests`, each compiled test
-// run bumps the returned counter, and neither the test deps nor rebuilds
-// can be read. Restored on cleanup.
+// run bumps the returned counter, every group of tests passes together,
+// and neither the test deps nor rebuilds can be read. Restored on cleanup.
 func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPkg) *int32 {
 	t.Helper()
 	origCompile := compileTestBinaryFunc
@@ -936,7 +936,9 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 	origRun := runCompiledTestFunc
 	origDeps := testDepsFunc
 	origRebuild := measureRebuildFunc
+	origGroup := groupPassesFunc
 	t.Cleanup(func() {
+		groupPassesFunc = origGroup
 		compileTestBinaryFunc = origCompile
 		resolvePackagesFunc = origResolve
 		listTestsFunc = origList
@@ -949,6 +951,9 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 	}
 	measureRebuildFunc = func(context.Context, string, BuildOptions, *compiledPkg) (time.Duration, error) {
 		return 0, errors.New("rebuild not stubbed")
+	}
+	groupPassesFunc = func(context.Context, *compiledPkg, []string, time.Duration) bool {
+		return true
 	}
 
 	resolvePackagesFunc = func(_ context.Context, _ string, _ []string, _ string) ([]resolvedPkg, error) {
