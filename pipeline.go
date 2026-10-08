@@ -47,11 +47,6 @@ type mutationRun struct {
 	goToolchain string
 
 	pkgs []discover.Package
-	// fset and discovered (which holds every parsed AST) are discovery
-	// scratch: preReadSources clears them once it has taken the source
-	// bytes, so they don't stay reachable for the whole mutation run.
-	fset       *token.FileSet
-	discovered *discover.Result
 	// mutants is set by discoverMutants, narrowed by its filters, and
 	// given its verdicts in place by pool.Run.
 	mutants []mutator.Mutant
@@ -80,14 +75,15 @@ type mutationRun struct {
 	coverStart time.Time
 	// profile is cleared once discoverMutants has filtered by coverage,
 	// profileBytes once runMutants has stamped it into the cache.
-	// profileBytes stays nil when the profile came from the cache, which
-	// already holds it.
-	profile      *coverage.Profile
-	profileBytes []byte
-	coverageKey  string
-	testTimeout  time.Duration
-	srcCache     map[string][]byte
-	testMap      *coverage.TestMap
+	// coverFromCache marks a profile the cache already holds under
+	// coverageKey, which runMutants then has no reason to stamp.
+	profile        *coverage.Profile
+	profileBytes   []byte
+	coverFromCache bool
+	coverageKey    string
+	testTimeout    time.Duration
+	srcCache       map[string][]byte
+	testMap        *coverage.TestMap
 
 	lastCheckpoint time.Time
 }
@@ -153,7 +149,6 @@ func (mr *mutationRun) resolvePackages(ctx context.Context) error {
 	var err error
 	packages := mr.opts.packages
 
-	// 1. Resolve packages.
 	mr.term.Phase("Resolving packages...")
 	mr.pkgs, err = discover.ResolvePackages(ctx, mr.projectDir, packages, mr.cfg.Tags)
 	if err != nil {
@@ -255,7 +250,6 @@ func (mr *mutationRun) resolveCoverageScope(ctx context.Context) {
 // makeTempDir creates the directory the coverage, test-map and mutant
 // runs write into. run() removes it.
 func (mr *mutationRun) makeTempDir() error {
-	// 2. Create temp directory.
 	var err error
 	mr.tmpDir, err = mkdirTempFunc("", "gomutants-*")
 	if err != nil {
@@ -267,17 +261,16 @@ func (mr *mutationRun) makeTempDir() error {
 // collectCoverage produces the coverage profile, from the cache when its
 // key matches and from a fresh `go test -coverprofile` run otherwise.
 func (mr *mutationRun) collectCoverage(ctx context.Context) error {
-	// 3. Collect coverage. With --cache enabled, the profile is memoized
-	// under a content-hash key that fingerprints every input that can
-	// change `go test -coverprofile` output (sources, go.mod/sum, toolchain,
-	// env, -coverpkg). A key match parses the cached profile in-process and
+	// With --cache enabled, the profile is memoized under a content-hash
+	// key that fingerprints every input that can change
+	// `go test -coverprofile` output (sources, go.mod/sum, toolchain, env,
+	// -coverpkg). A key match parses the cached profile in-process and
 	// skips the multi-second `go test` invocation.
 	mr.term.Phase("Collecting coverage...")
 	mr.coverStart = time.Now()
 
-	var coverFromCache bool
 	if mr.loadedCache != nil {
-		coverFromCache = mr.cachedCoverageProfile(ctx)
+		mr.coverFromCache = mr.cachedCoverageProfile(ctx)
 	}
 
 	if mr.profile == nil {
@@ -300,7 +293,7 @@ func (mr *mutationRun) collectCoverage(ctx context.Context) error {
 	}
 
 	coverSuffix := ""
-	if coverFromCache {
+	if mr.coverFromCache {
 		coverSuffix = ", cached"
 	}
 	mr.term.PhaseDone(fmt.Sprintf("done (%s%s)", phaseDurationDisplay(time.Since(mr.coverStart)), coverSuffix))
@@ -336,8 +329,6 @@ func (mr *mutationRun) cachedCoverageProfile(ctx context.Context) bool {
 		}
 	}
 	if mr.coverageKey != "" && mr.coverageKey == mr.loadedCache.CoverageKey && mr.loadedCache.CoverageProfile != "" {
-		// profileBytes stays nil: the cache already holds this key and
-		// profile, so runMutants has nothing to stamp.
 		if p, perr := parseBytesFunc([]byte(mr.loadedCache.CoverageProfile)); perr == nil {
 			mr.profile = p
 			return true
@@ -349,7 +340,6 @@ func (mr *mutationRun) cachedCoverageProfile(ctx context.Context) bool {
 // measureBaseline times one unmutated test run and derives the global
 // per-mutant timeout ceiling from it.
 func (mr *mutationRun) measureBaseline(ctx context.Context) error {
-	// 4. Measure baseline test duration.
 	mr.term.Phase("Measuring baseline...")
 	baseline, err := measureBaselineFunc(ctx, mr.projectDir, mr.coveragePatterns, mr.cfg.Tags, mr.cfg.TestFlagFields())
 	if err != nil {
@@ -368,16 +358,16 @@ func (mr *mutationRun) measureBaseline(ctx context.Context) error {
 	return nil
 }
 
-// discoverMutants parses the packages, keeping the parse cache for the
-// filters and preReadSources, and applies the --run-mutant-id,
-// --changed-since, coverage, directive and --exclude-calls filters to the
-// mutants found.
-func (mr *mutationRun) discoverMutants(ctx context.Context) error {
-	// 5. Discover mutants.
+// discoverMutants parses the packages and applies the --run-mutant-id,
+// --changed-since, directive, --exclude-calls and coverage filters to the
+// mutants found. It returns the parse cache, every parsed file keyed by
+// absolute path, for preReadSources; no later phase needs the ASTs, so the
+// caller drops it once the source bytes are taken.
+func (mr *mutationRun) discoverMutants(ctx context.Context) (map[string]*discover.ParsedFile, error) {
 	mr.term.Phase("Discovering mutants...")
-	mr.fset = token.NewFileSet()
-	mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
-	mr.mutants = mr.discovered.Mutants
+	fset := token.NewFileSet()
+	found := discover.Discover(fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
+	mr.mutants = found.Mutants
 	if mr.cfg.RunMutantID != "" {
 		// checkRunMutantID resolved the id against the source as it was
 		// before coverage and the baseline; an edit since can change the
@@ -389,16 +379,16 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 		var err error
 		mr.mutants, err = discover.FilterByStableID(mr.mutants, mr.cfg.RunMutantID)
 		if err != nil {
-			return usageError(err)
+			return nil, usageError(err)
 		}
 		if err := mr.checkSameRunTarget(mr.mutants[0]); err != nil {
-			return usageError(err)
+			return nil, usageError(err)
 		}
 	}
 	var err error
-	mr.mutants, mr.suppressed, mr.callSuppressed, err = mr.filterBySource(ctx, mr.fset, mr.mutants, mr.discovered.Files, true)
+	mr.mutants, mr.suppressed, mr.callSuppressed, err = mr.filterBySource(ctx, fset, mr.mutants, found.Files, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Coverage only sets a status, so it can run after the filters that
 	// drop: it then skips the mutants they removed.
@@ -406,12 +396,8 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	mr.profile = nil
 	if mr.cfg.Verbose {
 		for _, s := range mr.suppressed {
-			reason := s.Reason
-			if reason == "" {
-				reason = "no reason"
-			}
 			fmt.Fprintf(stderr, "suppressed %s at %s:%d (%s)\n",
-				s.Mutant.Type, s.Mutant.RelFile, s.Mutant.Line, reason)
+				s.Mutant.Type, s.Mutant.RelFile, s.Mutant.Line, suppressionReason(s))
 		}
 	}
 	// FilterByStableID resolved the id, but a later filter can still drop
@@ -424,7 +410,7 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	// the filters only drop.
 	if mr.cfg.RunMutantID != "" {
 		if len(mr.mutants) == 0 {
-			return usageError(runMutantDroppedError(mr.cfg.RunMutantID, mr.cfg.ChangedSince, mr.suppressed))
+			return nil, usageError(runMutantDroppedError(mr.cfg.RunMutantID, mr.cfg.ChangedSince, mr.suppressed))
 		}
 		mr.runTarget = &mr.mutants[0]
 	}
@@ -440,7 +426,7 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 		}
 	}
 	mr.term.PhaseDone(fmt.Sprintf("%d found (%d not covered, %d to test)", len(mr.mutants), notCoveredCount, mr.pendingCount))
-	return nil
+	return found.Files, nil
 }
 
 // filterBySource applies the filters that need only the source and git:
@@ -485,14 +471,12 @@ func (mr *mutationRun) printDryRun() {
 }
 
 // preReadSources collects every production source file into memory once,
-// for the overlays and for cache hashing, and releases the parse cache.
-func (mr *mutationRun) preReadSources() error {
+// for the overlays and for cache hashing. parsed is discoverMutants' parse
+// cache: the bytes discovery parsed are reused, so the overlays patch
+// exactly what the mutant offsets were computed on.
+func (mr *mutationRun) preReadSources(parsed map[string]*discover.ParsedFile) error {
 	var err error
-	// 6. Pre-read source files. The bytes discovery parsed are reused, so
-	// the overlays patch exactly what the mutant offsets were computed on.
-	mr.srcCache, err = preReadFilesFunc(mr.pkgs, mr.discovered.Files)
-	// The parsed ASTs are needed by no later phase.
-	mr.fset, mr.discovered = nil, nil
+	mr.srcCache, err = preReadFilesFunc(mr.pkgs, parsed)
 	if err != nil {
 		return fmt.Errorf("pre-reading source files: %w", err)
 	}
@@ -512,7 +496,6 @@ func (mr *mutationRun) preReadSources() error {
 // only its covering tests. Failure is fatal only under -coverpkg.
 func (mr *mutationRun) buildTestMap(ctx context.Context) error {
 	var err error
-	// 7. Build per-test coverage map.
 	mr.term.Phase("Building per-test coverage map...")
 	// testTimeout also bounds each test's solo coverage run: a test that
 	// can't finish in the suite's ceiling would time out every mutant it
@@ -554,7 +537,7 @@ func (mr *mutationRun) buildTestMap(ctx context.Context) error {
 // applyCache replays prior verdicts for mutants whose package and covering
 // tests are unchanged since the cached run.
 func (mr *mutationRun) applyCache() {
-	// 7a. Apply incremental-analysis cache (opt-in via --cache). Hits
+	// Apply incremental-analysis cache (opt-in via --cache). Hits
 	// flip the mutant from Pending to its prior terminal status, which
 	// makes the runner's Pending-only filter naturally skip them.
 	// loadedCache + hasher were created at module-read time so the
@@ -620,7 +603,7 @@ func (mr *mutationRun) runMutants(ctx context.Context) {
 	mr.progress.StartHeartbeat()
 	defer mr.progress.StopHeartbeat()
 
-	// 8. Run mutation testing. pool.Run mutates the slice in place.
+	// pool.Run mutates the slice in place.
 	// TimeoutPolicy resolves per-mutant deadlines from the per-test
 	// durations recorded on the testMap, falling back to the global
 	// baseline×coefficient ceiling. testTimeout stays the absolute cap.
@@ -631,7 +614,8 @@ func (mr *mutationRun) runMutants(ctx context.Context) {
 	// re-serialize the (potentially large) profile on every checkpoint.
 	// An empty coverageKey means hashing failed earlier and we silently
 	// fell back to a fresh run; don't poison the cache with a missing key.
-	if mr.loadedCache != nil && mr.coverageKey != "" && len(mr.profileBytes) > 0 {
+	// A profile that came from the cache is already stored under its key.
+	if mr.loadedCache != nil && mr.coverageKey != "" && !mr.coverFromCache {
 		mr.loadedCache.CoverageKey = mr.coverageKey
 		mr.loadedCache.CoverageProfile = string(mr.profileBytes)
 	}
@@ -646,7 +630,7 @@ func (mr *mutationRun) runMutants(ctx context.Context) {
 		mr.checkpoint(false)
 	})
 
-	// 8b. Trivial Compiler Equivalence pass (opt-in). Recompile each
+	// Trivial Compiler Equivalence pass (opt-in). Recompile each
 	// surviving (LIVED) mutant with package-scoped `-gcflags=-S` and
 	// reclassify it as EQUIVALENT when the assembly matches the original —
 	// a compiler-proven non-gap. Verdicts are checkpointed as they land (the
@@ -695,7 +679,6 @@ func (mr *mutationRun) checkpoint(force bool) {
 
 // writeReports prints the summary and writes every requested report.
 func (mr *mutationRun) writeReports() (*report.Report, error) {
-	// 9. Generate report.
 	totalElapsed := time.Since(mr.coverStart)
 	r := report.Generate(mr.mutants, mr.goModule, totalElapsed, len(mr.suppressed))
 	// Breakdown only; the aggregate stays in MutantsSuppressed so the two

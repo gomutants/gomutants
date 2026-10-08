@@ -295,7 +295,8 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if err := mr.discoverMutants(ctx); err != nil {
+	parsed, err := mr.discoverMutants(ctx)
+	if err != nil {
 		return err
 	}
 
@@ -304,7 +305,9 @@ func run(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	if err := mr.preReadSources(); err != nil {
+	// parsed is not used past this call, so the ASTs it holds are
+	// collectable for the rest of the run.
+	if err := mr.preReadSources(parsed); err != nil {
 		return err
 	}
 
@@ -330,15 +333,20 @@ func run(ctx context.Context, args []string) error {
 // was suppressed, --changed-since is what narrowed the run.
 func runMutantDroppedError(id, changedSince string, suppressed []discover.Suppression) error {
 	if len(suppressed) > 0 {
-		reason := suppressed[0].Reason
-		if reason == "" {
-			reason = "no reason"
-		}
 		return fmt.Errorf("the mutant matching --run-mutant-id %q is suppressed at %s:%d (%s)",
-			id, suppressed[0].Mutant.RelFile, suppressed[0].Mutant.Line, reason)
+			id, suppressed[0].Mutant.RelFile, suppressed[0].Mutant.Line, suppressionReason(suppressed[0]))
 	}
 	return fmt.Errorf("the mutant matching --run-mutant-id %q is not on any line changed since %q",
 		id, changedSince)
+}
+
+// suppressionReason is a suppression's reason as gomutants prints it: the
+// one written at the site or by --exclude-calls, else "no reason".
+func suppressionReason(s discover.Suppression) string {
+	if s.Reason == "" {
+		return "no reason"
+	}
+	return s.Reason
 }
 
 // warnInfraErrors notes on stderr that part of the run never produced a
