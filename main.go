@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 	"slices"
 	"strings"
@@ -286,89 +285,13 @@ func run(ctx context.Context, args []string) error {
 	}
 	defer func() { _ = os.RemoveAll(mr.tmpDir) }()
 
-	// 3. Collect coverage. With --cache enabled, the profile is memoized
-	// under a content-hash key that fingerprints every input that can
-	// change `go test -coverprofile` output (sources, go.mod/sum, toolchain,
-	// env, -coverpkg). A key match parses the cached profile in-process and
-	// skips the multi-second `go test` invocation.
-	mr.term.Phase("Collecting coverage...")
-	mr.coverStart = time.Now()
-
-	var coverFromCache bool
-	if mr.loadedCache != nil {
-		// Hash failures (unreadable file/dir) fall through to a fresh
-		// coverage run rather than aborting — same conservative policy
-		// as the per-mutant Lookup path.
-		// In integration mode the coverage profile is produced by running R's
-		// tests with -coverpkg=T, so the hash must fingerprint R's sources
-		// (rDirs, which already include T) and the effective -coverpkg. The
-		// distinct coverPkgEff value also keeps integration and
-		// non-integration runs in separate cache namespaces.
-		var (
-			hashDirs []string
-			derr     error
-		)
-		if mr.cfg.Integration {
-			hashDirs = mr.rDirs
-		} else {
-			hashDirs, derr = coveragePkgDirs(ctx, mr.projectDir, mr.pkgs, mr.coverPkgEff, mr.cfg.Tags)
-		}
-		if derr == nil {
-			toolchain := fmt.Sprintf("gomutants/%s|go/%s", runtime.Version(), mr.goToolchain)
-			if k, herr := mr.hasher.HashCoverageInputs(hashDirs, mr.projectDir, mr.coverPkgEff, mr.cfg.Tags, mr.cfg.CanonicalTestFlags(), toolchain, captureCoverageEnv()); herr == nil {
-				mr.coverageKey = k
-			}
-		}
-		if mr.coverageKey != "" && mr.coverageKey == mr.loadedCache.CoverageKey && mr.loadedCache.CoverageProfile != "" {
-			if p, perr := parseBytesFunc([]byte(mr.loadedCache.CoverageProfile)); perr == nil {
-				mr.profile = p
-				mr.profileBytes = []byte(mr.loadedCache.CoverageProfile)
-				coverFromCache = true
-			}
-		}
-	}
-
-	if mr.profile == nil {
-		profilePath, rerr := runCoverageFunc(ctx, mr.projectDir, mr.coveragePatterns, mr.coverPkgEff, mr.cfg.Tags, mr.tmpDir, mr.cfg.TestFlagFields())
-		if rerr != nil {
-			return rerr
-		}
-		// Read the profile bytes once and reuse them for parsing + cache
-		// persistence. Avoids a second file read at cache-write time.
-		bs, rerr := os.ReadFile(profilePath)
-		if rerr != nil {
-			return fmt.Errorf("reading coverage profile: %w", rerr)
-		}
-		p, perr := parseBytesFunc(bs)
-		if perr != nil {
-			return perr
-		}
-		mr.profile = p
-		mr.profileBytes = bs
-	}
-
-	coverSuffix := ""
-	if coverFromCache {
-		coverSuffix = ", cached"
-	}
-	mr.term.PhaseDone(fmt.Sprintf("done (%s%s)", phaseDurationDisplay(time.Since(mr.coverStart)), coverSuffix))
-
-	// 4. Measure baseline test duration.
-	mr.term.Phase("Measuring baseline...")
-	baseline, err := measureBaselineFunc(ctx, mr.projectDir, mr.coveragePatterns, mr.cfg.Tags, mr.cfg.TestFlagFields())
-	if err != nil {
+	if err := mr.collectCoverage(ctx); err != nil {
 		return err
 	}
-	mr.testTimeout = baseline * time.Duration(mr.cfg.TimeoutCoefficient)
-	// Distinguish the displayed value: with adaptive sizing, testTimeout
-	// is the upper-bound ceiling, not the deadline every mutant gets.
-	// Without this, users see "timeout: 4m" and assume each mutant has
-	// 4 minutes; in reality fast packages get sub-second deadlines.
-	timeoutLabel := "timeout"
-	if mr.cfg.AdaptiveTimeoutEnabled() {
-		timeoutLabel = "ceiling"
+
+	if err := mr.measureBaseline(ctx); err != nil {
+		return err
 	}
-	mr.term.PhaseDone(fmt.Sprintf("done (%s, %s: %s)", phaseDurationDisplay(baseline), timeoutLabel, mr.testTimeout.Round(time.Second)))
 
 	// 5. Discover mutants.
 	mr.term.Phase("Discovering mutants...")
