@@ -803,6 +803,24 @@ func TestBuildTestMapReadsTestDeps(t *testing.T) {
 	}
 }
 
+// TestSuites: every suite in scope, sorted, as a copy the caller can't
+// use to change the map; a nil map has none.
+func TestSuites(t *testing.T) {
+	if got := (*TestMap)(nil).Suites(); got != nil {
+		t.Errorf("nil map: Suites = %+v, want nil", got)
+	}
+	a, b := Package{ImportPath: "m/a", Dir: "/a"}, Package{ImportPath: "m/b", Dir: "/b"}
+	tm := NewTestMapForTesting(nil, nil).WithSuitesForTesting(false, nil, b, a)
+	got := tm.Suites()
+	if want := []Package{a, b}; !slices.Equal(got, want) {
+		t.Fatalf("Suites = %+v, want %+v", got, want)
+	}
+	got[0] = b
+	if again := tm.Suites(); again[0] != a {
+		t.Errorf("Suites after changing the returned slice = %+v, want the map unchanged", again)
+	}
+}
+
 // TestSuitePkgs pins which suites decide a mutant's verdict: its own
 // package's without cross-package coverage; with it, every package
 // (sorted) whose tests link the mutant's package or whose links are
@@ -1101,6 +1119,68 @@ func TestBuildTestMapErrorsWhenNothingLists(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(ran); got != 0 {
 		t.Errorf("runCompiledTestFunc called %d times after every listing failed, want 0", got)
+	}
+}
+
+// TestBuildTestMapKeepsSuitesWhenNothingRoutes: with -coverpkg, a build
+// that can route no mutant still knows which packages have tests, and an
+// importer's suite may be the only one that kills a mutant. So each way it
+// fails — nothing compiles, the test-binary arguments can't be read,
+// nothing lists — keeps the map with every suite deciding every verdict
+// and the failure as a warning. A dropped map ran each mutant against its
+// own package alone, and a package tested only by its importers read every
+// mutant LIVED.
+func TestBuildTestMapKeepsSuitesWhenNothingRoutes(t *testing.T) {
+	xDir, yDir := t.TempDir(), t.TempDir()
+	resolved := []resolvedPkg{{importPath: "example.com/x", dir: xDir}, {importPath: "example.com/y", dir: yDir}}
+	suites := []Package{{ImportPath: "example.com/x", Dir: xDir}, {ImportPath: "example.com/y", Dir: yDir}}
+	boom := errors.New("boom")
+	cases := []struct {
+		name  string
+		opts  BuildOptions
+		fail  func()
+		cause string
+	}{
+		{"nothing compiles", BuildOptions{}, func() {
+			compileTestBinaryFunc = func(_ context.Context, _ string, _ BuildOptions, pkg resolvedPkg) (*compiledPkg, error) {
+				return nil, fmt.Errorf("go test -c %s: %w", pkg.importPath, boom)
+			}
+		}, "no test binary compiled (2 packages failed); first failure: go test -c example.com/x: boom"},
+		{"test-binary arguments unread", BuildOptions{TestFlags: []string{"-short"}}, func() {
+			testBinaryArgsFunc = func(context.Context, string, string, string, []string) ([]string, error) { return nil, boom }
+		}, "reading the test-binary arguments for --test-flags: boom"},
+		{"nothing lists", BuildOptions{}, func() {
+			listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, []error) {
+				return nil, []error{fmt.Errorf("example.com/x: %w", boom), errors.New("example.com/y: boom")}
+			}
+		}, "no tests listed (2 packages failed); first failure: example.com/x: boom"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ran := stubBuildTestMapDeps(t, nil, resolved)
+			origArgs := testBinaryArgsFunc
+			t.Cleanup(func() { testBinaryArgsFunc = origArgs })
+			c.fail()
+
+			opts := c.opts
+			opts.CoverPkg, opts.TmpDir, opts.Workers = "./...", t.TempDir(), 1
+			tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, opts)
+			if err != nil || tm == nil {
+				t.Fatalf("BuildTestMap = (%v, %v), want a map", tm, err)
+			}
+			for _, pkg := range []string{"example.com/x", "example.com/y", "example.com/lib"} {
+				if got := tm.SuitePkgs(pkg); !slices.Equal(got, suites) {
+					t.Errorf("SuitePkgs(%s) = %+v, want every suite %+v", pkg, got, suites)
+				}
+			}
+			want := []string{"routing mutants to their covering tests failed, so each runs its own package's whole suite and every survivor is re-checked against every package's suite: " + c.cause}
+			if got := tm.Warnings(); !slices.Equal(got, want) {
+				t.Errorf("Warnings = %q, want %q", got, want)
+			}
+			if got := atomic.LoadInt32(ran); got != 0 {
+				t.Errorf("runCompiledTestFunc called %d times, want 0", got)
+			}
+		})
 	}
 }
 

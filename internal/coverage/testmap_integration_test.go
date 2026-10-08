@@ -669,8 +669,13 @@ func TestMeasureRebuild(t *testing.T) {
 	if err != nil || !bytes.HasPrefix(changed, before) || !bytes.Contains(changed[len(before):], []byte("// gomutants rebuild probe ")) {
 		t.Errorf("changed copy = (%q, %v), want the source with the probe's comment appended", changed, err)
 	}
-	if _, err := os.Stat(filepath.Join(binDir, "probe.test")); !errors.Is(err, fs.ErrNotExist) {
-		t.Errorf("probe binary left behind: %v", err)
+	entries, err := os.ReadDir(binDir)
+	var left []string
+	for _, e := range entries {
+		left = append(left, e.Name())
+	}
+	if want := []string{filepath.Base(probe), "overlay.json"}; err != nil || !slices.Equal(left, want) {
+		t.Errorf("binary directory holds (%v, %v), want only %v: the probe's binary is left behind", left, err, want)
 	}
 	if want := []os.FileMode{0o644, 0o644}; !slices.Equal(perms, want) {
 		t.Errorf("write modes = %v, want %v", perms, want)
@@ -1392,5 +1397,31 @@ func TestBuildTestMapKeepsCollidingBinariesApart(t *testing.T) {
 		if got := tm.TestRefsFor(file, 3); !slices.Equal(got, []TestRef{want}) {
 			t.Errorf("TestRefsFor(%s:3) = %+v, want [%+v]", file, got, want)
 		}
+	}
+}
+
+// TestBuildTestMapMapsPackageNamedProbe: a package named probe builds its
+// coverage binary as probe.test, the name the rebuild probe once gave its
+// own binary. The probe overwrote the package's binary, then removed it,
+// and listing its tests failed: the package mapped nothing, and alone in
+// scope failed the whole map.
+func TestBuildTestMapMapsPackageNamedProbe(t *testing.T) {
+	dir := writeModule(t, map[string]string{
+		"go.mod":          "module m\n\ngo 1.26\n",
+		"probe/p.go":      "package probe\n\nfunc P() int { return 1 }\n",
+		"probe/p_test.go": "package probe\n\nimport \"testing\"\n\nfunc TestP(t *testing.T) { P() }\n",
+	})
+	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
+	if err != nil {
+		t.Fatalf("BuildTestMap: %v", err)
+	}
+	if got, want := tm.TestRefsFor("m/probe/p.go", 3), []TestRef{{Pkg: "m/probe", Name: "TestP"}}; !slices.Equal(got, want) {
+		t.Errorf("TestRefsFor(p.go:3) = %+v, want %+v", got, want)
+	}
+	if _, ok := tm.RebuildDuration("m/probe"); !ok {
+		t.Error("RebuildDuration(m/probe) unmeasured, want the probe's measurement")
+	}
+	if w := tm.Warnings(); len(w) != 0 {
+		t.Errorf("Warnings = %q, want none", w)
 	}
 }

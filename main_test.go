@@ -1630,6 +1630,48 @@ func TestRunBuildTestMapWarningOnError(t *testing.T) {
 	}
 }
 
+// TestRunBuildTestMapErrorStopsCrossPkgRun: with -coverpkg, a mutant's
+// verdict rests on the suites of the packages whose tests link it, which
+// only the map knows. Without it each mutant would run its own package
+// alone, and one only an importer's tests kill would read LIVED: the run
+// stops with the map's error instead of going on to report it.
+func TestRunBuildTestMapErrorStopsCrossPkgRun(t *testing.T) {
+	dir := setupTinyProject(t)
+	t.Chdir(dir)
+
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	boom := errors.New("inject build-test-map failure")
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
+		return nil, boom
+	}
+
+	var out, errBuf bytes.Buffer
+	origStdout := stdout
+	origStderr := stderr
+	stdout = &out
+	stderr = &errBuf
+	defer func() {
+		stdout = origStdout
+		stderr = origStderr
+	}()
+
+	reportPath := filepath.Join(dir, "report.json")
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--coverpkg", "testmod",
+		"-w", "1",
+		"-o", reportPath,
+		"testmod",
+	})
+	if !errors.Is(err, boom) || !strings.HasPrefix(err.Error(), "per-test coverage map: ") {
+		t.Errorf("run = %v, want the map's error", err)
+	}
+	if _, serr := os.Stat(reportPath); !errors.Is(serr, os.ErrNotExist) {
+		t.Errorf("report written after the map failed: %v", serr)
+	}
+}
+
 // TestRunBuildTestMapWarnings: what the map lost while building without
 // failing reaches stderr, each warning on its own line, and the phase
 // still reads as done.
@@ -2744,5 +2786,18 @@ func TestEmbedFilesByDir(t *testing.T) {
 	}
 	if !slices.Equal(got["/m/a"], []string{"data/schema.json", "tmpl/x.tmpl"}) {
 		t.Errorf("got[\"/m/a\"] = %v, want both embed inputs", got["/m/a"])
+	}
+}
+
+// TestSuiteDirs: the directory of each suite in the map's scope, in order;
+// a nil map, as when it failed to build, has none.
+func TestSuiteDirs(t *testing.T) {
+	if got := suiteDirs(nil); got != nil {
+		t.Errorf("suiteDirs(nil) = %v, want nil", got)
+	}
+	tm := coverage.NewTestMapForTesting(nil, nil).WithSuitesForTesting(true, nil,
+		coverage.Package{ImportPath: "m/b", Dir: "/b"}, coverage.Package{ImportPath: "m/a", Dir: "/a"})
+	if got, want := suiteDirs(tm), []string{"/a", "/b"}; !slices.Equal(got, want) {
+		t.Errorf("suiteDirs = %v, want %v", got, want)
 	}
 }

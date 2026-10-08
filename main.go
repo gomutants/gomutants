@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -812,6 +813,13 @@ func run(ctx context.Context, args []string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		// With -coverpkg the map fails only when it can't tell which
+		// packages have tests (see coverage.BuildTestMap). Those are
+		// the suites a mutant's verdict rests on beyond its own package's:
+		// without them a mutant only an importer's tests kill reads LIVED.
+		if coverPkgEff != "" {
+			return fmt.Errorf("per-test coverage map: %w", err)
+		}
 		// Non-fatal: fall back to running all tests per mutant.
 		fmt.Fprintf(stderr, "warning: per-test coverage map failed: %v\n", err)
 		testMap = nil
@@ -834,7 +842,11 @@ func run(ctx context.Context, args []string) error {
 		// (rDirs; equal to the target dirs when integration mode is off) so
 		// cross-package coverage — tests in an importing package exercising a
 		// mutated target via -coverpkg — resolves to the right test files.
-		testIndex := cache.BuildTestIndex(rDirs)
+		// The map's suites join them: each can decide a survivor's verdict
+		// (see testFilesResolver), and one need not be in rDirs — a package
+		// --exclude-files emptied is gone from pkgs, but its tests still
+		// run under --coverpkg, and a file the index lacks is in no key.
+		testIndex := cache.BuildTestIndex(slices.Concat(rDirs, suiteDirs(testMap)))
 
 		crossPkg := cfg.Integration || cfg.CoverPkg != ""
 		testFilesFor = testFilesResolver(testIndex, testMap, crossPkg)
@@ -1254,6 +1266,16 @@ func dirsOfPackages(pkgs []discover.Package) []string {
 			seen[p.Dir] = true
 			dirs = append(dirs, p.Dir)
 		}
+	}
+	return dirs
+}
+
+// suiteDirs returns the directory of each package suite in tm's scope (see
+// coverage.TestMap.Suites); a nil map has none.
+func suiteDirs(tm *coverage.TestMap) []string {
+	var dirs []string
+	for _, p := range tm.Suites() {
+		dirs = append(dirs, p.Dir)
 	}
 	return dirs
 }

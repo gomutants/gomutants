@@ -127,6 +127,15 @@ func (tm *TestMap) SuitePkgs(pkg string) []Package {
 	return pkgs
 }
 
+// Suites returns every package in the map's scope that has tests, sorted
+// by import path: each one SuitePkgs can return.
+func (tm *TestMap) Suites() []Package {
+	if tm == nil {
+		return nil
+	}
+	return slices.Clone(tm.suites)
+}
+
 // Warnings returns what went wrong building the map that didn't fail it,
 // in the order it happened: each costs the run speed, never a kill, but
 // the user should know why it is slower than the map promises.
@@ -204,18 +213,18 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	tm := newTestMap(opts.CoverPkg != "")
+	tm.suites = suitePkgs(pkgBins, compileFailures)
 	// Every package with tests failed to compile: the map would come back
 	// empty and per-test routing would switch off without a word. Surface
 	// it so the caller warns and falls back explicitly (a nil map routes
-	// exactly like an empty one).
+	// exactly like an empty one; see unrouted).
 	if len(pkgBins) == 0 && len(compileFailures) > 0 {
-		return nil, fmt.Errorf("no test binary compiled (%d packages failed); first failure: %w",
-			len(compileFailures), compileFailures[0].err)
+		return tm.unrouted(fmt.Errorf("no test binary compiled (%d packages failed); first failure: %w",
+			len(compileFailures), compileFailures[0].err))
 	}
-	tm := newTestMap(opts.CoverPkg != "")
-	tm.suites = suitePkgs(pkgBins, compileFailures)
 	if err := setTestArgs(ctx, projectDir, opts, pkgBins); err != nil {
-		return nil, err
+		return tm.unrouted(err)
 	}
 	tm.rebuilds = measureRebuilds(ctx, projectDir, opts, pkgBins)
 
@@ -230,8 +239,8 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 	// Every listing failed: as with every compile failing, the map would
 	// come back empty and routing would switch off without a word.
 	if len(tests) == 0 && len(listFailures) > 0 {
-		return nil, fmt.Errorf("no tests listed (%d packages failed); first failure: %w",
-			len(listFailures), listFailures[0])
+		return tm.unrouted(fmt.Errorf("no tests listed (%d packages failed); first failure: %w",
+			len(listFailures), listFailures[0]))
 	}
 	if len(listFailures) > 0 {
 		tm.warnings = append(tm.warnings, fmt.Sprintf(
@@ -285,6 +294,23 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 				"reading what each package's tests link failed, so every survivor is re-checked against every package's suite: %v", err))
 		}
 	}
+	return tm, nil
+}
+
+// unrouted ends a build that can route no mutant to its covering tests,
+// with err. Without -coverpkg the map is dropped: each mutant then runs
+// its own package's whole suite, which is all that can kill it. With it,
+// the suites of the packages whose tests link the mutant's can kill it
+// too, and only the map knows them: dropped, a mutant only an importer's
+// tests kill would read LIVED. So the map is kept without routes or
+// links, err becomes a warning, and every survivor is re-checked against
+// every package's suite.
+func (tm *TestMap) unrouted(err error) (*TestMap, error) {
+	if !tm.crossPkg {
+		return nil, err
+	}
+	tm.warnings = append(tm.warnings, fmt.Sprintf(
+		"routing mutants to their covering tests failed, so each runs its own package's whole suite and every survivor is re-checked against every package's suite: %v", err))
 	return tm, nil
 }
 
@@ -555,7 +581,10 @@ func measureRebuilds(ctx context.Context, projectDir string, opts BuildOptions, 
 // the mutant runs then use.
 //
 // The changed file and overlay go next to cp's test binary, in its own
-// directory; the probe's binary is removed once built.
+// directory; the probe's binary is removed once built. Its name extends
+// that of cp's binary, as a fixed name can be the binary's own: a package
+// named probe builds probe.test, which the probe would overwrite and then
+// remove before the package's tests are listed.
 func measureRebuild(ctx context.Context, projectDir string, opts BuildOptions, cp *compiledPkg) (time.Duration, error) {
 	src, err := os.ReadFile(cp.probeFile)
 	if err != nil {
@@ -570,7 +599,7 @@ func measureRebuild(ctx context.Context, projectDir string, opts BuildOptions, c
 		return 0, err
 	}
 
-	probeBin := filepath.Join(dir, "probe.test")
+	probeBin := cp.binPath + ".rebuild"
 	defer func() { _ = os.Remove(probeBin) }()
 	args := []string{"test", "-c", "-vet=off", "-o", probeBin, "-overlay=" + ovPath}
 	if opts.Tags != "" {
