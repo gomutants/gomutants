@@ -242,18 +242,21 @@ func G(a, b int) int { return a - b } // gomutants:disable ARITHMETIC_BASE
 `
 	mutants, _ := writeFixture(t, src)
 
-	var (
-		kept       []mutator.Mutant
-		suppressed []Suppression
-		err        error
-	)
-	out := captureStderr(t, func() {
-		kept, suppressed, err = FilterByDirectivesSilently(token.NewFileSet(), mutants, nil)
-	})
+	// Point stderr at a file for the call: the warnings it must not
+	// print would otherwise go straight to os.Stderr.
+	errFile, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out != "" {
+	defer errFile.Close()
+	origStderr := os.Stderr
+	os.Stderr = errFile
+	kept, suppressed, err := FilterByDirectivesSilently(token.NewFileSet(), mutants, nil)
+	os.Stderr = origStderr
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := os.ReadFile(errFile.Name()); len(out) > 0 {
 		t.Errorf("FilterByDirectivesSilently wrote to stderr: %q", out)
 	}
 
@@ -269,30 +272,6 @@ func G(a, b int) int { return a - b } // gomutants:disable ARITHMETIC_BASE
 		t.Errorf("kept=%d suppressed=%d, want kept=%d suppressed=%d (>0)",
 			len(kept), len(suppressed), len(wantKept), len(wantSuppressed))
 	}
-}
-
-// captureStderr redirects os.Stderr through a pipe for the duration of fn
-// and returns whatever was written.
-func captureStderr(t *testing.T, fn func()) string {
-	t.Helper()
-	orig := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stderr = w
-	defer func() { os.Stderr = orig }()
-
-	done := make(chan struct{})
-	var captured strings.Builder
-	go func() {
-		defer close(done)
-		_, _ = io.Copy(&captured, r)
-	}()
-	fn()
-	w.Close()
-	<-done
-	return captured.String()
 }
 
 func TestParseDirectiveRegexpUnknownMutatorHintsWhitespace(t *testing.T) {

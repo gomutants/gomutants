@@ -2472,19 +2472,57 @@ func TestRunRejectsInvalidExcludeCallsDefaults(t *testing.T) {
 	}
 }
 
+// runOneMutant runs gomutants over the testmod module in dir (the working
+// directory), on ARITHMETIC_BASE alone with one worker and no cache,
+// narrowed by --run-mutant-id to id.
+func runOneMutant(dir, id string, extra ...string) error {
+	args := []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", id,
+		"-w", "1", "--cache=off",
+		"-o", filepath.Join(dir, "report.json"),
+	}
+	return run(context.Background(), append(append(args, extra...), "testmod"))
+}
+
+// stubSlowPhases makes coverage and the baseline fail with a marker error,
+// for tests pinning that a diagnosis comes before either one runs.
+func stubSlowPhases(t *testing.T) {
+	t.Helper()
+	origCov, origM := runCoverageFunc, measureBaselineFunc
+	t.Cleanup(func() { runCoverageFunc, measureBaselineFunc = origCov, origM })
+	runCoverageFunc = func(context.Context, string, []string, string, string, string, []string) (string, error) {
+		return "", errors.New("coverage ran: marker_cov")
+	}
+	measureBaselineFunc = func(context.Context, string, []string, string, []string) (time.Duration, error) {
+		return 0, errors.New("baseline ran: marker_base")
+	}
+}
+
+// editDuringBaseline runs the real baseline, then overwrites path with src:
+// an edit saved while the baseline runs. The returned flag reports whether
+// the baseline was reached.
+func editDuringBaseline(t *testing.T, path, src string) *bool {
+	t.Helper()
+	origM := measureBaselineFunc
+	t.Cleanup(func() { measureBaselineFunc = origM })
+	ran := new(bool)
+	measureBaselineFunc = func(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
+		*ran = true
+		d, err := origM(ctx, projectDir, packages, tags, testFlags)
+		if werr := os.WriteFile(path, []byte(src), 0o644); werr != nil {
+			t.Fatal(werr)
+		}
+		return d, err
+	}
+	return ran
+}
+
 func TestRunUnknownMutantIDIsUsageError(t *testing.T) {
 	dir := setupTinyProject(t)
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
 
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "no/such/file.go:Nope:ARITHMETIC_BASE#1",
-		"-w", "1",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	err := runOneMutant(dir, "no/such/file.go:Nope:ARITHMETIC_BASE#1")
 	// Exit 2, not 1: naming a mutant that doesn't exist is a bad
 	// invocation, in the same class as an unknown flag.
 	requireExitCode(t, err, exitCodeUsageError)
@@ -2501,17 +2539,9 @@ func TestRunUnknownMutantIDIsUsageError(t *testing.T) {
 // early check parses it, but nothing in it carries the id.
 func TestRunUnknownMutantIDInKnownFileIsUsageError(t *testing.T) {
 	dir := setupTinyProject(t)
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
 
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "add.go:Nope:ARITHMETIC_BASE#1",
-		"-w", "1",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	err := runOneMutant(dir, "add.go:Nope:ARITHMETIC_BASE#1")
 	requireExitCode(t, err, exitCodeUsageError)
 	want := `no mutant matches --run-mutant-id "add.go:Nope:ARITHMETIC_BASE#1" among the 1 discovered`
 	if !strings.HasPrefix(err.Error(), want) {
@@ -2546,28 +2576,10 @@ func TestRunAmbiguousMutantIDIsUsageError(t *testing.T) {
 // instead of the usage error.
 func TestRunMutantIDResolvesBeforeCoverage(t *testing.T) {
 	dir := setupTinyProject(t)
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
+	stubSlowPhases(t)
 
-	origCov := runCoverageFunc
-	defer func() { runCoverageFunc = origCov }()
-	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ []string) (string, error) {
-		return "", errors.New("coverage ran: marker_cov")
-	}
-	origM := measureBaselineFunc
-	defer func() { measureBaselineFunc = origM }()
-	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string, _ []string) (time.Duration, error) {
-		return 0, errors.New("baseline ran: marker_base")
-	}
-
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "no/such/file.go:Nope:ARITHMETIC_BASE#1",
-		"-w", "1",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	err := runOneMutant(dir, "add.go:Nope:ARITHMETIC_BASE#1")
 	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "no mutant matches") {
 		t.Errorf("an unknown id must be diagnosed before the coverage and baseline runs, got: %v", err)
@@ -2580,31 +2592,13 @@ func TestRunMutantIDResolvesBeforeCoverage(t *testing.T) {
 // into a package whose other files and TCE reference build come from disk.
 func TestRunMutantIDResolvesAgainAfterBaseline(t *testing.T) {
 	dir := setupTinyProject(t)
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
+	// Drop the only arithmetic, so the id no longer names anything.
+	baselineRan := editDuringBaseline(t, filepath.Join(dir, "add.go"),
+		"package testmod\n\nfunc Add(a, b int) int {\n\treturn a\n}\n")
 
-	origM := measureBaselineFunc
-	defer func() { measureBaselineFunc = origM }()
-	baselineRan := false
-	measureBaselineFunc = func(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
-		baselineRan = true
-		d, err := origM(ctx, projectDir, packages, tags, testFlags)
-		// Drop the only arithmetic, so the id no longer names anything.
-		if werr := os.WriteFile(filepath.Join(dir, "add.go"), []byte("package testmod\n\nfunc Add(a, b int) int {\n\treturn a\n}\n"), 0o644); werr != nil {
-			t.Fatal(werr)
-		}
-		return d, err
-	}
-
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE",
-		"-w", "1", "--cache=off",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
-	if !baselineRan {
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE")
+	if !*baselineRan {
 		t.Fatalf("the id must resolve before the edit, so the run reaches the baseline; got: %v", err)
 	}
 	requireExitCode(t, err, exitCodeUsageError)
@@ -2619,27 +2613,11 @@ func TestRunMutantIDResolvesAgainAfterBaseline(t *testing.T) {
 // the newcomer; the run must refuse rather than measure it.
 func TestRunMutantIDRetargetedDuringBaselineIsError(t *testing.T) {
 	dir := setupTinyProject(t)
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
+	editDuringBaseline(t, filepath.Join(dir, "add.go"),
+		"package testmod\n\nfunc Add(a, b int) int {\n\tb = b + 0\n\treturn a + b\n}\n")
 
-	origM := measureBaselineFunc
-	defer func() { measureBaselineFunc = origM }()
-	measureBaselineFunc = func(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
-		d, err := origM(ctx, projectDir, packages, tags, testFlags)
-		if werr := os.WriteFile(filepath.Join(dir, "add.go"), []byte("package testmod\n\nfunc Add(a, b int) int {\n\tb = b + 0\n\treturn a + b\n}\n"), 0o644); werr != nil {
-			t.Fatal(werr)
-		}
-		return d, err
-	}
-
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
-		"-w", "1", "--cache=off",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1")
 	requireExitCode(t, err, exitCodeUsageError)
 	want := `--run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" named add.go:Add:ARITHMETIC_BASE#1 at add.go:4:11 before the baseline but add.go:Add:ARITHMETIC_BASE#1 at add.go:4:8 after it; the source changed during the run, run again`
 	if err.Error() != want {
@@ -2806,44 +2784,6 @@ func writeModuleWithFiles(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-// TestRunMutantIDSuppressedFailsBeforeCoverage pins where a suppressed
-// target is diagnosed: directives need only the source, so the early check
-// reports it before coverage or the baseline is paid for.
-func TestRunMutantIDSuppressedFailsBeforeCoverage(t *testing.T) {
-	dir := writeModuleWithFiles(t, map[string]string{
-		"add.go": "package testmod\n\nfunc Add(a, b int) int {\n" +
-			"\treturn a + b // gomutants:disable ARITHMETIC_BASE reason=\"checked elsewhere\"\n}\n",
-		"add_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
-	})
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
-
-	origCov := runCoverageFunc
-	defer func() { runCoverageFunc = origCov }()
-	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ []string) (string, error) {
-		return "", errors.New("coverage ran: marker_cov")
-	}
-	origM := measureBaselineFunc
-	defer func() { measureBaselineFunc = origM }()
-	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string, _ []string) (time.Duration, error) {
-		return 0, errors.New("baseline ran: marker_base")
-	}
-
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
-		"-w", "1", "--cache=off",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
-	requireExitCode(t, err, exitCodeUsageError)
-	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is suppressed at add.go:4 (checked elsewhere)`
-	if err.Error() != want {
-		t.Errorf("error = %q, want %q", err.Error(), want)
-	}
-}
-
 // TestRunMutantIDOutsideChangedSinceFailsBeforeCoverage: a target on no
 // changed line is as untestable as a suppressed one, and git can say so
 // without coverage.
@@ -2863,24 +2803,10 @@ func TestRunMutantIDOutsideChangedSinceFailsBeforeCoverage(t *testing.T) {
 			t.Fatalf("git %v: %v\n%s", args, err, out)
 		}
 	}
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
+	stubSlowPhases(t)
 
-	origCov := runCoverageFunc
-	defer func() { runCoverageFunc = origCov }()
-	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ []string) (string, error) {
-		return "", errors.New("coverage ran: marker_cov")
-	}
-
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
-		"--changed-since", "HEAD",
-		"-w", "1", "--cache=off",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1", "--changed-since", "HEAD")
 	requireExitCode(t, err, exitCodeUsageError)
 	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is not on any line changed since "HEAD"`
 	if err.Error() != want {
@@ -2894,28 +2820,11 @@ func TestRunMutantIDOutsideChangedSinceFailsBeforeCoverage(t *testing.T) {
 // and exit 0.
 func TestRunMutantIDSuppressedDuringBaselineIsUsageError(t *testing.T) {
 	dir := setupTinyProject(t)
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
+	editDuringBaseline(t, filepath.Join(dir, "add.go"),
+		"package testmod\n\nfunc Add(a, b int) int {\n\treturn a + b // gomutants:disable reason=\"later\"\n}\n")
 
-	origM := measureBaselineFunc
-	defer func() { measureBaselineFunc = origM }()
-	measureBaselineFunc = func(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
-		d, err := origM(ctx, projectDir, packages, tags, testFlags)
-		src := "package testmod\n\nfunc Add(a, b int) int {\n\treturn a + b // gomutants:disable reason=\"later\"\n}\n"
-		if werr := os.WriteFile(filepath.Join(dir, "add.go"), []byte(src), 0o644); werr != nil {
-			t.Fatal(werr)
-		}
-		return d, err
-	}
-
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
-		"-w", "1", "--cache=off",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1")
 	requireExitCode(t, err, exitCodeUsageError)
 	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is suppressed at add.go:4 (later)`
 	if err.Error() != want {
@@ -2929,19 +2838,14 @@ func TestRunMutantIDSuppressedIsUsageError(t *testing.T) {
 			"\treturn a + b // gomutants:disable ARITHMETIC_BASE reason=\"checked elsewhere\"\n}\n",
 		"add_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
 	})
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
-
+	t.Chdir(dir)
 	// The id resolves — the directive filter runs after FilterByStableID —
-	// so without the guard this run would test nothing and exit 0.
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
-		"-w", "1", "--cache=off",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	// so without the guard this run would test nothing and exit 0. The
+	// directive needs only the source, so the early check reports it
+	// before coverage or the baseline is paid for.
+	stubSlowPhases(t)
+
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1")
 	requireExitCode(t, err, exitCodeUsageError)
 	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is suppressed at add.go:4 (checked elsewhere)`
 	if err.Error() != want {
