@@ -266,54 +266,9 @@ func run(ctx context.Context, args []string) error {
 		return writeMutatorCatalog(stdout, mutator.NewRegistry().Catalog())
 	}
 
-	cfg, err := config.Load(opts.configPath)
+	cfg, filters, err := loadConfig(opts)
 	if err != nil {
-		return usageError(err)
-	}
-	cfg.ApplyFlags(opts.flags)
-	cfg.ResolveCache()
-
-	// Integration mode computes -coverpkg from the target packages so that
-	// tests in importing packages record coverage on the mutated code. An
-	// explicit --coverpkg would conflict with that computed value, so refuse
-	// rather than silently pick one.
-	if cfg.Integration && cfg.CoverPkg != "" {
-		return usageErrorf("--integration manages -coverpkg automatically; do not also pass --coverpkg")
-	}
-
-	// --run-mutant-id exists to answer "did the test I just wrote kill this
-	// mutant?" from an exit code, and --dry-run returns before anything is
-	// compiled or tested. The pair would print the mutant and exit 0 — which
-	// a script reads as a kill. Checked after ApplyFlags because dry-run is
-	// also a config-file key: a committed `dry-run: true` is invisible to the
-	// caller and cannot be turned back off from the command line.
-	if cfg.RunMutantID != "" && cfg.DryRun {
-		return usageErrorf("--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report")
-	}
-
-	// Checked after ApplyFlags so a value from .gomutants.yml is screened
-	// too, not just the CLI one.
-	if err := checkTestFlags(cfg.TestFlagFields()); err != nil {
-		return usageError(err)
-	}
-
-	// Compile user-supplied patterns before any project or Go-tool work.
-	// These are configuration errors even when the selected target also
-	// happens to be unbuildable, so configuration must win that race.
-	excluder, err := discover.NewExcluder(cfg.ExcludeFiles)
-	if err != nil {
-		return usageErrorf("--exclude-files: %w", err)
-	}
-	callExcluder, err := discover.NewCallExcluder(cfg.ResolvedExcludeCalls())
-	if err != nil {
-		return usageErrorf("--exclude-calls: %w", err)
-	}
-
-	// Periodic checkpointing rides on the cache file; with --cache=off
-	// there is nothing to flush. Warn rather than silently ignore so a
-	// user who set --checkpoint-interval isn't misled about durability.
-	if cfg.Cache == "" && opts.flags.CheckpointInterval.Set {
-		fmt.Fprintln(stderr, "gomutants: --checkpoint-interval ignored: --cache is off")
+		return err
 	}
 
 	packages := opts.packages
@@ -383,7 +338,7 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	pkgs, excludedFiles := discover.ApplyExcludes(pkgs, excluder, projectDir)
+	pkgs, excludedFiles := discover.ApplyExcludes(pkgs, filters.excluder, projectDir)
 	if hasher != nil {
 		// Feed the cache's pkg_hash the //go:embed inputs go list resolved
 		// for these packages. Mutants only ever live in the packages
@@ -558,7 +513,7 @@ func run(ctx context.Context, args []string) error {
 	}
 	// Directives run first so that where both could apply, the reason
 	// surfaced under --verbose is the one a human wrote at the site.
-	mutants, callSuppressed := discover.FilterByCalls(fset, mutants, discovered.Files, callExcluder)
+	mutants, callSuppressed := discover.FilterByCalls(fset, mutants, discovered.Files, filters.callExcluder)
 	suppressed = append(suppressed, callSuppressed...)
 	if cfg.Verbose {
 		for _, s := range suppressed {

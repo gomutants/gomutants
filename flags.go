@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/szhekpisov/gomutants/internal/config"
+	"github.com/szhekpisov/gomutants/internal/discover"
 )
 
 // cliOptions is the parsed command line. flags is merged over the config
@@ -232,4 +233,68 @@ func parseFlags(args []string) (*cliOptions, error) {
 		showVersion:       showVersion,
 		listMutators:      listMutators,
 	}, nil
+}
+
+// runFilters are the user-supplied exclusion patterns, compiled once the
+// config file and the flags have been merged.
+type runFilters struct {
+	excluder     *discover.Excluder
+	callExcluder *discover.CallExcluder
+}
+
+// loadConfig merges the config file under the parsed flags and rejects
+// combinations that are only invalid once both sources are known. Every
+// failure here is a usage error: nothing has touched the project yet.
+func loadConfig(opts *cliOptions) (config.Config, runFilters, error) {
+	cfg, err := config.Load(opts.configPath)
+	if err != nil {
+		return cfg, runFilters{}, usageError(err)
+	}
+	cfg.ApplyFlags(opts.flags)
+	cfg.ResolveCache()
+
+	// Integration mode computes -coverpkg from the target packages so that
+	// tests in importing packages record coverage on the mutated code. An
+	// explicit --coverpkg would conflict with that computed value, so refuse
+	// rather than silently pick one.
+	if cfg.Integration && cfg.CoverPkg != "" {
+		return cfg, runFilters{}, usageErrorf("--integration manages -coverpkg automatically; do not also pass --coverpkg")
+	}
+
+	// --run-mutant-id exists to answer "did the test I just wrote kill this
+	// mutant?" from an exit code, and --dry-run returns before anything is
+	// compiled or tested. The pair would print the mutant and exit 0 — which
+	// a script reads as a kill. Checked after ApplyFlags because dry-run is
+	// also a config-file key: a committed `dry-run: true` is invisible to the
+	// caller and cannot be turned back off from the command line.
+	if cfg.RunMutantID != "" && cfg.DryRun {
+		return cfg, runFilters{}, usageErrorf("--run-mutant-id cannot be used with --dry-run: a dry run tests nothing, so there is no verdict to report")
+	}
+
+	// Checked after ApplyFlags so a value from .gomutants.yml is screened
+	// too, not just the CLI one.
+	if err := checkTestFlags(cfg.TestFlagFields()); err != nil {
+		return cfg, runFilters{}, usageError(err)
+	}
+
+	// Compile user-supplied patterns before any project or Go-tool work.
+	// These are configuration errors even when the selected target also
+	// happens to be unbuildable, so configuration must win that race.
+	excluder, err := discover.NewExcluder(cfg.ExcludeFiles)
+	if err != nil {
+		return cfg, runFilters{}, usageErrorf("--exclude-files: %w", err)
+	}
+	callExcluder, err := discover.NewCallExcluder(cfg.ResolvedExcludeCalls())
+	if err != nil {
+		return cfg, runFilters{}, usageErrorf("--exclude-calls: %w", err)
+	}
+
+	// Periodic checkpointing rides on the cache file; with --cache=off
+	// there is nothing to flush. Warn rather than silently ignore so a
+	// user who set --checkpoint-interval isn't misled about durability.
+	if cfg.Cache == "" && opts.flags.CheckpointInterval.Set {
+		fmt.Fprintln(stderr, "gomutants: --checkpoint-interval ignored: --cache is off")
+	}
+
+	return cfg, runFilters{excluder: excluder, callExcluder: callExcluder}, nil
 }
