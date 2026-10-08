@@ -444,13 +444,14 @@ func lineGroups(set map[testKey]bool) []testGroup {
 // line in lines (every line when lines is nil), sorted. A group of one
 // test already passed alone when the map was built (see processWork).
 func (tm *TestMap) testGroups(lines map[string]bool) []testGroup {
+	keys := maps.Keys(tm.index)
+	if lines != nil {
+		keys = maps.Keys(lines)
+	}
 	seen := map[string]bool{}
 	var groups []testGroup
-	for key, set := range tm.index {
-		if lines != nil && !lines[key] {
-			continue
-		}
-		for _, g := range lineGroups(set) {
+	for key := range keys {
+		for _, g := range lineGroups(tm.index[key]) {
 			if len(g.tests) > 1 && !seen[g.key()] {
 				seen[g.key()] = true
 				groups = append(groups, g)

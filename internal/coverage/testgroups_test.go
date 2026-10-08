@@ -6,7 +6,6 @@ import (
 	"maps"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -114,23 +113,23 @@ func TestCheckGroups(t *testing.T) {
 	orig := groupPassesFunc
 	t.Cleanup(func() { groupPassesFunc = orig })
 	var (
-		mu       sync.Mutex
-		ran      []string
-		inFlight atomic.Int32
-		peak     atomic.Int32
+		mu             sync.Mutex
+		ran            []string
+		inFlight, peak int
 	)
 	groupPassesFunc = func(_ context.Context, cp *compiledPkg, tests []string, timeout time.Duration) bool {
-		n := inFlight.Add(1)
-		defer inFlight.Add(-1)
-		for p := peak.Load(); n > p && !peak.CompareAndSwap(p, n); p = peak.Load() {
-		}
+		mu.Lock()
+		inFlight++
+		peak = max(peak, inFlight)
+		mu.Unlock()
 		time.Sleep(20 * time.Millisecond)
 		if timeout != 7*time.Second {
 			t.Errorf("timeout = %s, want 7s", timeout)
 		}
 		mu.Lock()
+		defer mu.Unlock()
+		inFlight--
 		ran = append(ran, testGroup{pkg: cp.importPath, tests: tests}.String())
-		mu.Unlock()
 		return !slices.Contains(tests, "TestBad")
 	}
 	bins := map[string]*compiledPkg{"p": {importPath: "p"}, "q": {importPath: "q"}}
@@ -149,8 +148,8 @@ func TestCheckGroups(t *testing.T) {
 	if want := []string{"p: TestA, TestB", "p: TestA, TestBad", "q: TestBad, TestX", "q: TestX, TestY"}; !slices.Equal(ran, want) {
 		t.Errorf("ran %q, want each group once against its package: %q", ran, want)
 	}
-	if p := peak.Load(); p != 2 {
-		t.Errorf("%d groups ran at once, want 2 workers' worth", p)
+	if peak != 2 {
+		t.Errorf("%d groups ran at once, want 2 workers' worth", peak)
 	}
 }
 
