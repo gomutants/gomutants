@@ -440,46 +440,53 @@ func (mr *mutationRun) applyCache() {
 	// loadedCache + hasher were created at module-read time so the
 	// coverage phase could already consult them — here we just build
 	// the test-files resolver and run the lookup.
-	if mr.loadedCache != nil {
-		// TestIndex is built from the reverse-dependency closure's directories
-		// (rDirs; equal to the target dirs when integration mode is off) so
-		// cross-package coverage — tests in an importing package exercising a
-		// mutated target via -coverpkg — resolves to the right test files.
-		// The map's suites join them: each can decide a survivor's verdict
-		// (see testFilesResolver), and one need not be in rDirs — a package
-		// --exclude-files emptied is gone from pkgs, but its tests still
-		// run under --coverpkg, and a file the index lacks is in no key.
-		testIndex := cache.BuildTestIndex(slices.Concat(mr.rDirs, suiteDirs(mr.testMap)))
+	if mr.loadedCache == nil {
+		return
+	}
+	// TestIndex is built from the reverse-dependency closure's directories
+	// (rDirs; equal to the target dirs when integration mode is off) so
+	// cross-package coverage — tests in an importing package exercising a
+	// mutated target via -coverpkg — resolves to the right test files.
+	// The map's suites join them: each can decide a survivor's verdict
+	// (see testFilesResolver), and one need not be in rDirs — a package
+	// --exclude-files emptied is gone from pkgs, but its tests still
+	// run under --coverpkg, and a file the index lacks is in no key.
+	testIndex := cache.BuildTestIndex(slices.Concat(mr.rDirs, suiteDirs(mr.testMap)))
 
-		crossPkg := mr.cfg.Integration || mr.cfg.CoverPkg != ""
-		mr.testFilesFor = testFilesResolver(testIndex, mr.testMap, crossPkg)
+	crossPkg := mr.cfg.Integration || mr.cfg.CoverPkg != ""
+	mr.testFilesFor = testFilesResolver(testIndex, mr.testMap, crossPkg)
 
-		// --run-mutant-id skips the lookup, not the resolver above: the
-		// point of naming one mutant is to measure it again after editing
-		// a test, and a cache hit would replay the previous verdict
-		// instead of running anything. testFilesFor is still needed by
-		// checkpoint's loadedCache.Update, so the fresh verdict lands in
-		// the cache file as usual.
-		hits := 0
-		if mr.cfg.RunMutantID == "" {
-			hits = mr.loadedCache.Lookup(mr.mutants, mr.hasher, mr.testFilesFor)
-		}
-		if hits > 0 {
-			mr.pendingCount -= hits
-			// When equivalence detection is off this run, a cached EQUIVALENT
-			// must not surface — report the survivor honestly as LIVED. The
-			// reuse already validated prod+tests hashes (EQUIVALENT needs a
-			// tests hash), so a LIVED reading is sound.
-			if !mr.cfg.DetectEquivalentEnabled() {
-				for i := range mr.mutants {
-					if mr.mutants[i].Status == mutator.StatusEquivalent {
-						mr.mutants[i].Status = mutator.StatusLived
-					}
-				}
-			}
-			if !mr.cfg.Quiet {
-				fmt.Fprintf(stdout, "Cache: %d mutant outcomes reused from %s\n", hits, mr.cfg.Cache)
-			}
+	// --run-mutant-id skips the lookup, not the resolver above: the
+	// point of naming one mutant is to measure it again after editing
+	// a test, and a cache hit would replay the previous verdict
+	// instead of running anything. testFilesFor is still needed by
+	// checkpoint's loadedCache.Update, so the fresh verdict lands in
+	// the cache file as usual.
+	if mr.cfg.RunMutantID != "" {
+		return
+	}
+	hits := mr.loadedCache.Lookup(mr.mutants, mr.hasher, mr.testFilesFor)
+	if hits == 0 {
+		return
+	}
+	mr.pendingCount -= hits
+	// When equivalence detection is off this run, a cached EQUIVALENT
+	// must not surface — report the survivor honestly as LIVED. The
+	// reuse already validated prod+tests hashes (EQUIVALENT needs a
+	// tests hash), so a LIVED reading is sound.
+	if !mr.cfg.DetectEquivalentEnabled() {
+		demoteEquivalents(mr.mutants)
+	}
+	if !mr.cfg.Quiet {
+		fmt.Fprintf(stdout, "Cache: %d mutant outcomes reused from %s\n", hits, mr.cfg.Cache)
+	}
+}
+
+// demoteEquivalents reports every EQUIVALENT mutant as LIVED.
+func demoteEquivalents(mutants []mutator.Mutant) {
+	for i := range mutants {
+		if mutants[i].Status == mutator.StatusEquivalent {
+			mutants[i].Status = mutator.StatusLived
 		}
 	}
 }
