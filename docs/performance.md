@@ -768,8 +768,10 @@ gomutants --changed-since main --test-flags '-short' ./...
 ```
 
 The flags reach the per-mutant runs, the coverage run, the baseline run,
-and the per-test coverage map — never `go list`, which is what makes this
-safe where `GOFLAGS=-short` is not. The trade is explicit: fewer checks means
+and the per-test coverage map — never package resolution, which is what
+makes this safe where `GOFLAGS=-short` is not. (Their build flags, such as
+`-tags` or `-race`, also reach the map's `go list -test`, which reads what
+each test binary links, so it sees the test files the runs compile.) The trade is explicit: fewer checks means
 fewer chances to catch a mutant, so this belongs on a fast pre-push gate,
 not on the run whose score you publish. Because the flags are part of the
 cache identity, the two runs keep separate cache generations and neither

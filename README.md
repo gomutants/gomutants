@@ -742,12 +742,14 @@ gomutants --changed-since main --test-flags '-short' ./...
 Four things to know:
 
 - **`go test` only.** The flags reach the per-mutant runs, the coverage run,
-  the baseline run, and the per-test coverage map — never `go list`. The
-  map compiles each test binary once with `go test -c` and runs it
-  directly, so gomutants splits your flags as `go test` would: build flags
-  such as `-race` or `-tags` go to the compile, the rest to the binary.
-  This is why
-  `GOFLAGS` is not a workaround. Go applies a GOFLAGS entry only "when the
+  the baseline run, and the per-test coverage map — never package
+  resolution. The one `go list` they reach is the map's `go list -test`
+  under `--integration` or `--coverpkg`, which reads what each test binary
+  links, and only their build flags reach it, so it sees the test files the
+  runs compile. The map compiles each test binary once with `go test -c`
+  and runs it directly, so gomutants splits your flags as `go test` would:
+  build flags such as `-race` or `-tags` go to the compile, the rest to
+  the binary. This is why `GOFLAGS` is not a workaround. Go applies a GOFLAGS entry only "when the
   given flag is known by the current command" (`go help environment`), so
   you cannot say which invocations a flag reaches: `-short` is silently
   ignored by `go list` and `go test -c`, while `-race` is honored by them.

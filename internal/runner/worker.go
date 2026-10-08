@@ -724,20 +724,23 @@ func (w *Worker) routeGroups(m mutator.Mutant) map[string][]string {
 }
 
 // recheckGroups returns the packages to run in full for m once the run of
-// `routed` (see routeGroups) has passed: m's own package and every
-// package whose suite can kill it (see coverage.TestMap.SuitePkgs), less
-// those `routed` already ran in full. Empty means the routed run already
-// was the full verdict.
+// `routed` (see routeGroups) has passed: every package whose suite can
+// kill it (see coverage.TestMap.SuitePkgs) and every package `routed` ran
+// only some tests of, less those `routed` already ran in full. Empty means
+// the routed run already was the full verdict. m's own package is among
+// them only when it has tests: a package tested only by its importers
+// would cost a build and link for "no test files".
 func (w *Worker) recheckGroups(m mutator.Mutant, routed map[string][]string) map[string][]string {
 	full := map[string][]string{}
-	add := func(pkg string) {
-		if tests, ran := routed[pkg]; !ran || tests != nil {
+	for pkg, tests := range routed {
+		if tests != nil {
 			full[pkg] = nil
 		}
 	}
-	add(m.Pkg)
 	for _, p := range w.testMap.SuitePkgs(m.Pkg) {
-		add(p.ImportPath)
+		if tests, ran := routed[p.ImportPath]; !ran || tests != nil {
+			full[p.ImportPath] = nil
+		}
 	}
 	return full
 }

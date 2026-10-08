@@ -322,10 +322,10 @@ func (tm *TestMap) ingestResult(tc testCoverage) {
 	tm.recordDuration(tc.pkg, tc.testName, tc.duration)
 }
 
-// recordDuration stores a single (pkg, test) timing and updates the
-// rolling per-package sum. Extracted so a duplicate observation (e.g.
-// future retry logic re-running a test) accumulates rather than
-// overwrites — matching the per-package sum's accumulation behavior.
+// recordDuration stores a single (pkg, test) timing. A duplicate
+// observation (e.g. future retry logic re-running a test) accumulates
+// rather than overwrites, so a timing never undercounts the runs it
+// describes.
 func (tm *TestMap) recordDuration(pkg, name string, d time.Duration) {
 	if d <= 0 {
 		return

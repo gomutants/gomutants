@@ -146,36 +146,45 @@ func TestRecheckInvocations(t *testing.T) {
 	cases := []struct {
 		name     string
 		tm       *coverage.TestMap
+		pkg      string
 		wantPkgs []string
 	}{
-		{"no map: the routed run was the whole package", nil, nil},
-		{"own package routed to a subset", routeMap("f.go:1", coverage.TestRef{Pkg: calc, Name: "TestA"}), []string{calc}},
+		{"no map: the routed run was the whole package", nil, calc, nil},
+		{"own package routed to a subset", routeMap("f.go:1", coverage.TestRef{Pkg: calc, Name: "TestA"}), calc, []string{calc}},
 		{
 			"own package routed to a subset, suites in scope",
 			routeMap("f.go:1", coverage.TestRef{Pkg: calc, Name: "TestA"}).WithSuitesForTesting(false, nil, suites...),
-			[]string{calc},
+			calc, []string{calc},
 		},
-		{"no covering tests: the whole own package already ran", routeMap("other.go:9", coverage.TestRef{Pkg: calc, Name: "TestA"}), nil},
+		{"no covering tests: the whole own package already ran", routeMap("other.go:9", coverage.TestRef{Pkg: calc, Name: "TestA"}), calc, nil},
 		{
 			"cross-package, no covering tests: the linking importers",
 			cross(routeMap("other.go:9", coverage.TestRef{Pkg: calc, Name: "TestA"})),
-			[]string{app},
+			calc, []string{app},
 		},
 		{
 			"cross-package, routed to an importer: own package and the importer in full",
 			cross(routeMap("f.go:1", coverage.TestRef{Pkg: app, Name: "TestApp"})),
-			[]string{calc, app},
+			calc, []string{calc, app},
 		},
 		{
 			"cross-package, links unknown: every suite",
 			routeMap("f.go:1", coverage.TestRef{Pkg: calc, Name: "TestA"}).WithSuitesForTesting(true, nil, suites...),
-			[]string{calc, app, lib},
+			calc, []string{calc, app, lib},
+		},
+		{
+			// m/types has no tests, so it isn't among the suites: running
+			// it would build and link for "no test files".
+			"cross-package, own package without tests: only the importer",
+			routeMap("f.go:1", coverage.TestRef{Pkg: app, Name: "TestApp"}).WithSuitesForTesting(true,
+				map[string]map[string]bool{calc: {}, app: {"m/types": true}, lib: {}}, suites...),
+			"m/types", []string{app},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &Worker{testMap: tc.tm}
-			invs := w.recheckInvocations(mutator.Mutant{Pkg: calc, CoverageFile: "f.go", Line: 1})
+			invs := w.recheckInvocations(mutator.Mutant{Pkg: tc.pkg, CoverageFile: "f.go", Line: 1})
 			if len(invs) != len(tc.wantPkgs) {
 				t.Fatalf("got %d invocations, want %d: %v", len(invs), len(tc.wantPkgs), invs)
 			}

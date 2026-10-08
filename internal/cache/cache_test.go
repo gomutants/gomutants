@@ -902,6 +902,30 @@ func TestUpdate_StatusFiltering(t *testing.T) {
 	}
 }
 
+// TestUpdateLookup_RoundTripsRechecked: whether a mutant was re-checked
+// survives the cache, so a hit counts in the report's re-check totals as
+// the run that tested it did, rather than those totals shrinking with the
+// hit rate.
+func TestUpdateLookup_RoundTripsRechecked(t *testing.T) {
+	root := t.TempDir()
+	prodPath := filepath.Join(root, "x.go")
+	mustWrite(t, prodPath, "package x\n")
+	mustWrite(t, filepath.Join(root, "x_test.go"), "package x\n")
+
+	rechecked := mkMutant(prodPath, 1, mutator.StatusLived)
+	rechecked.Rechecked = true
+	c := &Cache{SchemaVersion: SchemaVersion, GoModule: testModule, ToolVersion: testVersion}
+	c.Update([]mutator.Mutant{rechecked, mkMutant(prodPath, 2, mutator.StatusKilled)}, NewHasher(nil), root, pkgDirTestFilesFor)
+
+	mutants := []mutator.Mutant{mkMutant(prodPath, 1, mutator.StatusPending), mkMutant(prodPath, 2, mutator.StatusPending)}
+	if hits := c.Lookup(mutants, NewHasher(nil), pkgDirTestFilesFor); hits != 2 {
+		t.Fatalf("Lookup hits = %d, want 2", hits)
+	}
+	if !mutants[0].Rechecked || mutants[1].Rechecked {
+		t.Errorf("Rechecked = %v, %v after the round trip, want true, false", mutants[0].Rechecked, mutants[1].Rechecked)
+	}
+}
+
 // TestUpdate_TestsHashStampedWhenGated asserts that Update writes
 // tests_hash for exactly the statuses whose reuse is gated on it
 // (KILLED/LIVED/TIMED_OUT) and leaves it empty for NOT_VIABLE (which
