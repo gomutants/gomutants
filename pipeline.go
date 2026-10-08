@@ -20,7 +20,8 @@ import (
 )
 
 // mutationRun is the state one gomutants invocation carries from phase to
-// phase: each field is set by one phase of run() and read by later ones.
+// phase. run() calls the phase methods in a fixed order; each method reads
+// what earlier phases set and may set or narrow fields for later ones.
 type mutationRun struct {
 	cfg     config.Config
 	opts    *cliOptions
@@ -42,10 +43,16 @@ type mutationRun struct {
 	// toolchain dimension. Computed once, only when caching is on.
 	goToolchain string
 
-	pkgs       []discover.Package
+	pkgs []discover.Package
+	// fset and discovered (which holds every parsed AST) are discovery
+	// scratch: discoverMutants clears them once its filters have run, so
+	// they don't stay reachable for the whole mutation run.
 	fset       *token.FileSet
 	discovered *discover.Result
-	mutants    []mutator.Mutant
+	// mutants is narrowed to the --run-mutant-id match by resolvePackages,
+	// or set to every discovered mutant by discoverMutants, which then
+	// filters it; pool.Run records verdicts on it in place.
+	mutants []mutator.Mutant
 	// suppressed holds every mutant a directive or --exclude-calls
 	// removed; callSuppressed is the --exclude-calls share of it.
 	suppressed     []discover.Suppression
@@ -59,8 +66,10 @@ type mutationRun struct {
 	coverPkgEff      string
 	rDirs            []string
 
-	tmpDir       string
-	coverStart   time.Time
+	tmpDir     string
+	coverStart time.Time
+	// profile is cleared once discoverMutants has filtered by coverage,
+	// profileBytes once runMutants has stamped it into the cache.
 	profile      *coverage.Profile
 	profileBytes []byte
 	coverageKey  string
@@ -100,7 +109,7 @@ func (mr *mutationRun) setup(ctx context.Context) error {
 		mr.loadedCache = cacheLoadFunc(mr.cfg.Cache, mr.goModule, cacheToolVersion(), mr.cfg.Tags, mr.cfg.CanonicalTestFlags(), mr.goToolchain)
 		// Hasher is created before discovery's PreReadFiles so the
 		// coverage-key calc can use it. SetSrcCache is called once
-		// the in-memory source map exists (after step 6), so
+		// the in-memory source map exists (in preReadSources), so
 		// per-mutant Lookup's prodHash calls reuse already-loaded bytes.
 		mr.hasher = cache.NewHasher(nil)
 	}
@@ -157,12 +166,13 @@ func (mr *mutationRun) resolvePackages(ctx context.Context) error {
 	}
 	mr.term.PhaseDone(resolveMsg)
 
-	// Resolve --run-mutant-id here, not at step 5. Discovery is pure AST
-	// work over the packages just resolved, so an unknown or ambiguous id
-	// costs nothing to diagnose; leaving it at step 5 would charge a full
-	// `go test -cover` plus a baseline run before reporting a typo or a
-	// stale id — on the one flag whose purpose is to avoid paying for the
-	// whole package. The result is carried to step 5 rather than re-parsed.
+	// Resolve --run-mutant-id here, not in discoverMutants. Discovery is
+	// pure AST work over the packages just resolved, so an unknown or
+	// ambiguous id costs nothing to diagnose; leaving it to discoverMutants
+	// would charge a full `go test -cover` plus a baseline run before
+	// reporting a typo or a stale id — on the one flag whose purpose is to
+	// avoid paying for the whole package. discoverMutants reuses the result
+	// rather than re-parsing.
 	mr.fset = token.NewFileSet()
 	if mr.cfg.RunMutantID != "" {
 		mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
@@ -300,8 +310,8 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	var err error
 	// 5. Discover mutants.
 	mr.term.Phase("Discovering mutants...")
-	// discovered is already set when --run-mutant-id resolved it above,
-	// along with the single mutant it narrowed to.
+	// discovered is already set when resolvePackages resolved
+	// --run-mutant-id, along with the single mutant it narrowed to.
 	if mr.discovered == nil {
 		mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
 		mr.mutants = mr.discovered.Mutants
@@ -318,6 +328,7 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 		mr.mutants = discover.FilterByDiff(mr.mutants, ranges, gitRoot)
 	}
 	discover.FilterByCoverage(mr.mutants, mr.profile, mr.pkgs, mr.goModule)
+	mr.profile = nil
 
 	mr.mutants, mr.suppressed, err = discover.FilterByDirectivesWithCache(mr.fset, mr.mutants, mr.discovered.Files)
 	if err != nil {
@@ -327,6 +338,8 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	// surfaced under --verbose is the one a human wrote at the site.
 	mr.mutants, mr.callSuppressed = discover.FilterByCalls(mr.fset, mr.mutants, mr.discovered.Files, mr.filters.callExcluder)
 	mr.suppressed = append(mr.suppressed, mr.callSuppressed...)
+	// The parsed ASTs are needed by no later phase.
+	mr.fset, mr.discovered = nil, nil
 	if mr.cfg.Verbose {
 		for _, s := range mr.suppressed {
 			reason := s.Reason
@@ -509,6 +522,7 @@ func (mr *mutationRun) runMutants(ctx context.Context, term2 *report.Terminal) {
 		mr.loadedCache.CoverageKey = mr.coverageKey
 		mr.loadedCache.CoverageProfile = string(mr.profileBytes)
 	}
+	mr.profileBytes = nil
 
 	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields()}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
@@ -632,9 +646,13 @@ func (mr *mutationRun) checkThresholds(r *report.Report) error {
 	// still exit 0: those statuses drop out of the efficacy denominator,
 	// and a zero denominator skips the gate entirely. Report the non-answer
 	// rather than let a script read it as a kill. mutants holds exactly the
-	// one FilterByStableID returned; anything that empties it has already
-	// returned above.
+	// one FilterByStableID returned (discoverMutants returns a usage error
+	// when a filter empties it); the length check keeps a direct call from
+	// panicking if that ever stops holding.
 	if mr.cfg.RunMutantID != "" {
+		if len(mr.mutants) != 1 {
+			return fmt.Errorf("--run-mutant-id %q produced no verdict: %d mutants to report, want 1", mr.cfg.RunMutantID, len(mr.mutants))
+		}
 		if s := mr.mutants[0].Status; s != mutator.StatusKilled && s != mutator.StatusLived {
 			return fmt.Errorf("--run-mutant-id %q produced no verdict: the mutant is %s", mr.cfg.RunMutantID, s)
 		}
