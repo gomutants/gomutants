@@ -253,10 +253,16 @@ func NewHasher(srcCache map[string][]byte) *Hasher {
 // discover.PreReadFiles) after the hasher was constructed. Used by
 // callers that need a Hasher before pre-read completes (e.g. the
 // coverage-key calc runs before discovery) and want subsequent File()
-// calls to skip the disk read. Already-memoized hashes in h.files are
-// preserved.
+// calls to skip the disk read.
+//
+// Every memoized file and directory hash is dropped. They were read from
+// disk before srcCache was, possibly before an edit srcCache now holds, and
+// a verdict measured on srcCache's bytes must be keyed on those bytes —
+// not on a version of the file that was never tested.
 func (h *Hasher) SetSrcCache(srcCache map[string][]byte) {
 	h.srcCache = srcCache
+	h.files = make(map[string]string)
+	h.dirs = make(map[string]string)
 }
 
 // SetEmbedFiles attaches the //go:embed inputs of each package, keyed by

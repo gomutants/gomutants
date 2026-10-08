@@ -59,6 +59,10 @@ type mutationRun struct {
 	// mutants, so it carries the verdict pool.Run records; nil on every
 	// other run.
 	runTarget *mutator.Mutant
+	// earlyTarget is the mutant checkRunMutantID resolved the id to,
+	// before coverage and the baseline. discoverMutants resolves the id
+	// again and refuses to measure anything else.
+	earlyTarget mutator.Mutant
 	// suppressed holds every mutant a directive or --exclude-calls
 	// removed; callSuppressed is the --exclude-calls share of it.
 	suppressed     []discover.Suppression
@@ -109,9 +113,7 @@ func (mr *mutationRun) setup(ctx context.Context) error {
 	// Load the cache early so the coverage phase can short-circuit on a
 	// matching profile key. The per-mutant Lookup runs later off the same
 	// *Cache; load failures fall through to a nil cache, which the rest
-	// of the pipeline treats as "no cache at all". A single Hasher is
-	// reused across the coverage-key calc and Lookup so per-file sha256s
-	// are memoized only once.
+	// of the pipeline treats as "no cache at all".
 	if mr.cfg.Cache != "" {
 		mr.goToolchain = goVersionFunc(ctx)
 		mr.loadedCache = cacheLoadFunc(mr.cfg.Cache, mr.goModule, cacheToolVersion(), mr.cfg.Tags, mr.cfg.CanonicalTestFlags(), mr.goToolchain)
@@ -194,10 +196,28 @@ func (mr *mutationRun) checkRunMutantID() error {
 		return nil
 	}
 	found := discover.Discover(token.NewFileSet(), mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
-	if _, err := discover.FilterByStableID(found.Mutants, mr.cfg.RunMutantID); err != nil {
+	target, err := discover.FilterByStableID(found.Mutants, mr.cfg.RunMutantID)
+	if err != nil {
 		return usageError(err)
 	}
+	mr.earlyTarget = target[0]
 	return nil
+}
+
+// checkSameRunTarget fails when the id, resolved again after the
+// baseline, names a different mutant than checkRunMutantID found. An edit
+// in between can do that without making the id unknown or ambiguous: a
+// prefix that now matches another mutant, or a new expression above the
+// target that shifts every ordinal after it. Measuring the newcomer would
+// answer a question nobody asked. A target that merely moved fails too —
+// its code is no longer the code the id was looked up for.
+func (mr *mutationRun) checkSameRunTarget(m mutator.Mutant) error {
+	e := mr.earlyTarget
+	if m.StableID == e.StableID && m.Line == e.Line && m.Col == e.Col && m.Original == e.Original {
+		return nil
+	}
+	return fmt.Errorf("--run-mutant-id %q named %s at %s:%d:%d before the baseline but %s at %s:%d:%d after it; the source changed during the run, run again",
+		mr.cfg.RunMutantID, e.StableID, e.RelFile, e.Line, e.Col, m.StableID, m.RelFile, m.Line, m.Col)
 }
 
 // resolveCoverageScope fixes the packages coverage and the baseline run
@@ -357,6 +377,9 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 		if err != nil {
 			return usageError(err)
 		}
+		if err := mr.checkSameRunTarget(mr.mutants[0]); err != nil {
+			return usageError(err)
+		}
 	}
 	if mr.cfg.ChangedSince != "" {
 		gitRoot, err := discover.GitRoot(ctx, mr.projectDir)
@@ -442,9 +465,10 @@ func (mr *mutationRun) preReadSources() error {
 	if mr.hasher != nil {
 		// Hasher was created early (before PreReadFiles) for the
 		// coverage-key calc; attach the in-memory source map now so
-		// per-mutant Lookup's prodHash calls skip disk reads. Files
-		// hashed during the coverage-key phase remain in the hasher's
-		// internal memo, so this only affects newly seen paths.
+		// per-mutant Lookup's prodHash calls skip disk reads. It also
+		// drops what the coverage-key calc memoized: those hashes were
+		// read before coverage and the baseline, and the cache entries
+		// must be keyed on the bytes the mutants are measured on.
 		mr.hasher.SetSrcCache(mr.srcCache)
 	}
 	return nil

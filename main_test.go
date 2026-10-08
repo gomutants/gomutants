@@ -2587,6 +2587,64 @@ func TestRunMutantIDResolvesAgainAfterBaseline(t *testing.T) {
 	}
 }
 
+// TestRunMutantIDRetargetedDuringBaselineIsError: an edit saved during the
+// baseline can leave the id valid but pointing elsewhere. Here a new `+`
+// above the original one takes ordinal #1, so the same full id now names
+// the newcomer; the run must refuse rather than measure it.
+func TestRunMutantIDRetargetedDuringBaselineIsError(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origM := measureBaselineFunc
+	defer func() { measureBaselineFunc = origM }()
+	measureBaselineFunc = func(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
+		d, err := origM(ctx, projectDir, packages, tags, testFlags)
+		if werr := os.WriteFile(filepath.Join(dir, "add.go"), []byte("package testmod\n\nfunc Add(a, b int) int {\n\tb = b + 0\n\treturn a + b\n}\n"), 0o644); werr != nil {
+			t.Fatal(werr)
+		}
+		return d, err
+	}
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
+		"-w", "1", "--cache=off",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	want := `--run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" named add.go:Add:ARITHMETIC_BASE#1 at add.go:4:11 before the baseline but add.go:Add:ARITHMETIC_BASE#1 at add.go:4:8 after it; the source changed during the run, run again`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestCheckSameRunTarget pins every field the comparison reads: each one
+// alone, changed, must fail the check.
+func TestCheckSameRunTarget(t *testing.T) {
+	early := mutator.Mutant{StableID: "a.go:F:ARITHMETIC_BASE#1", RelFile: "a.go", Line: 4, Col: 11, Original: "+"}
+	mr := &mutationRun{earlyTarget: early}
+	if err := mr.checkSameRunTarget(early); err != nil {
+		t.Fatalf("same mutant rejected: %v", err)
+	}
+	for name, edit := range map[string]func(*mutator.Mutant){
+		"stable id": func(m *mutator.Mutant) { m.StableID = "a.go:F:ARITHMETIC_BASE#2" },
+		"line":      func(m *mutator.Mutant) { m.Line = 5 },
+		"col":       func(m *mutator.Mutant) { m.Col = 8 },
+		"original":  func(m *mutator.Mutant) { m.Original = "-" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := early
+			edit(&m)
+			if err := mr.checkSameRunTarget(m); err == nil {
+				t.Errorf("a different %s was accepted as the same target", name)
+			}
+		})
+	}
+}
+
 // TestRunMutantIDRejectsDryRun: --dry-run returns before anything is
 // compiled or tested, so the pair would exit 0 for a mutant that was never
 // measured — which a script reads as a kill.

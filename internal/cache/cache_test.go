@@ -103,6 +103,54 @@ func TestHasher_SetSrcCacheAttachesAfterConstruction(t *testing.T) {
 	}
 }
 
+// TestHasher_SetSrcCacheDropsFileMemo: a hash memoized from disk before
+// the source map was attached (the coverage-key calc) must not outlive it.
+// The run measures the bytes in srcCache, so an edit saved in between has
+// to change the hash its verdict is stored under.
+func TestHasher_SetSrcCacheDropsFileMemo(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.go")
+	mustWrite(t, p, "DISK CONTENT\n")
+
+	h := NewHasher(nil)
+	disk, err := h.File(p)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	h.SetSrcCache(map[string][]byte{p: []byte("MEMORY CONTENT\n")})
+
+	got, err := h.File(p)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if got == disk {
+		t.Fatalf("File returned the hash memoized from disk before SetSrcCache")
+	}
+}
+
+// TestHasher_SetSrcCacheDropsDirMemo: the same for the per-directory
+// pkg_hash memo, which would otherwise pin every sibling file's old hash.
+func TestHasher_SetSrcCacheDropsDirMemo(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.go")
+	mustWrite(t, p, "package x\n")
+
+	h := NewHasher(nil)
+	before, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	h.SetSrcCache(map[string][]byte{p: []byte("package x // edited\n")})
+
+	after, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	if after == before {
+		t.Fatalf("HashPkgFiles returned the directory hash memoized before SetSrcCache")
+	}
+}
+
 func TestHashTestFiles_OrderInvariantAndContentSensitive(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a_test.go")
