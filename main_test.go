@@ -976,11 +976,15 @@ func TestRunQuietSuppressesProgressKeepsSummary(t *testing.T) {
 	defer os.Chdir(orig)
 
 	outPath := filepath.Join(dir, "report.json")
+	htmlPath := filepath.Join(dir, "report.html")
+	strykerPath := filepath.Join(dir, "stryker.json")
 	out, err := captureOutput(t, func() error {
 		return run(context.Background(), []string{
 			"--only", "ARITHMETIC_BASE",
 			"-w", "1",
 			"-o", outPath,
+			"--html-output", htmlPath,
+			"--stryker-output", strykerPath,
 			"--cache=off",
 			"--quiet",
 			"testmod",
@@ -1000,6 +1004,8 @@ func TestRunQuietSuppressesProgressKeepsSummary(t *testing.T) {
 		"Discovering mutants...",
 		"Building per-test coverage map...",
 		"Report:",
+		"Stryker report:",
+		"HTML report:",
 	}
 	for _, s := range mustNotContain {
 		if strings.Contains(out, s) {
@@ -1018,9 +1024,11 @@ func TestRunQuietSuppressesProgressKeepsSummary(t *testing.T) {
 		}
 	}
 
-	// Report file is still written — quiet trims chatter, not artifacts.
-	if _, err := os.Stat(outPath); err != nil {
-		t.Fatalf("report not written under --quiet: %v", err)
+	// Report files are still written — quiet trims chatter, not artifacts.
+	for _, p := range []string{outPath, htmlPath, strykerPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("report not written under --quiet: %v", err)
+		}
 	}
 }
 
@@ -2727,17 +2735,6 @@ func TestRunMutantIDWithoutVerdictIsError(t *testing.T) {
 	want := `--run-mutant-id "add.go:Sub:ARITHMETIC_BASE#1" produced no verdict: the mutant is NOT COVERED`
 	if err.Error() != want {
 		t.Errorf("error = %q, want %q", err.Error(), want)
-	}
-}
-
-// checkThresholds must not index an empty mutants slice: discoverMutants
-// guards against that in run(), but the guard lives in another phase.
-func TestCheckThresholdsRunMutantIDWithoutMutants(t *testing.T) {
-	mr := &mutationRun{cfg: config.Config{RunMutantID: "a#1"}}
-	err := mr.checkThresholds(&report.Report{})
-	want := `--run-mutant-id "a#1" produced no verdict: 0 mutants to report, want 1`
-	if err == nil || err.Error() != want {
-		t.Errorf("error = %v, want %q", err, want)
 	}
 }
 

@@ -55,6 +55,10 @@ type mutationRun struct {
 	// mutants is set by findMutants, narrowed by discoverMutants's filters,
 	// and given its verdicts in place by pool.Run.
 	mutants []mutator.Mutant
+	// runTarget is the one mutant --run-mutant-id names. It points into
+	// mutants, so it carries the verdict pool.Run records; nil on every
+	// other run.
+	runTarget *mutator.Mutant
 	// suppressed holds every mutant a directive or --exclude-calls
 	// removed; callSuppressed is the --exclude-calls share of it.
 	suppressed     []discover.Suppression
@@ -346,7 +350,6 @@ func (mr *mutationRun) measureBaseline(ctx context.Context) error {
 // applies the --changed-since, coverage, directive and --exclude-calls
 // filters to the mutants found.
 func (mr *mutationRun) discoverMutants(ctx context.Context) error {
-	var err error
 	// 5. Discover mutants.
 	mr.term.Phase("Discovering mutants...")
 	if mr.discovered == nil {
@@ -366,6 +369,7 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	discover.FilterByCoverage(mr.mutants, mr.profile, mr.pkgs, mr.goModule)
 	mr.profile = nil
 
+	var err error
 	mr.mutants, mr.suppressed, err = discover.FilterByDirectivesWithCache(mr.fset, mr.mutants, mr.discovered.Files)
 	if err != nil {
 		return fmt.Errorf("applying directives: %w", err)
@@ -388,8 +392,13 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	// what it found. Without this the run would test nothing, print
 	// "0 found" and exit 0 — indistinguishable, to a script reading the
 	// exit code, from the mutant having been killed.
-	if mr.cfg.RunMutantID != "" && len(mr.mutants) == 0 {
-		return usageError(runMutantDroppedError(mr.cfg.RunMutantID, mr.cfg.ChangedSince, mr.suppressed))
+	// Otherwise mutants holds exactly the one FilterByStableID returned:
+	// the filters only drop.
+	if mr.cfg.RunMutantID != "" {
+		if len(mr.mutants) == 0 {
+			return usageError(runMutantDroppedError(mr.cfg.RunMutantID, mr.cfg.ChangedSince, mr.suppressed))
+		}
+		mr.runTarget = &mr.mutants[0]
 	}
 
 	mr.pendingCount = 0
@@ -655,7 +664,9 @@ func (mr *mutationRun) writeReports() (*report.Report, error) {
 		if err := report.WriteHTML(mr.opts.htmlOutput, mr.mutants, mr.projectDir, effectiveVersion()); err != nil {
 			return nil, fmt.Errorf("writing HTML report: %w", err)
 		}
-		fmt.Fprintf(stdout, "HTML report: %s\n", mr.opts.htmlOutput)
+		if !mr.cfg.Quiet {
+			fmt.Fprintf(stdout, "HTML report: %s\n", mr.opts.htmlOutput)
+		}
 	}
 
 	if mr.opts.annotations == "github" {
@@ -690,15 +701,9 @@ func (mr *mutationRun) checkThresholds(r *report.Report) error {
 	// KILLED and LIVED leaves that unanswered, and the gates below would
 	// still exit 0: those statuses drop out of the efficacy denominator,
 	// and a zero denominator skips the gate entirely. Report the non-answer
-	// rather than let a script read it as a kill. mutants holds exactly the
-	// one FilterByStableID returned (discoverMutants returns a usage error
-	// when a filter empties it); the length check keeps a direct call from
-	// panicking if that ever stops holding.
-	if mr.cfg.RunMutantID != "" {
-		if len(mr.mutants) != 1 {
-			return fmt.Errorf("--run-mutant-id %q produced no verdict: %d mutants to report, want 1", mr.cfg.RunMutantID, len(mr.mutants))
-		}
-		if s := mr.mutants[0].Status; s != mutator.StatusKilled && s != mutator.StatusLived {
+	// rather than let a script read it as a kill.
+	if mr.runTarget != nil {
+		if s := mr.runTarget.Status; s != mutator.StatusKilled && s != mutator.StatusLived {
 			return fmt.Errorf("--run-mutant-id %q produced no verdict: the mutant is %s", mr.cfg.RunMutantID, s)
 		}
 	}
