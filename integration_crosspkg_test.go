@@ -134,6 +134,45 @@ func TestIntegrationKillsWithoutRoutes(t *testing.T) {
 	}
 }
 
+// TestIntegrationGroupFailingTogetherLives: under --integration, an
+// importer's covering tests that pass alone but fail together stop being
+// routed to, while the mutant's own package stays routed. app's TestBreak
+// leaves state behind that fails TestUse unless TestReset runs in between;
+// both reach calc.Add and neither checks a result, so nothing can kill its
+// mutant. Routed to the two of them it read KILLED, as they fail with or
+// without it; now calc's test passes it, and so does app's whole suite on
+// the re-check.
+func TestIntegrationGroupFailingTogetherLives(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	dir := writeCrossPkgModule(t)
+	appTest := "package app\n\nimport \"testing\"\n\nvar broken bool\n\n" +
+		"func TestBreak(t *testing.T) { broken = true; _ = Total(1) }\n\n" +
+		"func TestReset(t *testing.T) { broken = false }\n\n" +
+		"func TestUse(t *testing.T) {\n\tif broken {\n\t\tt.Fatal(\"broken\")\n\t}\n\t_ = Total(2)\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "app", "app_test.go"), []byte(appTest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	out := filepath.Join(t.TempDir(), "report.json")
+	if err := run(context.Background(), []string{
+		"-o", out,
+		"--only", "ARITHMETIC_BASE",
+		"--cache=off",
+		"--integration",
+		"./calc/",
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if r := loadReport(t, out); r.MutantsKilled != 0 || r.MutantsLived != 1 || r.MutantsRechecked != 1 {
+		t.Fatalf("killed=%d lived=%d rechecked=%d, want the one mutant LIVED after its re-check",
+			r.MutantsKilled, r.MutantsLived, r.MutantsRechecked)
+	}
+}
+
 // TestIntegrationCoverpkgConflict pins the guard that --integration and
 // --coverpkg cannot be combined: integration mode computes -coverpkg itself.
 func TestIntegrationCoverpkgConflict(t *testing.T) {

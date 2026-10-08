@@ -375,17 +375,29 @@ func TestLoad_SchemaVersionMismatch(t *testing.T) {
 
 // TestLoad_SchemaVersionPinned hardcodes the current on-disk schema number
 // so that bumping or nudging the SchemaVersion constant without intent is
-// caught: a cache written at literal version 8 must load under the current
-// constant. (Pins SchemaVersion == 8; kills off-by-one mutations of it.)
+// caught: a cache written at literal version 9 must load under the current
+// constant. (Pins SchemaVersion == 9; kills off-by-one mutations of it.)
 func TestLoad_SchemaVersionPinned(t *testing.T) {
-	if SchemaVersion != 8 {
+	if SchemaVersion != 9 {
 		t.Fatalf("SchemaVersion = %d; update this pinned test and the on-disk fixture deliberately", SchemaVersion)
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":8,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":9,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
 	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 1 {
-		t.Fatalf("a literal-version-8 cache must load under SchemaVersion=8, got %d entries", len(c.Entries))
+		t.Fatalf("a literal-version-9 cache must load under SchemaVersion=9, got %d entries", len(c.Entries))
+	}
+}
+
+// TestLoad_V8CacheRejected pins the v9 bump's reason: a v8 KILLED entry
+// may record a mutant routed to covering tests that fail together without
+// it, so the metadata gate must discard it wholesale.
+func TestLoad_V8CacheRejected(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cache.json")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":8,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	c := Load(p, testModule, testVersion, "", "", "")
+	if len(c.Entries) != 0 {
+		t.Fatalf("a v8 cache must be discarded under SchemaVersion=9, got %d entries", len(c.Entries))
 	}
 }
 
@@ -397,7 +409,7 @@ func TestLoad_V7CacheRejected(t *testing.T) {
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":7,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"LIVED"}]}`, testModule, testVersion))
 	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
-		t.Fatalf("a v7 cache must be discarded under SchemaVersion=8, got %d entries", len(c.Entries))
+		t.Fatalf("a v7 cache must be discarded under SchemaVersion=9, got %d entries", len(c.Entries))
 	}
 }
 
@@ -410,7 +422,7 @@ func TestLoad_V6CacheRejected(t *testing.T) {
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":6,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
 	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
-		t.Fatalf("a v6 cache must be discarded under SchemaVersion=8, got %d entries", len(c.Entries))
+		t.Fatalf("a v6 cache must be discarded under SchemaVersion=9, got %d entries", len(c.Entries))
 	}
 }
 

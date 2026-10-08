@@ -613,6 +613,19 @@ func testFilesResolver(testIndex *cache.TestIndex, testMap *coverage.TestMap, cr
 	}
 }
 
+// pendingLines returns the positions of the mutants still to be tested, in
+// the coverage map's key format: the lines whose groups of covering tests
+// the map checks pass together (see coverage.BuildOptions.Lines).
+func pendingLines(mutants []mutator.Mutant) map[string]bool {
+	lines := map[string]bool{}
+	for _, m := range mutants {
+		if m.Status == mutator.StatusPending {
+			lines[coverage.LineKey(m.CoverageFile, m.Line)] = true
+		}
+	}
+	return lines
+}
+
 // coverageTestFlags returns the flags the mutant runs pass to `go test`
 // that shape how their tests run — -cpu for --test-cpu and -short when the
 // runner adds it, then the user's --test-flags, in the mutant runs' order

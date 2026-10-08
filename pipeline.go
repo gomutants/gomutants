@@ -560,6 +560,7 @@ func (mr *mutationRun) buildTestMap(ctx context.Context) error {
 		Workers:     mr.cfg.Workers,
 		TestTimeout: mr.testTimeout,
 		TestFlags:   coverageTestFlags(mr.cfg.TestFlagFields(), runner.ShortFlagFromEnv(), mr.cfg.TestCPU),
+		Lines:       pendingLines(mr.mutants),
 	})
 	if err != nil {
 		// An interrupt stops the run here, as in every other phase; it

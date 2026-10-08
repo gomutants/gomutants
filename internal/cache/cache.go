@@ -70,7 +70,12 @@ import (
 //	    mutant's, as all of them decide a LIVED verdict. Entries record
 //	    whether the mutant was re-checked, so a cache hit counts in the
 //	    report's re-check totals as the run that tested it did.
-const SchemaVersion = 8
+//	v9: KILLED means the mutant failed tests that pass together without it.
+//	    Through v8 a mutant could be routed to covering tests that each
+//	    pass alone but fail together on unmutated code — one leaves state
+//	    behind that breaks another — so v8 KILLED entries can be such
+//	    false kills.
+const SchemaVersion = 9
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path
