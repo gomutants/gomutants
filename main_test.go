@@ -1740,7 +1740,7 @@ func TestRunBuildTestMapGetsTestTimeout(t *testing.T) {
 
 	if _, err := captureOutput(t, func() error {
 		return run(context.Background(), []string{
-			"--only", "ARITHMETIC_BASE", "-w", "1", "--timeout-coefficient", "4", "--test-flags=-count=1",
+			"--only", "ARITHMETIC_BASE", "-w", "1", "--timeout-coefficient", "4", "--test-cpu", "1", "--test-flags=-count=1",
 			"-o", filepath.Join(dir, "r.json"), "testmod",
 		})
 	}); err != nil {
@@ -1752,20 +1752,24 @@ func TestRunBuildTestMapGetsTestTimeout(t *testing.T) {
 	if got.Workers != 1 || got.TmpDir == "" {
 		t.Errorf("BuildTestMap options = %+v, want Workers 1 and a TmpDir", got)
 	}
-	if !slices.Equal(got.TestFlags, []string{"-short", "-count=1"}) {
-		t.Errorf("BuildTestMap TestFlags = %q, want the runner's -short then --test-flags", got.TestFlags)
+	if !slices.Equal(got.TestFlags, []string{"-cpu=1", "-short", "-count=1"}) {
+		t.Errorf("BuildTestMap TestFlags = %q, want --test-cpu's -cpu, the runner's -short, then --test-flags", got.TestFlags)
 	}
 }
 
-// TestCoverageTestFlags: -short goes first when the runner adds it, as in
-// the mutant runs' argument order.
+// TestCoverageTestFlags: -cpu for --test-cpu, then -short when the runner
+// adds it, go before the user's flags, as in the mutant runs' argument
+// order.
 func TestCoverageTestFlags(t *testing.T) {
 	user := []string{"-count=1", "-args", "-x"}
-	if got := coverageTestFlags(user, false); !slices.Equal(got, user) {
+	if got := coverageTestFlags(user, false, 0); !slices.Equal(got, user) {
 		t.Errorf("short=false: %q, want %q", got, user)
 	}
-	if got := coverageTestFlags(user, true); !slices.Equal(got, []string{"-short", "-count=1", "-args", "-x"}) {
+	if got := coverageTestFlags(user, true, 0); !slices.Equal(got, []string{"-short", "-count=1", "-args", "-x"}) {
 		t.Errorf("short=true: %q, want -short prepended", got)
+	}
+	if got := coverageTestFlags(user, true, 2); !slices.Equal(got, []string{"-cpu=2", "-short", "-count=1", "-args", "-x"}) {
+		t.Errorf("testCPU=2: %q, want -cpu=2 then -short prepended", got)
 	}
 }
 

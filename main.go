@@ -804,7 +804,7 @@ func run(ctx context.Context, args []string) error {
 		TmpDir:      tmpDir,
 		Workers:     cfg.Workers,
 		TestTimeout: testTimeout,
-		TestFlags:   coverageTestFlags(cfg.TestFlagFields(), runner.ShortFlagFromEnv()),
+		TestFlags:   coverageTestFlags(cfg.TestFlagFields(), runner.ShortFlagFromEnv(), cfg.TestCPU),
 	})
 	if err != nil {
 		// An interrupt stops the run here, as in every other phase; it
@@ -1316,13 +1316,20 @@ func testFilesResolver(testIndex *cache.TestIndex, testMap *coverage.TestMap, cr
 }
 
 // coverageTestFlags returns the flags the mutant runs pass to `go test`
-// after the package — -short when the runner adds it, then the user's
-// --test-flags — so the per-test coverage runs match them.
-func coverageTestFlags(userFlags []string, short bool) []string {
-	if short {
-		return append([]string{"-short"}, userFlags...)
+// that shape how their tests run — -cpu for --test-cpu and -short when the
+// runner adds it, then the user's --test-flags, in the mutant runs' order
+// so a repeated flag resolves the same way — so the per-test coverage
+// runs match them. Their timings size the mutant runs' deadlines: a test
+// timed at every core and run at -cpu=1 would outlast its deadline.
+func coverageTestFlags(userFlags []string, short bool, testCPU int) []string {
+	var flags []string
+	if testCPU > 0 {
+		flags = append(flags, fmt.Sprintf("-cpu=%d", testCPU))
 	}
-	return userFlags
+	if short {
+		flags = append(flags, "-short")
+	}
+	return append(flags, userFlags...)
 }
 
 // integrationScope computes the reverse-dependency closure of the target

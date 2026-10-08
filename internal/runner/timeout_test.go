@@ -73,8 +73,8 @@ func TestTimeoutPolicyForAddsRebuilds(t *testing.T) {
 		m    mutator.Mutant
 		want time.Duration
 	}{
-		{"one package", mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}, 1400 * time.Millisecond},
-		{"two packages", mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 2}, 3400 * time.Millisecond},
+		{"own package", mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}, 1400 * time.Millisecond},
+		{"another package too", mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 2}, 30 * time.Second},
 	}
 	for _, tc := range cases {
 		if got := p.For(tm, tc.m); got != tc.want {
@@ -88,24 +88,30 @@ func TestTimeoutPolicyForAddsRebuilds(t *testing.T) {
 // mutant gets Global.
 func TestTimeoutPolicyForUnmeasuredRebuild(t *testing.T) {
 	tm := newTestMapWithDurations(t,
-		map[[2]string]time.Duration{{"p", "TestA"}: 100 * time.Millisecond, {"q", "TestC"}: 100 * time.Millisecond},
-		map[string][]coverage.TestRef{"f.go:1": {{Pkg: "p", Name: "TestA"}, {Pkg: "q", Name: "TestC"}}},
+		map[[2]string]time.Duration{{"q", "TestC"}: 100 * time.Millisecond},
+		map[string][]coverage.TestRef{"f.go:1": {{Pkg: "q", Name: "TestC"}}},
 	).WithRebuildsForTesting(map[string]time.Duration{"p": 0})
 	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 3, Min: time.Second, Adaptive: true}
-	if got := p.For(tm, mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}); got != 30*time.Second {
+	if got := p.For(tm, mutator.Mutant{Pkg: "q", CoverageFile: "f.go", Line: 1}); got != 30*time.Second {
 		t.Errorf("For = %v, want Global with q's rebuild unmeasured", got)
 	}
 }
 
-// TestRebuildCost: a measured rebuild sum for the packages run, and none
-// at all — not a partial sum — once one of them is unmeasured.
+// TestRebuildCost: a mutant whose covering tests are all in its package
+// rebuilds that package's test binary, as measured. Once one is in
+// another package, its rebuild has no measurement: it recompiles the
+// mutant's package and every one up to the test's, while each package's
+// measured rebuild is of its own change alone.
 func TestRebuildCost(t *testing.T) {
 	tm := coverage.NewTestMapForTesting(nil, nil).WithRebuildsForTesting(map[string]time.Duration{"p": time.Second, "q": 2 * time.Second})
-	refs := []coverage.TestRef{{Pkg: "p", Name: "TestA"}, {Pkg: "q", Name: "TestB"}, {Pkg: "p", Name: "TestC"}}
-	if total, ok := rebuildCost(tm, refs); total != 3*time.Second || !ok {
-		t.Errorf("rebuildCost(p, q) = (%v, %v), want (3s, true)", total, ok)
+	own := []coverage.TestRef{{Pkg: "p", Name: "TestA"}, {Pkg: "p", Name: "TestC"}}
+	if total, ok := rebuildCost(tm, own, "p"); total != time.Second || !ok {
+		t.Errorf("rebuildCost(own package) = (%v, %v), want (1s, true)", total, ok)
 	}
-	if total, ok := rebuildCost(tm, append(refs, coverage.TestRef{Pkg: "r", Name: "TestD"})); total != 0 || ok {
+	if total, ok := rebuildCost(tm, append(own, coverage.TestRef{Pkg: "q", Name: "TestB"}), "p"); total != 0 || ok {
+		t.Errorf("rebuildCost with a test in q = (%v, %v), want (0, false)", total, ok)
+	}
+	if total, ok := rebuildCost(tm, []coverage.TestRef{{Pkg: "r", Name: "TestD"}}, "r"); total != 0 || ok {
 		t.Errorf("rebuildCost with r unmeasured = (%v, %v), want (0, false)", total, ok)
 	}
 }
