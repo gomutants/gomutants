@@ -806,6 +806,7 @@ func run(ctx context.Context, args []string) error {
 		Workers:     cfg.Workers,
 		TestTimeout: testTimeout,
 		TestFlags:   coverageTestFlags(cfg.TestFlagFields(), runner.ShortFlagFromEnv(), cfg.TestCPU),
+		Lines:       pendingLines(mutants),
 	})
 	if err != nil {
 		// An interrupt stops the run here, as in every other phase; it
@@ -1335,6 +1336,19 @@ func testFilesResolver(testIndex *cache.TestIndex, testMap *coverage.TestMap, cr
 		}
 		return files
 	}
+}
+
+// pendingLines returns the positions of the mutants still to be tested, in
+// the coverage map's key format: the lines whose groups of covering tests
+// the map checks pass together (see coverage.BuildOptions.Lines).
+func pendingLines(mutants []mutator.Mutant) map[string]bool {
+	lines := map[string]bool{}
+	for _, m := range mutants {
+		if m.Status == mutator.StatusPending {
+			lines[coverage.LineKey(m.CoverageFile, m.Line)] = true
+		}
+	}
+	return lines
 }
 
 // coverageTestFlags returns the flags the mutant runs pass to `go test`
