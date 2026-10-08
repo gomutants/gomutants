@@ -1165,22 +1165,30 @@ func TestBuildTestMapKeepsSuitesWhenNothingRoutes(t *testing.T) {
 			opts := c.opts
 			opts.CoverPkg, opts.TmpDir, opts.Workers = "./...", t.TempDir(), 1
 			tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, opts)
-			if err != nil || tm == nil {
-				t.Fatalf("BuildTestMap = (%v, %v), want a map", tm, err)
-			}
-			for _, pkg := range []string{"example.com/x", "example.com/y", "example.com/lib"} {
-				if got := tm.SuitePkgs(pkg); !slices.Equal(got, suites) {
-					t.Errorf("SuitePkgs(%s) = %+v, want every suite %+v", pkg, got, suites)
-				}
-			}
-			want := []string{"routing mutants to their covering tests failed, so each runs its own package's whole suite and every survivor is re-checked against every package's suite: " + c.cause}
-			if got := tm.Warnings(); !slices.Equal(got, want) {
-				t.Errorf("Warnings = %q, want %q", got, want)
-			}
+			checkUnroutedMap(t, tm, err, suites, c.cause)
 			if got := atomic.LoadInt32(ran); got != 0 {
 				t.Errorf("runCompiledTestFunc called %d times, want 0", got)
 			}
 		})
+	}
+}
+
+// checkUnroutedMap checks what BuildTestMap returned after failing with
+// cause (see unrouted): a map, every suite deciding every package's
+// verdicts, and cause as its one warning.
+func checkUnroutedMap(t *testing.T, tm *TestMap, err error, suites []Package, cause string) {
+	t.Helper()
+	if err != nil || tm == nil {
+		t.Fatalf("BuildTestMap = (%v, %v), want a map", tm, err)
+	}
+	for _, pkg := range []string{"example.com/x", "example.com/y", "example.com/lib"} {
+		if got := tm.SuitePkgs(pkg); !slices.Equal(got, suites) {
+			t.Errorf("SuitePkgs(%s) = %+v, want every suite %+v", pkg, got, suites)
+		}
+	}
+	want := []string{"routing mutants to their covering tests failed, so each runs its own package's whole suite and every survivor is re-checked against every package's suite: " + cause}
+	if got := tm.Warnings(); !slices.Equal(got, want) {
+		t.Errorf("Warnings = %q, want %q", got, want)
 	}
 }
 
