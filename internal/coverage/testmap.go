@@ -82,6 +82,10 @@ type TestMap struct {
 	// links (see testDeps); it is read only with crossPkg. A package
 	// without an entry is taken to link every package.
 	testDeps map[string]map[string]bool
+
+	// warnings describes what the map lost while building without
+	// failing: work it routes less precisely, or not at all (see Warnings).
+	warnings []string
 }
 
 // Package is a package in the coverage map's scope that has tests.
@@ -121,6 +125,13 @@ func (tm *TestMap) SuitePkgs(pkg string) []Package {
 		}
 	}
 	return pkgs
+}
+
+// Warnings returns what went wrong building the map that didn't fail it,
+// in the order it happened: each costs the run speed, never a kill, but
+// the user should know why it is slower than the map promises.
+func (tm *TestMap) Warnings() []string {
+	return tm.warnings
 }
 
 // links reports whether p's test binary links pkg, or what it links is
@@ -210,9 +221,23 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 
 	// 2. List each binary's tests. Keying them by the binary's import path
 	// means every listed test has a binary to run against by construction.
-	// A cancellation here surfaces after the workers, which run nothing
-	// once the ctx is done.
-	tests := listTestsFunc(ctx, pkgBins, opts.TestTimeout, opts.Workers)
+	tests, listFailures := listTestsFunc(ctx, pkgBins, opts.TestTimeout, opts.Workers)
+	// A cancelled ctx fails every remaining listing; report the
+	// cancellation, not the listing failures it caused.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Every listing failed: as with every compile failing, the map would
+	// come back empty and routing would switch off without a word.
+	if len(tests) == 0 && len(listFailures) > 0 {
+		return nil, fmt.Errorf("no tests listed (%d packages failed); first failure: %w",
+			len(listFailures), listFailures[0])
+	}
+	if len(listFailures) > 0 {
+		tm.warnings = append(tm.warnings, fmt.Sprintf(
+			"listing the tests of %d packages failed, so their mutants run their whole suites; first failure: %v",
+			len(listFailures), listFailures[0]))
+	}
 
 	// 3. Run tests in parallel using compiled binaries.
 	work := make(chan testEntry, len(tests))
@@ -252,9 +277,13 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 
 	// A package's suite decides a mutant's verdict only if its tests can
 	// reach the mutant. Without knowing what they reach it decides every
-	// verdict, so failing to read it costs speed, never a missed kill.
+	// verdict, so failing to read it costs speed, never a missed kill —
+	// but every survivor then re-runs every suite, which the user is told.
 	if tm.crossPkg {
-		tm.testDeps, _ = testDepsFunc(ctx, projectDir, opts, importPaths(tm.suites))
+		if tm.testDeps, err = testDepsFunc(ctx, projectDir, opts, importPaths(tm.suites)); err != nil {
+			tm.warnings = append(tm.warnings, fmt.Sprintf(
+				"reading what each package's tests link failed, so every survivor is re-checked against every package's suite: %v", err))
+		}
 	}
 	return tm, nil
 }
@@ -836,6 +865,14 @@ func (tm *TestMap) WithSuitesForTesting(crossPkg bool, deps map[string]map[strin
 	return &c
 }
 
+// WithWarningsForTesting returns a copy of tm whose Warnings are exactly
+// `warnings`. Exposed for main's tests, like NewTestMapForTesting.
+func (tm *TestMap) WithWarningsForTesting(warnings ...string) *TestMap {
+	c := *tm
+	c.warnings = warnings
+	return &c
+}
+
 // WithRebuildsForTesting returns a copy of tm whose rebuild durations (see
 // RebuildDuration) are exactly `rebuilds`: a package left out has none.
 // Exposed for the runner's timeout tests, like NewTestMapForTesting.
@@ -869,29 +906,44 @@ type testEntry struct {
 // construction (#105) and no package is compiled twice.
 //
 // A binary whose listing fails doesn't fail the map: its package just
-// lists no tests, so its mutants run its whole suite.
-func listTests(ctx context.Context, pkgBins map[string]*compiledPkg, timeout time.Duration, workers int) []testEntry {
+// lists no tests, so its mutants run its whole suite. Its failure is
+// returned, naming the package, with the others sorted by package.
+func listTests(ctx context.Context, pkgBins map[string]*compiledPkg, timeout time.Duration, workers int) ([]testEntry, []error) {
 	var (
-		tests []testEntry
-		mu    sync.Mutex
-		wg    sync.WaitGroup
-		sem   = make(chan struct{}, workers)
+		tests    []testEntry
+		failures []listFailure
+		mu       sync.Mutex
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, workers)
 	)
 	for pkg, cp := range pkgBins {
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			// A failed listing returns no names.
-			names, _ := listBinTestsFunc(ctx, cp, timeout)
+			names, err := listBinTestsFunc(ctx, cp, timeout)
 			mu.Lock()
 			defer mu.Unlock()
+			if err != nil {
+				failures = append(failures, listFailure{pkg: pkg, err: err})
+			}
 			for _, name := range names {
 				tests = append(tests, testEntry{name: name, pkg: pkg})
 			}
 		})
 	}
 	wg.Wait()
-	return tests
+	slices.SortFunc(failures, func(a, b listFailure) int { return strings.Compare(a.pkg, b.pkg) })
+	errs := make([]error, len(failures))
+	for i, f := range failures {
+		errs[i] = fmt.Errorf("%s: %w", f.pkg, f.err)
+	}
+	return tests, errs
+}
+
+// listFailure is a package whose test binary's listing failed.
+type listFailure struct {
+	pkg string
+	err error
 }
 
 // listBinTests runs `<binary> -test.list=.` from the package directory, as
@@ -1017,8 +1069,7 @@ func parseTestBinaryArgs(out string) ([]string, error) {
 // testDeps returns, for each of pkgs, the packages its test binary links,
 // read from the deps of the "<pkg>.test" main package `go list -test`
 // generates, which take in the test files' imports too. A package go list
-// reports an error for is left out, as its deps may be incomplete. The
-// caller discards a failure, so it isn't dressed up.
+// reports an error for is left out, as its deps may be incomplete.
 //
 // The build flags among opts.TestFlags are passed as in the mutant runs:
 // -tags or -race can add test files, and with them imports.
@@ -1029,9 +1080,12 @@ func testDeps(ctx context.Context, projectDir string, opts BuildOptions, pkgs []
 	}
 	args = append(args, buildFlags(opts.TestFlags)...)
 	args = append(args, pkgs...)
-	out, err := goCmd(ctx, projectDir, args...).Output()
+	cmd := goCmd(ctx, projectDir, args...)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("go list -test: %w: %s", err, bytes.TrimSpace(stderr.Bytes()))
 	}
 
 	testMains := make(map[string]string, len(pkgs))

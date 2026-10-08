@@ -818,6 +818,9 @@ func run(ctx context.Context, args []string) error {
 		term.PhaseDone("skipped (will run all tests per mutant)")
 	} else {
 		term.PhaseDone("done")
+		for _, w := range testMap.Warnings() {
+			fmt.Fprintf(stderr, "warning: per-test coverage map: %s\n", w)
+		}
 	}
 
 	// 7a. Apply incremental-analysis cache (opt-in via --cache). Hits

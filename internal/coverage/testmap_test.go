@@ -720,12 +720,12 @@ func TestBuildTestMapContinuesPastFailedCompile(t *testing.T) {
 		{importPath: "pkg.fail", dir: failDir},
 		{importPath: "pkg.ok", dir: t.TempDir()},
 	})
-	listTestsFunc = func(_ context.Context, bins map[string]*compiledPkg, _ time.Duration, _ int) []testEntry {
+	listTestsFunc = func(_ context.Context, bins map[string]*compiledPkg, _ time.Duration, _ int) ([]testEntry, []error) {
 		var tests []testEntry
 		for pkg := range bins {
 			tests = append(tests, testEntry{name: "TestA", pkg: pkg})
 		}
-		return tests
+		return tests, nil
 	}
 	compileTestBinaryFunc = func(_ context.Context, _ string, _ BuildOptions, pkg resolvedPkg) (*compiledPkg, error) {
 		if pkg.importPath == "pkg.fail" {
@@ -835,6 +835,16 @@ func TestSuitePkgs(t *testing.T) {
 	}
 }
 
+// TestWithWarningsForTestingCopies: the test helper sets exactly the
+// warnings given, on a copy, leaving the map it is called on as it is.
+func TestWithWarningsForTestingCopies(t *testing.T) {
+	base := newTestMap(false)
+	got := base.WithWarningsForTesting("a", "b")
+	if !slices.Equal(got.Warnings(), []string{"a", "b"}) || base.Warnings() != nil {
+		t.Errorf("copy warns %q, original %q; want [a b] and none", got.Warnings(), base.Warnings())
+	}
+}
+
 // TestWithSuitesForTestingCopies: the test helper leaves the map it is
 // called on as it was, and sorts the suites it is given.
 func TestWithSuitesForTestingCopies(t *testing.T) {
@@ -926,8 +936,8 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 	resolvePackagesFunc = func(_ context.Context, _ string, _ []string, _ string) ([]resolvedPkg, error) {
 		return resolved, nil
 	}
-	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) []testEntry {
-		return tests
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, []error) {
+		return tests, nil
 	}
 	compileTestBinaryFunc = func(_ context.Context, _ string, _ BuildOptions, pkg resolvedPkg) (*compiledPkg, error) {
 		return &compiledPkg{binPath: "x", importPath: pkg.importPath, dir: pkg.dir}, nil
@@ -955,9 +965,9 @@ func TestBuildTestMapErrorsWhenNothingCompiles(t *testing.T) {
 		return nil, fmt.Errorf("go test -c %s: %w", pkg.importPath, boom)
 	}
 	listed := false
-	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) []testEntry {
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, []error) {
 		listed = true
-		return nil
+		return nil, nil
 	}
 
 	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
@@ -1018,14 +1028,15 @@ func TestBuildTestMapReportsCancellationDuringCompile(t *testing.T) {
 }
 
 // TestBuildTestMapReportsCancellationDuringListing: same as above for a
-// listing killed by cancellation.
+// listing killed by cancellation, which fails every listing: the error is
+// the cancellation, not the every-listing-failed diagnostic.
 func TestBuildTestMapReportsCancellationDuringListing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ran := stubBuildTestMapDeps(t, nil, []resolvedPkg{{importPath: "example.com/x", dir: t.TempDir()}})
-	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) []testEntry {
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, []error) {
 		cancel()
-		return []testEntry{{name: "TestA", pkg: "example.com/x"}}
+		return nil, []error{errors.New("example.com/x: signal: killed")}
 	}
 
 	tm, err := BuildTestMap(ctx, t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
@@ -1045,8 +1056,8 @@ func TestBuildTestMapKeepsUnlistedPackages(t *testing.T) {
 		{importPath: "example.com/bad", dir: badDir},
 		{importPath: "example.com/ok", dir: t.TempDir()},
 	})
-	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) []testEntry {
-		return []testEntry{{name: "TestA", pkg: "example.com/ok"}}
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, []error) {
+		return []testEntry{{name: "TestA", pkg: "example.com/ok"}}, []error{errors.New("example.com/bad: listing its tests failed")}
 	}
 
 	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
@@ -1058,6 +1069,94 @@ func TestBuildTestMapKeepsUnlistedPackages(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(ran); got != 1 {
 		t.Errorf("runCompiledTestFunc called %d times, want 1 (example.com/ok's TestA)", got)
+	}
+	want := []string{"listing the tests of 1 packages failed, so their mutants run their whole suites; first failure: example.com/bad: listing its tests failed"}
+	if got := tm.Warnings(); !slices.Equal(got, want) {
+		t.Errorf("Warnings = %q, want %q", got, want)
+	}
+}
+
+// TestBuildTestMapErrorsWhenNothingLists: every listing failing is an
+// error with the failure count and the first failure, not an empty map
+// whose routing switches off without a word (#105).
+func TestBuildTestMapErrorsWhenNothingLists(t *testing.T) {
+	ran := stubBuildTestMapDeps(t, nil, []resolvedPkg{
+		{importPath: "example.com/x", dir: t.TempDir()},
+		{importPath: "example.com/y", dir: t.TempDir()},
+	})
+	boom := errors.New("boom")
+	listTestsFunc = func(context.Context, map[string]*compiledPkg, time.Duration, int) ([]testEntry, []error) {
+		return nil, []error{fmt.Errorf("example.com/x: %w", boom), errors.New("example.com/y: boom")}
+	}
+
+	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
+	if tm != nil || err == nil {
+		t.Fatalf("BuildTestMap = (%v, %v), want an error and no map", tm, err)
+	}
+	if got, want := err.Error(), "no tests listed (2 packages failed); first failure: example.com/x: boom"; got != want {
+		t.Errorf("error %q, want %q", got, want)
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("error %q should wrap the first failure", err)
+	}
+	if got := atomic.LoadInt32(ran); got != 0 {
+		t.Errorf("runCompiledTestFunc called %d times after every listing failed, want 0", got)
+	}
+}
+
+// TestBuildTestMapWarnsWithoutTestDeps: links that can't be read leave
+// every suite deciding every verdict, which the warning tells the user,
+// with go list's error; read links warn of nothing.
+func TestBuildTestMapWarnsWithoutTestDeps(t *testing.T) {
+	stubBuildTestMapDeps(t, nil, []resolvedPkg{{importPath: "pkg.a", dir: t.TempDir()}})
+	opts := BuildOptions{CoverPkg: "./...", TmpDir: t.TempDir(), Workers: 1}
+	tm, err := BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, opts)
+	if err != nil {
+		t.Fatalf("BuildTestMap: %v", err)
+	}
+	want := []string{"reading what each package's tests link failed, so every survivor is re-checked against every package's suite: deps not stubbed"}
+	if got := tm.Warnings(); !slices.Equal(got, want) {
+		t.Errorf("Warnings = %q, want %q", got, want)
+	}
+
+	testDepsFunc = func(context.Context, string, BuildOptions, []string) (map[string]map[string]bool, error) {
+		return map[string]map[string]bool{"pkg.a": {}}, nil
+	}
+	if tm, err = BuildTestMap(context.Background(), t.TempDir(), []string{"./..."}, opts); err != nil || tm.Warnings() != nil {
+		t.Errorf("BuildTestMap = (warnings %q, %v), want no warnings", tm.Warnings(), err)
+	}
+}
+
+// TestListTestsSortsFailures: the failures come back sorted by package,
+// whatever order the listings finish in, so the first one reported is
+// stable from run to run, each wrapping its listing's error.
+func TestListTestsSortsFailures(t *testing.T) {
+	orig := listBinTestsFunc
+	t.Cleanup(func() { listBinTestsFunc = orig })
+	boom := errors.New("boom")
+	listBinTestsFunc = func(_ context.Context, cp *compiledPkg, _ time.Duration) ([]string, error) {
+		if cp.importPath == "ok" {
+			return []string{"TestA"}, nil
+		}
+		return nil, boom
+	}
+	bins := map[string]*compiledPkg{}
+	for _, p := range []string{"d", "b", "ok", "c", "a"} {
+		bins[p] = &compiledPkg{importPath: p}
+	}
+	tests, failures := listTests(context.Background(), bins, 0, 3)
+	if !slices.Equal(tests, []testEntry{{name: "TestA", pkg: "ok"}}) {
+		t.Errorf("tests = %+v, want ok's TestA", tests)
+	}
+	var got []string
+	for _, f := range failures {
+		got = append(got, f.Error())
+		if !errors.Is(f, boom) {
+			t.Errorf("failure %q should wrap the listing's error", f)
+		}
+	}
+	if want := []string{"a: boom", "b: boom", "c: boom", "d: boom"}; !slices.Equal(got, want) {
+		t.Errorf("failures = %q, want %q", got, want)
 	}
 }
 
@@ -1100,7 +1199,7 @@ func TestListTestsBoundsConcurrency(t *testing.T) {
 	// A slot that is never released blocks the loop for good. The deadline
 	// stays under the per-mutant timeout so that mutant reads as killed.
 	runWithDeadline(t, 5*time.Second, func() {
-		tests = listTests(context.Background(), bins, 0, 2)
+		tests, _ = listTests(context.Background(), bins, 0, 2)
 	})
 	if peak != 2 {
 		t.Errorf("peak concurrent listings = %d, want 2", peak)
@@ -1118,9 +1217,9 @@ func TestBuildTestMapForwardsTestTimeout(t *testing.T) {
 	stubBuildTestMapDeps(t, nil, []resolvedPkg{{importPath: "example.com/x", dir: t.TempDir()}})
 	var listTimeout, runTimeout time.Duration
 	var listWorkers int
-	listTestsFunc = func(_ context.Context, _ map[string]*compiledPkg, d time.Duration, workers int) []testEntry {
+	listTestsFunc = func(_ context.Context, _ map[string]*compiledPkg, d time.Duration, workers int) ([]testEntry, []error) {
 		listTimeout, listWorkers = d, workers
-		return []testEntry{{name: "TestA", pkg: "example.com/x"}}
+		return []testEntry{{name: "TestA", pkg: "example.com/x"}}, nil
 	}
 	runCompiledTestFunc = func(_ context.Context, _ *compiledPkg, _, _ string, d time.Duration) ([]Block, time.Duration, error) {
 		runTimeout = d

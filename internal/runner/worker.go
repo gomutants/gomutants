@@ -485,15 +485,16 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	// run for survivors alone; killed mutants keep the speed of routing.
 	//
 	// The routed run gets the adaptive deadline, sized from its tests'
-	// timings. The re-check gets the global ceiling: its packages' timings
-	// aren't all known, and a mutant the covering tests pass rarely hangs.
+	// timings. Each package of the re-check gets the global ceiling: their
+	// timings aren't all known, and a mutant the covering tests pass
+	// rarely hangs.
 	short := ShortFlagFromEnv()
 	routed := w.routeGroups(m)
 	status := w.runGroups(ctx, routed, m.Pkg, short, w.computeTimeout(m))
 	rechecked := false
 	if status == mutator.StatusLived {
 		if full := w.recheckGroups(m, routed); len(full) > 0 {
-			status = w.runGroups(ctx, full, m.Pkg, short, w.policy.Global)
+			status = w.recheck(ctx, full, m.Pkg, short)
 			rechecked = true
 		}
 	}
@@ -529,6 +530,22 @@ func (w *Worker) runGroups(ctx context.Context, groups map[string][]string, ownP
 	defer cancel()
 	for _, args := range w.invocations(groups, ownPkg, short, timeout) {
 		if status := w.runMutantTest(testCtx, args); status != mutator.StatusLived {
+			return status
+		}
+	}
+	return mutator.StatusLived
+}
+
+// recheck runs each package in full in turn (see recheckGroups), the
+// mutant's own first, and returns the first outcome that isn't Lived, or
+// Lived when every package passes. Each package gets the global ceiling
+// to itself. Global is sized from one `go test` of every package at once,
+// in parallel, so one deadline shared by suites run one after another
+// would run out on a mutant many suites link, turning a survivor
+// TIMED_OUT, which drops it from the efficacy denominator.
+func (w *Worker) recheck(ctx context.Context, full map[string][]string, ownPkg string, short bool) mutator.MutantStatus {
+	for _, pkg := range orderRoutePackages(full, ownPkg) {
+		if status := w.runGroups(ctx, map[string][]string{pkg: nil}, ownPkg, short, w.policy.Global); status != mutator.StatusLived {
 			return status
 		}
 	}

@@ -1630,6 +1630,48 @@ func TestRunBuildTestMapWarningOnError(t *testing.T) {
 	}
 }
 
+// TestRunBuildTestMapWarnings: what the map lost while building without
+// failing reaches stderr, each warning on its own line, and the phase
+// still reads as done.
+func TestRunBuildTestMapWarnings(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
+		return coverage.NewTestMapForTesting(nil, nil).WithWarningsForTesting("first lost", "second lost"), nil
+	}
+
+	var out, errBuf bytes.Buffer
+	origStdout := stdout
+	origStderr := stderr
+	stdout = &out
+	stderr = &errBuf
+	defer func() {
+		stdout = origStdout
+		stderr = origStderr
+	}()
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if want := "warning: per-test coverage map: first lost\nwarning: per-test coverage map: second lost\n"; !strings.Contains(errBuf.String(), want) {
+		t.Errorf("stderr = %q, want it to contain %q", errBuf.String(), want)
+	}
+	if !strings.Contains(out.String(), "Building per-test coverage map... done") {
+		t.Errorf("stdout missing 'done' PhaseDone; got: %q", out.String())
+	}
+}
+
 // TestRunBuildTestMapInterrupted: an interrupt during the per-test map
 // stops the run with the cancellation, rather than reading as a map
 // failure and going on without one.

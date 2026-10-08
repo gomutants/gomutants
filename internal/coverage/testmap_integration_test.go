@@ -255,18 +255,15 @@ func TestTwo(t *testing.T) {}
 	}
 }
 
-// TestBuildTestMapKeepsUnlistablePackage: a binary that refuses to list
-// maps none of its tests but keeps its package's suite in scope, instead
-// of failing the whole map.
-func TestBuildTestMapKeepsUnlistablePackage(t *testing.T) {
+// TestBuildTestMapFailsWhenNothingLists: when the only binary refuses to
+// list, the map fails with the binary's own message, rather than coming
+// back empty with routing switched off without a word (#105).
+func TestBuildTestMapFailsWhenNothingLists(t *testing.T) {
 	dir := writeModule(t, cwdListModule)
 
 	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
-	if err != nil {
-		t.Fatalf("BuildTestMap: %v", err)
-	}
-	if got := importPaths(tm.SuitePkgs("cwdlist")); !slices.Equal(got, []string{"cwdlist"}) || len(tm.index) != 0 {
-		t.Errorf("SuitePkgs(cwdlist) = %v with %d lines mapped, want cwdlist with none", got, len(tm.index))
+	if tm != nil || err == nil || !strings.Contains(err.Error(), "cwdlist: listing its tests failed: exit status 3: listing refused: no marker in cwd") {
+		t.Errorf("BuildTestMap = (%v, %v), want the listing's failure", tm, err)
 	}
 }
 
@@ -468,7 +465,10 @@ func TestListTests(t *testing.T) {
 	dir := setupTestProject(t)
 	cp := compileFixture(t, dir, "testmod")
 
-	tests := listTests(context.Background(), map[string]*compiledPkg{"testmod": cp}, 0, 1)
+	tests, failures := listTests(context.Background(), map[string]*compiledPkg{"testmod": cp}, 0, 1)
+	if len(failures) != 0 {
+		t.Fatalf("listTests failures: %v", failures)
+	}
 
 	if len(tests) != 2 {
 		t.Fatalf("expected 2 tests, got %d", len(tests))
@@ -560,7 +560,7 @@ func TestListTestsKeysByImportPath(t *testing.T) {
 		if len(failures) > 0 {
 			t.Fatalf("buildPkgBins(%v): %v", patterns, failures)
 		}
-		got := listTests(context.Background(), bins, 0, 2)
+		got, _ := listTests(context.Background(), bins, 0, 2)
 		slices.SortFunc(got, func(x, y testEntry) int {
 			return strings.Compare(x.name+"\x00"+x.pkg, y.name+"\x00"+y.pkg)
 		})
@@ -571,11 +571,16 @@ func TestListTestsKeysByImportPath(t *testing.T) {
 }
 
 // TestListTestsFailure: a binary that can't be listed lists no tests,
-// rather than failing the listing.
+// rather than failing the listing, and its failure is returned naming its
+// package.
 func TestListTestsFailure(t *testing.T) {
 	bins := map[string]*compiledPkg{"gone": {binPath: "/nonexistent/absolutely/not/a/binary", importPath: "gone", dir: t.TempDir()}}
-	if tests := listTests(context.Background(), bins, 0, 1); len(tests) != 0 {
+	tests, failures := listTests(context.Background(), bins, 0, 1)
+	if len(tests) != 0 {
 		t.Fatalf("listTests = %+v, want no tests", tests)
+	}
+	if len(failures) != 1 || !strings.HasPrefix(failures[0].Error(), "gone: listing its tests failed") {
+		t.Errorf("listTests failures = %v, want gone's", failures)
 	}
 }
 
@@ -743,10 +748,19 @@ func TestCompileTestBinaryNoScratchDir(t *testing.T) {
 	}
 }
 
-// TestTestDepsError: a go list that can't run is an error, tags and all.
+// TestTestDepsError: a go list that can't run is an error, tags and all,
+// and one that fails quotes what it printed, which the user is shown.
 func TestTestDepsError(t *testing.T) {
 	if _, err := testDeps(context.Background(), filepath.Join(t.TempDir(), "missing"), BuildOptions{Tags: "mytag"}, []string{"m/p"}); err == nil {
 		t.Error("testDeps in a missing directory: want an error")
+	}
+	dir := writeModule(t, map[string]string{"go.mod": "module badmod\n\nbogus directive\n"})
+	_, err := testDeps(context.Background(), dir, BuildOptions{}, []string{"badmod"})
+	if err == nil || !strings.HasPrefix(err.Error(), "go list -test: exit status 1: ") || !strings.Contains(err.Error(), "unknown directive: bogus") {
+		t.Errorf("testDeps with a broken go.mod: err = %v, want go list's message", err)
+	}
+	if exitErr := (*exec.ExitError)(nil); !errors.As(err, &exitErr) {
+		t.Errorf("testDeps with a broken go.mod: err = %v, want it to wrap go list's exit", err)
 	}
 }
 
@@ -1218,8 +1232,8 @@ func TestShort(t *testing.T) {
 
 // TestBuildTestMapForwardsTestFlags is the end-to-end gate for test flags:
 // -short and a custom flag after -args reach the listing and the per-test
-// run, so the package maps normally. Without them it can't be listed and
-// maps nothing.
+// run, so the package maps normally. Without them it can't be listed, and
+// as the only package, fails the map.
 func TestBuildTestMapForwardsTestFlags(t *testing.T) {
 	dir := writeModule(t, flagModule)
 
@@ -1244,11 +1258,8 @@ func TestBuildTestMapForwardsTestFlags(t *testing.T) {
 	}
 
 	tm, err = BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
-	if err != nil {
-		t.Fatalf("BuildTestMap without flags: %v", err)
-	}
-	if tests := tm.TestsFor("flagmod/lib.go", 3); len(tests) != 0 {
-		t.Errorf("without flags: TestsFor(lib.go:3) = %v, want none: the binary can't be listed", tests)
+	if tm != nil || err == nil || !strings.Contains(err.Error(), "missing -need") {
+		t.Errorf("without flags: BuildTestMap = (%v, %v), want the listing's failure: the binary can't be listed", tm, err)
 	}
 }
 
