@@ -269,17 +269,29 @@ func TestLoad_SchemaVersionMismatch(t *testing.T) {
 
 // TestLoad_SchemaVersionPinned hardcodes the current on-disk schema number
 // so that bumping or nudging the SchemaVersion constant without intent is
-// caught: a cache written at literal version 7 must load under the current
-// constant. (Pins SchemaVersion == 7; kills off-by-one mutations of it.)
+// caught: a cache written at literal version 8 must load under the current
+// constant. (Pins SchemaVersion == 8; kills off-by-one mutations of it.)
 func TestLoad_SchemaVersionPinned(t *testing.T) {
-	if SchemaVersion != 7 {
+	if SchemaVersion != 8 {
 		t.Fatalf("SchemaVersion = %d; update this pinned test and the on-disk fixture deliberately", SchemaVersion)
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":7,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":8,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
 	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 1 {
-		t.Fatalf("a literal-version-7 cache must load under SchemaVersion=7, got %d entries", len(c.Entries))
+		t.Fatalf("a literal-version-8 cache must load under SchemaVersion=8, got %d entries", len(c.Entries))
+	}
+}
+
+// TestLoad_V7CacheRejected pins the v8 bump's reason: a v7 LIVED entry
+// may record a survivor its covering tests missed, never re-checked
+// against the full suites, so the metadata gate must discard it wholesale.
+func TestLoad_V7CacheRejected(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cache.json")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":7,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"LIVED"}]}`, testModule, testVersion))
+	c := Load(p, testModule, testVersion, "", "", "")
+	if len(c.Entries) != 0 {
+		t.Fatalf("a v7 cache must be discarded under SchemaVersion=8, got %d entries", len(c.Entries))
 	}
 }
 
@@ -292,7 +304,7 @@ func TestLoad_V6CacheRejected(t *testing.T) {
 	mustWrite(t, p, fmt.Sprintf(`{"schema_version":6,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
 	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 0 {
-		t.Fatalf("a v6 cache must be discarded under SchemaVersion=7, got %d entries", len(c.Entries))
+		t.Fatalf("a v6 cache must be discarded under SchemaVersion=8, got %d entries", len(c.Entries))
 	}
 }
 
@@ -887,6 +899,30 @@ func TestUpdate_StatusFiltering(t *testing.T) {
 			e.Status == mutator.StatusInfraError.String() {
 			t.Errorf("non-cacheable status %q persisted: %+v", e.Status, e)
 		}
+	}
+}
+
+// TestUpdateLookup_RoundTripsRechecked: whether a mutant was re-checked
+// survives the cache, so a hit counts in the report's re-check totals as
+// the run that tested it did, rather than those totals shrinking with the
+// hit rate.
+func TestUpdateLookup_RoundTripsRechecked(t *testing.T) {
+	root := t.TempDir()
+	prodPath := filepath.Join(root, "x.go")
+	mustWrite(t, prodPath, "package x\n")
+	mustWrite(t, filepath.Join(root, "x_test.go"), "package x\n")
+
+	rechecked := mkMutant(prodPath, 1, mutator.StatusLived)
+	rechecked.Rechecked = true
+	c := &Cache{SchemaVersion: SchemaVersion, GoModule: testModule, ToolVersion: testVersion}
+	c.Update([]mutator.Mutant{rechecked, mkMutant(prodPath, 2, mutator.StatusKilled)}, NewHasher(nil), root, pkgDirTestFilesFor)
+
+	mutants := []mutator.Mutant{mkMutant(prodPath, 1, mutator.StatusPending), mkMutant(prodPath, 2, mutator.StatusPending)}
+	if hits := c.Lookup(mutants, NewHasher(nil), pkgDirTestFilesFor); hits != 2 {
+		t.Fatalf("Lookup hits = %d, want 2", hits)
+	}
+	if !mutants[0].Rechecked || mutants[1].Rechecked {
+		t.Errorf("Rechecked = %v, %v after the round trip, want true, false", mutants[0].Rechecked, mutants[1].Rechecked)
 	}
 }
 

@@ -241,6 +241,9 @@ func (t *Terminal) Summary(r *Report) {
 	if r.MutantsCached > 0 {
 		fmt.Fprintf(t.w, "  Cached:       %d  (skipped)\n", r.MutantsCached)
 	}
+	if r.MutantsRechecked > 0 {
+		fmt.Fprintf(t.w, "  Re-checked:   %d  (%d killed by tests the coverage map missed)\n", r.MutantsRechecked, r.MutantsRecheckKilled)
+	}
 	if r.MutantsSuppressed > 0 {
 		fmt.Fprintf(t.w, "  Suppressed:   %d  (%s)\n", r.MutantsSuppressed, suppressedSources(r))
 	}

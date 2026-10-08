@@ -6,13 +6,16 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	"github.com/szhekpisov/gomutants/internal/coverage"
 	"github.com/szhekpisov/gomutants/internal/mutator"
 )
 
@@ -372,5 +375,76 @@ func TestWorkerTestMonitorGoroutineExits(t *testing.T) {
 	time.Sleep(4 * monitorPollInterval)
 	if growth := psCalls.Load() - atReturn; growth > 1 {
 		t.Errorf("ps polled %d more times after Test returned — STATEMENT_REMOVE on close(monitorDone) leaks the goroutine", growth)
+	}
+}
+
+// recheckWorker returns a worker whose map routes a mutant in m/calc to
+// m/app's TestApp, with m/app's tests linking m/calc, so a survivor is
+// re-checked against m/calc and m/app in full, and that mutant. Every
+// `go test` it starts runs cmdFor(its package) instead, and the packages
+// are recorded in the order they start.
+func recheckWorker(t *testing.T, global time.Duration, cmdFor func(pkg string) []string) (*Worker, mutator.Mutant, *[]string) {
+	t.Helper()
+	const calc, app = "m/calc", "m/app"
+	tm := routeMap("f.go:1", coverage.TestRef{Pkg: app, Name: "TestApp"}).WithSuitesForTesting(true,
+		map[string]map[string]bool{calc: {}, app: {calc: true}},
+		coverage.Package{ImportPath: calc}, coverage.Package{ImportPath: app})
+	file := filepath.Join(t.TempDir(), "f.go")
+	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: global}, map[string][]byte{file: []byte("package calc\n")}, t.TempDir(), tm)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	var started []string
+	origStart := startCommandFunc
+	t.Cleanup(func() { startCommandFunc = origStart })
+	startCommandFunc = func(cmd *exec.Cmd) error {
+		pkg := lastArg(cmd.Args)
+		started = append(started, pkg)
+		argv := cmdFor(pkg)
+		path, err := exec.LookPath(argv[0])
+		if err != nil {
+			t.Fatalf("LookPath(%s): %v", argv[0], err)
+		}
+		cmd.Path, cmd.Args, cmd.Err = path, argv, nil
+		return cmd.Start()
+	}
+	return w, mutator.Mutant{Pkg: calc, File: file, CoverageFile: "f.go", Line: 1, Status: mutator.StatusPending}, &started
+}
+
+// TestWorkerTestRecheckDeadlinePerPackage: each package of the re-check
+// gets the global ceiling to itself. Global is sized from every package's
+// tests run at once, so with one deadline shared by suites run in turn, a
+// survivor many suites link would run out of time and read as TIMED_OUT,
+// dropping out of the efficacy denominator. Here each run takes 0.6s of a
+// 1s ceiling: shared, m/app's re-check would be killed 0.4s in.
+func TestWorkerTestRecheckDeadlinePerPackage(t *testing.T) {
+	w, m, started := recheckWorker(t, time.Second, func(string) []string { return []string{"sleep", "0.6"} })
+	got := w.Test(context.Background(), m)
+	if got.Status != mutator.StatusLived || !got.Rechecked {
+		t.Errorf("Status=%v Rechecked=%v, want a re-checked LIVED", got.Status, got.Rechecked)
+	}
+	if want := []string{"m/app", "m/calc", "m/app"}; !slices.Equal(*started, want) {
+		t.Errorf("runs = %v, want %v: routed m/app, then the re-check, own package first", *started, want)
+	}
+}
+
+// TestWorkerTestRecheckStopsAtKill: the re-check stops at the first
+// package whose suite kills the mutant.
+func TestWorkerTestRecheckStopsAtKill(t *testing.T) {
+	runs := 0
+	w, m, started := recheckWorker(t, 30*time.Second, func(string) []string {
+		// The routed run passes; the re-check's first package fails.
+		runs++
+		if runs == 1 {
+			return []string{"true"}
+		}
+		return []string{"false"}
+	})
+	got := w.Test(context.Background(), m)
+	if got.Status != mutator.StatusKilled || !got.Rechecked {
+		t.Errorf("Status=%v Rechecked=%v, want KILLED by the re-check", got.Status, got.Rechecked)
+	}
+	if want := []string{"m/app", "m/calc"}; !slices.Equal(*started, want) {
+		t.Errorf("runs = %v, want %v: nothing after m/calc's kill", *started, want)
 	}
 }

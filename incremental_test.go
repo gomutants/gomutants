@@ -484,3 +484,62 @@ func TestIncrementalCacheInvalidatesOnEmbeddedFileEdit(t *testing.T) {
 		},
 	}.run(t)
 }
+
+// TestIncrementalCacheInvalidatesOnExcludedSuiteEdit: with --coverpkg a
+// mutant's verdict rests on every suite whose tests link it, including one
+// in a package --exclude-files emptied. That package is gone from the
+// mutated packages but its tests still run, and its files must still be in
+// the key. They weren't: the cache's test index covered only the mutated
+// packages, so strengthening e2e's test replayed lib's mutant as LIVED.
+func TestIncrementalCacheInvalidatesOnExcludedSuiteEdit(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"go.mod":     "module excl\n\ngo 1.26\n",
+		"lib/lib.go": "package lib\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n",
+		"lib/lib_test.go": "package lib\n\nimport \"testing\"\n\n" +
+			"func TestSmoke(t *testing.T) {}\n",
+		"e2e/helpers.go": "package e2e\n\nimport \"excl/lib\"\n\n" +
+			"func Sum(a, b int) int { return lib.Add(a, b) }\n",
+		"e2e/e2e_test.go": "package e2e\n\nimport \"testing\"\n\n" +
+			"func TestSum(t *testing.T) { _ = Sum(2, 3) }\n",
+	} {
+		path := filepath.Join(dir, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := []string{
+		"-w", "2",
+		"--only", "ARITHMETIC_BASE",
+		"--coverpkg", "./...",
+		"--exclude-files", "^e2e/",
+		"-cache", filepath.Join(dir, ".gomutants-cache.json"),
+		"-o", filepath.Join(dir, "report.json"),
+		"./...",
+	}
+
+	cold := runInDir(t, dir, args)
+	probe := findArithmeticMutation(t, cold, "lib.go")
+	if probe.Status != mutator.StatusLived.String() {
+		t.Fatalf("cold run: %s status=%s, want LIVED — e2e's test asserts nothing", probe.ID, probe.Status)
+	}
+
+	strong := "package e2e\n\nimport \"testing\"\n\n" +
+		"func TestSum(t *testing.T) {\n\tif Sum(2, 3) != 5 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "e2e", "e2e_test.go"), []byte(strong), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	warm := runInDir(t, dir, args)
+	if got := findMutationByID(t, warm, probe.ID); got.Status != mutator.StatusKilled.String() {
+		t.Errorf("warm run: %s status=%s (cached=%d), want KILLED: e2e's strengthened test must invalidate it",
+			probe.ID, got.Status, warm.MutantsCached)
+	}
+}

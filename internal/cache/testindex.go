@@ -237,6 +237,15 @@ func (ti *TestIndex) CoveringFiles(pkgDir string, testNames []string, crossPkg b
 	return files
 }
 
+// PackageFiles returns every indexed file of dir: its test files and its
+// production sources. A package whose whole suite runs for a mutant (see
+// coverage.TestMap.SuitePkgs) decides the verdict through all of them.
+func (ti *TestIndex) PackageFiles(dir string) []string {
+	var files []string
+	ti.addWholePackage(dir, func(f string) { files = append(files, f) })
+	return files
+}
+
 // addWholePackage feeds every indexed file of dir — its test files and its
 // production sources both — to add. Split out of CoveringFiles so that
 // method stays within the cognitive-complexity budget: inlined, its two

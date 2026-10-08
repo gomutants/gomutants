@@ -62,7 +62,15 @@ import (
 //	    //go:embed dimension in the same version: a v7 profile recorded
 //	    before it simply mismatches and is recomputed, which is why this
 //	    framing change rides on v7 rather than a bump of its own.
-const SchemaVersion = 7
+//	v8: LIVED means the mutant survived every test suite that can kill it,
+//	    not just the tests the coverage map routed it to, which could miss
+//	    a test that covers the line only after another test has run. v7
+//	    LIVED entries can be such false survivors. With -coverpkg the
+//	    tests dimension now spans every package whose tests link the
+//	    mutant's, as all of them decide a LIVED verdict. Entries record
+//	    whether the mutant was re-checked, so a cache hit counts in the
+//	    report's re-check totals as the run that tested it did.
+const SchemaVersion = 8
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path
@@ -165,6 +173,9 @@ type Entry struct {
 	TestsHash  string `json:"tests_hash"`
 	Status     string `json:"status"`
 	DurationMs int64  `json:"duration_ms"`
+	// Rechecked (v8+) is the mutant's Rechecked, restored on a hit so the
+	// report's re-check counts don't depend on how many mutants hit.
+	Rechecked bool `json:"rechecked,omitempty"`
 }
 
 // key returns the identity tuple used for cache lookups.
@@ -670,7 +681,7 @@ type TestFilesForFn func(m mutator.Mutant) []string
 
 // Lookup applies cache hits to the mutants slice in place. For each
 // pending mutant whose identity key + content hashes match a cached
-// entry, sets Status, Duration, and FromCache so the runner's
+// entry, sets Status, Duration, Rechecked and FromCache so the runner's
 // Pending-only filter naturally skips it. Returns the number of hits.
 //
 // Skip rules — pkg_hash gates every reusable status:
@@ -771,6 +782,7 @@ func (c *Cache) Lookup(mutants []mutator.Mutant, h *Hasher, testFilesFor TestFil
 
 		m.Status = status
 		m.Duration = time.Duration(entry.DurationMs) * time.Millisecond
+		m.Rechecked = entry.Rechecked
 		m.FromCache = true
 		hits++
 	}
@@ -878,6 +890,7 @@ func (c *Cache) Update(mutants []mutator.Mutant, h *Hasher, projectDir string, t
 			PkgHash:     pkgHash,
 			Status:      m.Status.String(),
 			DurationMs:  m.Duration.Milliseconds(),
+			Rechecked:   m.Rechecked,
 		}
 		// tests_hash is only meaningful for statuses where it gates
 		// reuse. Stamp it for KILLED/LIVED/TIMED_OUT so future

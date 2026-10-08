@@ -232,7 +232,7 @@ func mutantLess(a, b mutator.Mutant) bool {
 // it is no longer read as a package — it is forwarded to the test binary
 // as a positional argument and `go test` falls back to `.`. A test-binary
 // flag (`-rapid.checks=N`) ahead of the packages therefore measures the
-// working directory instead of them. See buildTestArgs for the same
+// working directory instead of them. See pkgTestArgs for the same
 // ordering on the mutant runs.
 func MeasureBaseline(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
 	args := []string{"test", "-count=1"}

@@ -51,33 +51,68 @@ func TestTimeoutPolicyForAdaptiveDisabledIgnoresTestMap(t *testing.T) {
 	}
 }
 
-// TestTimeoutPolicyForUnmeasuredIgnoresTestMap pins the --test-flags
-// fallback: timings recorded without the run's flags can't size its
-// deadlines, so Unmeasured must return Global even with a fully populated
-// map and Adaptive on. Kills BRANCH_IF on the `if p.Unmeasured` return —
-// dropping it hands a `-race` run a deadline measured without -race,
-// which turns survivors into TIMED_OUT and quietly removes them from the
-// efficacy denominator.
-func TestTimeoutPolicyForUnmeasuredIgnoresTestMap(t *testing.T) {
+// TestTimeoutPolicyForAddsRebuilds: the deadline also covers rebuilding
+// the test binary of every package the mutant's tests run in — each once,
+// however many of its tests run. The floor alone can be shorter than a
+// link under load.
+func TestTimeoutPolicyForAddsRebuilds(t *testing.T) {
 	tm := newTestMapWithDurations(t,
 		map[[2]string]time.Duration{
 			{"p", "TestA"}: 100 * time.Millisecond,
+			{"p", "TestB"}: 100 * time.Millisecond,
+			{"q", "TestC"}: 100 * time.Millisecond,
 		},
 		map[string][]coverage.TestRef{
-			"f.go:1": {{Pkg: "p", Name: "TestA"}},
+			"f.go:1": {{Pkg: "p", Name: "TestA"}, {Pkg: "p", Name: "TestB"}},
+			"f.go:2": {{Pkg: "p", Name: "TestA"}, {Pkg: "q", Name: "TestC"}},
 		},
-	)
-	m := mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}
-	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 3, Min: time.Second, Adaptive: true, Unmeasured: true}
-	if got := p.For(tm, m); got != 30*time.Second {
-		t.Errorf("Unmeasured must return Global; got %v", got)
+	).WithRebuildsForTesting(map[string]time.Duration{"p": 500 * time.Millisecond, "q": time.Second})
+	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 2, Min: time.Second, Adaptive: true}
+	cases := []struct {
+		name string
+		m    mutator.Mutant
+		want time.Duration
+	}{
+		{"own package", mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}, 1400 * time.Millisecond},
+		{"another package too", mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 2}, 30 * time.Second},
 	}
-	// The same policy without the flag must still size adaptively —
-	// otherwise the assertion above would pass on a For() that ignores
-	// the TestMap unconditionally.
-	p.Unmeasured = false
-	if got := p.For(tm, m); got != time.Second {
-		t.Errorf("Unmeasured=false must size from the TestMap (100ms × 3, clamped to Min 1s); got %v", got)
+	for _, tc := range cases {
+		if got := p.For(tm, tc.m); got != tc.want {
+			t.Errorf("%s: For = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestTimeoutPolicyForUnmeasuredRebuild: a package whose rebuild wasn't
+// measured gives no basis for the build part of the deadline, so the
+// mutant gets Global.
+func TestTimeoutPolicyForUnmeasuredRebuild(t *testing.T) {
+	tm := newTestMapWithDurations(t,
+		map[[2]string]time.Duration{{"q", "TestC"}: 100 * time.Millisecond},
+		map[string][]coverage.TestRef{"f.go:1": {{Pkg: "q", Name: "TestC"}}},
+	).WithRebuildsForTesting(map[string]time.Duration{"p": 0})
+	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 3, Min: time.Second, Adaptive: true}
+	if got := p.For(tm, mutator.Mutant{Pkg: "q", CoverageFile: "f.go", Line: 1}); got != 30*time.Second {
+		t.Errorf("For = %v, want Global with q's rebuild unmeasured", got)
+	}
+}
+
+// TestRebuildCost: a mutant whose covering tests are all in its package
+// rebuilds that package's test binary, as measured. Once one is in
+// another package, its rebuild has no measurement: it recompiles the
+// mutant's package and every one up to the test's, while each package's
+// measured rebuild is of its own change alone.
+func TestRebuildCost(t *testing.T) {
+	tm := coverage.NewTestMapForTesting(nil, nil).WithRebuildsForTesting(map[string]time.Duration{"p": time.Second, "q": 2 * time.Second})
+	own := []coverage.TestRef{{Pkg: "p", Name: "TestA"}, {Pkg: "p", Name: "TestC"}}
+	if total, ok := rebuildCost(tm, own, "p"); total != time.Second || !ok {
+		t.Errorf("rebuildCost(own package) = (%v, %v), want (1s, true)", total, ok)
+	}
+	if total, ok := rebuildCost(tm, append(own, coverage.TestRef{Pkg: "q", Name: "TestB"}), "p"); total != 0 || ok {
+		t.Errorf("rebuildCost with a test in q = (%v, %v), want (0, false)", total, ok)
+	}
+	if total, ok := rebuildCost(tm, []coverage.TestRef{{Pkg: "r", Name: "TestD"}}, "r"); total != 0 || ok {
+		t.Errorf("rebuildCost with r unmeasured = (%v, %v), want (0, false)", total, ok)
 	}
 }
 
@@ -132,9 +167,10 @@ func TestTimeoutPolicyForCeilingClampsAboveGlobal(t *testing.T) {
 	}
 }
 
-func TestTimeoutPolicyForFallsBackToPackageWhenPerTestMissing(t *testing.T) {
-	// The covering set lists TestUnseen, which has no recorded duration.
-	// Selector must fall back to PackageDuration("p").
+// TestTimeoutPolicyForMissingPerTestUsesGlobal: a covering test with no
+// recorded duration gives no basis for the deadline, so the mutant gets
+// the ceiling rather than one sized from the package's other tests.
+func TestTimeoutPolicyForMissingPerTestUsesGlobal(t *testing.T) {
 	tm := newTestMapWithDurations(t,
 		map[[2]string]time.Duration{
 			{"p", "TestA"}: 50 * time.Millisecond,
@@ -145,10 +181,8 @@ func TestTimeoutPolicyForFallsBackToPackageWhenPerTestMissing(t *testing.T) {
 		},
 	)
 	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 4, Min: 0, Adaptive: true}
-	got := p.For(tm, mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1})
-	want := 400 * time.Millisecond // pkg sum 100ms × 4
-	if got != want {
-		t.Errorf("missing per-test entry must trigger pkg fallback; got %v want %v", got, want)
+	if got := p.For(tm, mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}); got != p.Global {
+		t.Errorf("missing per-test entry: got %v, want the 30s ceiling", got)
 	}
 }
 
@@ -189,13 +223,13 @@ func TestWorkerComputeTimeoutWiresPolicyAndTestMap(t *testing.T) {
 	}
 }
 
-// TestWorkerBuildTestArgsUsesAdaptiveTimeout closes the loop end-to-end:
+// TestWorkerTestInvocationsUsesAdaptiveTimeout closes the loop end-to-end:
 // the per-mutant timeout chosen by computeTimeout must thread into the
 // `-timeout=` flag that `go test` actually receives. A refactor that
 // reverts to threading w.policy.Global directly would still pass
 // TestWorkerComputeTimeoutWiresPolicyAndTestMap; this test catches that
 // by asserting the args carry the adaptive value.
-func TestWorkerBuildTestArgsUsesAdaptiveTimeout(t *testing.T) {
+func TestWorkerTestInvocationsUsesAdaptiveTimeout(t *testing.T) {
 	tm := newTestMapWithDurations(t,
 		map[[2]string]time.Duration{
 			{"p", "TestA"}: 500 * time.Millisecond,
@@ -219,7 +253,7 @@ func TestWorkerBuildTestArgsUsesAdaptiveTimeout(t *testing.T) {
 		t.Fatalf("computeTimeout = %v, want %v (precondition for arg test)", timeout, wantTimeout)
 	}
 
-	args := w.buildTestArgs(m, false, timeout)
+	args := onlyInvocation(t, w, m, false, timeout)
 	wantArg := "-timeout=" + wantTimeout.String()
 	found := false
 	for _, a := range args {
@@ -229,13 +263,15 @@ func TestWorkerBuildTestArgsUsesAdaptiveTimeout(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("args missing %q; got: %v — buildTestArgs must thread the resolved adaptive timeout, not w.policy.Global", wantArg, args)
+		t.Errorf("args missing %q; got: %v — the routed run must thread the resolved adaptive timeout, not w.policy.Global", wantArg, args)
 	}
 }
 
-func TestTimeoutPolicyForNoCoveringSetUsesPackage(t *testing.T) {
-	// No entry in the cover index for the mutant's location → TestsFor
-	// returns nil → SumDurationsFor returns (0, false) → package fallback.
+// TestTimeoutPolicyForNoCoveringSetUsesGlobal: a mutant on a line no
+// test covers runs its whole package, whose timings the map doesn't hold
+// in full (a test that failed or hung alone has none), so it gets the
+// ceiling.
+func TestTimeoutPolicyForNoCoveringSetUsesGlobal(t *testing.T) {
 	tm := newTestMapWithDurations(t,
 		map[[2]string]time.Duration{
 			{"p", "TestA"}: 250 * time.Millisecond,
@@ -245,9 +281,7 @@ func TestTimeoutPolicyForNoCoveringSetUsesPackage(t *testing.T) {
 		},
 	)
 	p := TimeoutPolicy{Global: 30 * time.Second, Margin: 2, Min: 0, Adaptive: true}
-	got := p.For(tm, mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1})
-	want := 500 * time.Millisecond // pkg sum 250ms × 2
-	if got != want {
-		t.Errorf("uncovered line must use pkg fallback; got %v want %v", got, want)
+	if got := p.For(tm, mutator.Mutant{Pkg: "p", CoverageFile: "f.go", Line: 1}); got != p.Global {
+		t.Errorf("uncovered line: got %v, want the 30s ceiling", got)
 	}
 }

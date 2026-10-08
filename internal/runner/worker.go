@@ -360,10 +360,10 @@ var (
 	startCommandFunc   = func(cmd *exec.Cmd) error { return cmd.Start() }
 )
 
-// shortFlagFromEnv reports whether the inner `go test` should be invoked
+// ShortFlagFromEnv reports whether the inner `go test` should be invoked
 // with -short. Extracted from Worker.Test so the env-string equality check
 // is reachable without spinning up a subprocess.
-func shortFlagFromEnv() bool {
+func ShortFlagFromEnv() bool {
 	return os.Getenv("GOMUTANTS_TEST_SHORT") == "1"
 }
 
@@ -477,46 +477,79 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 		return m
 	}
 
-	// 5. Compute the per-mutant timeout once and reuse it for both the
-	// outer context deadline (which feeds exec.CommandContext's
-	// SIGKILL-on-expiry) and the inner -timeout flag (which lets `go test`
-	// exit cleanly with its own timeout error). Computing once means an
-	// odd-shaped TimeoutPolicy can't desync the two. The single deadline is
-	// shared across every per-package invocation: computeTimeout already
-	// sizes it from the sum of all covering tests' durations (across
-	// packages), so the whole cross-package run is bounded as one unit.
-	timeout := w.computeTimeout(m)
-	testCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	// 6. Run each covering package's invocation in turn, short-circuiting on
-	// the first non-Lived outcome (a kill, timeout, or compile failure). A
-	// mutant is Lived only if every covering package's tests pass. A
-	// cmd.Start failure surfaces as NotViable or InfraError from
-	// runMutantTest, which the non-Lived check below returns just like any
-	// other terminal outcome.
-	for _, args := range w.testInvocations(m, shortFlagFromEnv(), timeout) {
-		status := w.runMutantTest(testCtx, args)
-		// Parent-context cancel (Ctrl-C, upstream deadline) propagates via
-		// exec.CommandContext as a non-nil cmd.Wait error that is neither
-		// memKilled nor the test's own timeout, which classifyTestOutcome
-		// would mistake for StatusKilled — silently marking cancelled mutants
-		// as tested and inflating efficacy. Detect parent cancel here and
-		// preserve the incoming Status + zero Duration so the pool surfaces
-		// the mutant as Pending (not tested), keeping Pending ⇒ Duration==0.
-		if ctx.Err() != nil {
-			return m
-		}
-		if status != mutator.StatusLived {
-			m.Duration = time.Since(start)
-			m.Status = status
-			return m
+	// 5. Run the mutant's covering tests, then, if they all pass, the
+	// whole suites its verdict rests on (see recheckGroups). The covering
+	// tests are only the likeliest killers: a test that covers the line in
+	// package order but not alone is missing from them, so a mutant they
+	// miss lives only once the full suites pass too. That costs a second
+	// run for survivors alone; killed mutants keep the speed of routing.
+	//
+	// The routed run gets the adaptive deadline, sized from its tests'
+	// timings. Each package of the re-check gets the global ceiling: their
+	// timings aren't all known, and a mutant the covering tests pass
+	// rarely hangs.
+	short := ShortFlagFromEnv()
+	routed := w.routeGroups(m)
+	status := w.runGroups(ctx, routed, m.Pkg, short, w.computeTimeout(m))
+	rechecked := false
+	if status == mutator.StatusLived {
+		if full := w.recheckGroups(m, routed); len(full) > 0 {
+			status = w.recheck(ctx, full, m.Pkg, short)
+			rechecked = true
 		}
 	}
-
+	// Parent-context cancel (Ctrl-C, upstream deadline) propagates via
+	// exec.CommandContext as a non-nil cmd.Wait error that is neither
+	// memKilled nor the test's own timeout, which classifyTestOutcome
+	// would mistake for StatusKilled — silently marking cancelled mutants
+	// as tested and inflating efficacy. Preserve the incoming Status + zero
+	// Duration so the pool surfaces the mutant as Pending (not tested),
+	// keeping Pending ⇒ Duration==0.
+	if ctx.Err() != nil {
+		return m
+	}
 	m.Duration = time.Since(start)
-	m.Status = mutator.StatusLived
+	m.Status = status
+	m.Rechecked = rechecked
 	return m
+}
+
+// runGroups runs one `go test` per package in groups (see invocations),
+// under one deadline of `timeout` shared by all of them, and returns the
+// first outcome that isn't Lived, or Lived when every package passes. The
+// deadline is computed once and threaded into both the context (which
+// feeds exec.CommandContext's SIGKILL-on-expiry) and the inner -timeout
+// flag (which lets `go test` exit cleanly with its own timeout error), so
+// an odd-shaped TimeoutPolicy can't desync the two. A cmd.Start failure
+// surfaces as NotViable or InfraError from runMutantTest, and ends the run
+// like any other terminal outcome. So does a cancelled ctx, which kills
+// the invocation in flight or fails the next one's start; the caller
+// discards that outcome.
+func (w *Worker) runGroups(ctx context.Context, groups map[string][]string, ownPkg string, short bool, timeout time.Duration) mutator.MutantStatus {
+	testCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	for _, args := range w.invocations(groups, ownPkg, short, timeout) {
+		if status := w.runMutantTest(testCtx, args); status != mutator.StatusLived {
+			return status
+		}
+	}
+	return mutator.StatusLived
+}
+
+// recheck runs each package in full in turn (see recheckGroups), the
+// mutant's own first, and returns the first outcome that isn't Lived, or
+// Lived when every package passes. Each package gets the global ceiling
+// to itself. Global is sized from one `go test` of every package at once,
+// in parallel, so one deadline shared by suites run one after another
+// would run out on a mutant many suites link, turning a survivor
+// TIMED_OUT, which drops it from the efficacy denominator.
+func (w *Worker) recheck(ctx context.Context, full map[string][]string, ownPkg string, short bool) mutator.MutantStatus {
+	for _, pkg := range orderRoutePackages(full, ownPkg) {
+		if status := w.runGroups(ctx, map[string][]string{pkg: nil}, ownPkg, short, w.policy.Global); status != mutator.StatusLived {
+			return status
+		}
+	}
+	return mutator.StatusLived
 }
 
 // runMutantTest runs one `go test` invocation under the RSS monitor and
@@ -649,11 +682,10 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 	return args
 }
 
-// buildTestArgs constructs the `go test` argv for the single-package case:
-// the mutant's own package, optionally filtered to its covering tests. Used
-// when no cross-package routing applies (the common path). Kept as a
-// distinct builder so callers can verify the -short, -run, and package arg
-// wiring without spinning up a subprocess.
+// pkgTestArgs constructs the `go test` argv for one package, filtered to
+// `tests` with -run, or running the whole package when tests is nil. Kept
+// as a distinct builder so callers can verify the -short, -run, and
+// package arg wiring without spinning up a subprocess.
 //
 // The user's --test-flags go last, after the package. `go test` goes on
 // parsing its own flags past one it does not recognize, but that first
@@ -664,24 +696,58 @@ func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
 // mutant reported LIVED. Trailing placement also preserves the override
 // rule — Go takes the last occurrence of a repeated flag, so a user value
 // still beats ours.
-func (w *Worker) buildTestArgs(m mutator.Mutant, short bool, timeout time.Duration) []string {
+func (w *Worker) pkgTestArgs(pkg string, tests []string, short bool, timeout time.Duration) []string {
 	args := w.baseTestArgs(short, timeout)
-	// Use per-test coverage map to run only relevant tests.
-	if w.testMap != nil {
-		if tests := w.testMap.TestsFor(m.CoverageFile, m.Line); len(tests) > 0 {
-			args = append(args, fmt.Sprintf("-run=%s", coverage.RunPattern(tests)))
-		}
+	if tests != nil {
+		args = append(args, fmt.Sprintf("-run=%s", coverage.RunPattern(tests)))
 	}
-	args = append(args, m.Pkg)
+	args = append(args, pkg)
 	return append(args, w.testFlags...)
 }
 
-// testInvocations returns the ordered set of `go test` argv lists to run for
-// one mutant. In the common case this is a single invocation against the
-// mutant's own package (identical to buildTestArgs). When the per-test
-// coverage map routes the mutant to covering tests in *other* packages
-// (integration mode), it returns one invocation per covering package, each
-// filtered to that package's covering tests.
+// routeGroups returns the packages to run first for m, each mapped to the
+// covering tests to run in it: the tests the per-test coverage map
+// attributes to m's line, grouped by package, or, when it has none, m's
+// whole own package (a nil entry runs a package in full). With the map
+// built across packages (integration mode) the covering tests can sit in
+// other packages than m's.
+func (w *Worker) routeGroups(m mutator.Mutant) map[string][]string {
+	// TestRefsFor is nil-safe, so a nil map leaves only the fallback.
+	groups := map[string][]string{}
+	for _, ref := range w.testMap.TestRefsFor(m.CoverageFile, m.Line) {
+		groups[ref.Pkg] = append(groups[ref.Pkg], ref.Name)
+	}
+	if len(groups) == 0 {
+		groups[m.Pkg] = nil
+	}
+	return groups
+}
+
+// recheckGroups returns the packages to run in full for m once the run of
+// `routed` (see routeGroups) has passed: every package whose suite can
+// kill it (see coverage.TestMap.SuitePkgs) and every package `routed` ran
+// only some tests of, less those `routed` already ran in full. Empty means
+// the routed run already was the full verdict. m's own package is among
+// them only when it has tests: a package tested only by its importers
+// would cost a build and link for "no test files".
+func (w *Worker) recheckGroups(m mutator.Mutant, routed map[string][]string) map[string][]string {
+	full := map[string][]string{}
+	for pkg, tests := range routed {
+		if tests != nil {
+			full[pkg] = nil
+		}
+	}
+	for _, p := range w.testMap.SuitePkgs(m.Pkg) {
+		if tests, ran := routed[p.ImportPath]; !ran || tests != nil {
+			full[p.ImportPath] = nil
+		}
+	}
+	return full
+}
+
+// invocations returns the ordered `go test` argv lists for groups, one per
+// package, filtered to its tests with -run or running it in full when its
+// entry is nil.
 //
 // Per-package invocations are required because `go test -run` applies its
 // regex independently per package and `-failfast` does not short-circuit
@@ -689,30 +755,10 @@ func (w *Worker) buildTestArgs(m mutator.Mutant, short bool, timeout time.Durati
 // same-named tests and run every package even after one already killed the
 // mutant. The mutant's own package is ordered first so the cheapest, most
 // likely killer runs before any cross-package suite.
-func (w *Worker) testInvocations(m mutator.Mutant, short bool, timeout time.Duration) [][]string {
-	groups := map[string][]string{}
-	if w.testMap != nil {
-		for _, ref := range w.testMap.TestRefsFor(m.CoverageFile, m.Line) {
-			groups[ref.Pkg] = append(groups[ref.Pkg], ref.Name)
-		}
-	}
-
-	// No routing info: run the whole of the mutant's own package. (When the
-	// only covering package is the mutant's own, the general loop below
-	// produces the same single invocation, so no special-case is needed.)
-	if len(groups) == 0 {
-		return [][]string{w.buildTestArgs(m, short, timeout)}
-	}
-
-	base := w.baseTestArgs(short, timeout)
+func (w *Worker) invocations(groups map[string][]string, ownPkg string, short bool, timeout time.Duration) [][]string {
 	invs := make([][]string, 0, len(groups))
-	for _, pkg := range orderRoutePackages(groups, m.Pkg) {
-		args := append(slices.Clone(base),
-			fmt.Sprintf("-run=%s", coverage.RunPattern(groups[pkg])), pkg)
-		// User flags trail the package here for the same reason as in
-		// buildTestArgs.
-		args = append(args, w.testFlags...)
-		invs = append(invs, args)
+	for _, pkg := range orderRoutePackages(groups, ownPkg) {
+		invs = append(invs, w.pkgTestArgs(pkg, groups[pkg], short, timeout))
 	}
 	return invs
 }
@@ -729,7 +775,7 @@ func orderRoutePackages(groups map[string][]string, ownPkg string) []string {
 		}
 	}
 	slices.Sort(rest)
-	if groups[ownPkg] != nil {
+	if _, ok := groups[ownPkg]; ok {
 		return append([]string{ownPkg}, rest...)
 	}
 	return rest

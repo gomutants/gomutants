@@ -315,6 +315,21 @@ func TestSummaryHidesCachedLineWhenZero(t *testing.T) {
 	}
 }
 
+// TestSummaryRecheckLine: the re-check line shows only when a mutant was
+// re-checked, with how many the re-check killed.
+func TestSummaryRecheckLine(t *testing.T) {
+	var buf bytes.Buffer
+	NewTerminal(&buf, 0, false, false).Summary(&Report{MutantsKilled: 5, MutantsLived: 1, MutantsRechecked: 1, MutantsRecheckKilled: 1})
+	if !strings.Contains(buf.String(), "Re-checked:   1  (1 killed by tests the coverage map missed)\n") {
+		t.Errorf("expected Re-checked line, got %q", buf.String())
+	}
+	buf.Reset()
+	NewTerminal(&buf, 0, false, false).Summary(&Report{MutantsKilled: 5})
+	if strings.Contains(buf.String(), "Re-checked:") {
+		t.Errorf("expected no Re-checked line without re-checks, got %q", buf.String())
+	}
+}
+
 func TestSummaryShowsSuppressedLineWhenNonZero(t *testing.T) {
 	var buf bytes.Buffer
 	term := NewTerminal(&buf, 0, false, false)

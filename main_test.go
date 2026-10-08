@@ -865,29 +865,19 @@ func TestCheckTestFlagsAccepts(t *testing.T) {
 	}
 }
 
-// TestTimeoutPolicyFor covers the config→policy mapping, and in
-// particular the one field that isn't a straight read: Unmeasured must
-// track whether --test-flags is in effect. The timing phase never sees
-// those flags, so with them set the recorded durations describe different
-// work than the deadline is being sized for — a `-race` run given a
-// no-race deadline turns survivors into TIMED_OUT, which drops them out
-// of the efficacy denominator instead of into it. STATEMENT_REMOVE on any
-// assignment here leaves that field zero.
+// TestTimeoutPolicyFor covers the config→policy mapping. --test-flags no
+// longer changes it: the per-test timings are measured with the same
+// flags as the mutant runs, so they can size deadlines either way.
+// Compared as a whole struct so a STATEMENT_REMOVE on any assignment in
+// timeoutPolicyFor shows up, without a per-field if apiece.
 func TestTimeoutPolicyFor(t *testing.T) {
 	const (
 		global = 42 * time.Second
 		margin = 2.5
 		floor  = 3 * time.Second
 	)
-	// want is the expected policy with only the two derived switches left
-	// to vary; the three pass-through fields are the same every time.
-	// Compared as a whole struct so a STATEMENT_REMOVE on any assignment
-	// in timeoutPolicyFor shows up, without a per-field if apiece.
-	want := func(adaptive, unmeasured bool) runner.TimeoutPolicy {
-		return runner.TimeoutPolicy{
-			Global: global, Margin: margin, Min: floor,
-			Adaptive: adaptive, Unmeasured: unmeasured,
-		}
+	want := func(adaptive bool) runner.TimeoutPolicy {
+		return runner.TimeoutPolicy{Global: global, Margin: margin, Min: floor, Adaptive: adaptive}
 	}
 	off := false
 	cases := []struct {
@@ -895,14 +885,9 @@ func TestTimeoutPolicyFor(t *testing.T) {
 		cfg  config.Config
 		want runner.TimeoutPolicy
 	}{
-		{"no test flags", config.Config{}, want(true, false)},
-		{"test flags set", config.Config{TestFlags: "-race"}, want(true, true)},
-		// Whitespace-only is not a flag: the runner appends nothing, so
-		// giving up adaptive sizing here would cost speed for nothing.
-		{"whitespace-only test flags", config.Config{TestFlags: "   "}, want(true, false)},
-		// The two switches are independent — a --test-flags run with
-		// adaptive already off must not read as adaptive.
-		{"adaptive off with test flags", config.Config{TestFlags: "-short", AdaptiveTimeout: &off}, want(false, true)},
+		{"no test flags", config.Config{}, want(true)},
+		{"test flags set", config.Config{TestFlags: "-race"}, want(true)},
+		{"adaptive off", config.Config{TestFlags: "-short", AdaptiveTimeout: &off}, want(false)},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1614,7 +1599,7 @@ func TestRunBuildTestMapWarningOnError(t *testing.T) {
 
 	origBuild := buildTestMapFunc
 	defer func() { buildTestMapFunc = origBuild }()
-	buildTestMapFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ int) (*coverage.TestMap, error) {
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
 		return nil, errors.New("inject build-test-map failure")
 	}
 
@@ -1642,6 +1627,285 @@ func TestRunBuildTestMapWarningOnError(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Building per-test coverage map... skipped") {
 		t.Errorf("stdout missing 'skipped' PhaseDone; got: %q — CONDITIONALS_NEGATION on `err != nil` flips the branch", out.String())
+	}
+}
+
+// TestRunBuildTestMapErrorStopsCrossPkgRun: with -coverpkg, a mutant's
+// verdict rests on the suites of the packages whose tests link it, which
+// only the map knows. Without it each mutant would run its own package
+// alone, and one only an importer's tests kill would read LIVED: the run
+// stops with the map's error instead of going on to report it.
+func TestRunBuildTestMapErrorStopsCrossPkgRun(t *testing.T) {
+	dir := setupTinyProject(t)
+	t.Chdir(dir)
+
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	boom := errors.New("inject build-test-map failure")
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
+		return nil, boom
+	}
+
+	var out, errBuf bytes.Buffer
+	origStdout := stdout
+	origStderr := stderr
+	stdout = &out
+	stderr = &errBuf
+	defer func() {
+		stdout = origStdout
+		stderr = origStderr
+	}()
+
+	reportPath := filepath.Join(dir, "report.json")
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--coverpkg", "testmod",
+		"-w", "1",
+		"-o", reportPath,
+		"testmod",
+	})
+	if !errors.Is(err, boom) || !strings.HasPrefix(err.Error(), "per-test coverage map: ") {
+		t.Errorf("run = %v, want the map's error", err)
+	}
+	if _, serr := os.Stat(reportPath); !errors.Is(serr, os.ErrNotExist) {
+		t.Errorf("report written after the map failed: %v", serr)
+	}
+}
+
+// TestRunBuildTestMapWarnings: what the map lost while building without
+// failing reaches stderr, each warning on its own line, and the phase
+// still reads as done.
+func TestRunBuildTestMapWarnings(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
+		return coverage.NewTestMapForTesting(nil, nil).WithWarningsForTesting("first lost", "second lost"), nil
+	}
+
+	var out, errBuf bytes.Buffer
+	origStdout := stdout
+	origStderr := stderr
+	stdout = &out
+	stderr = &errBuf
+	defer func() {
+		stdout = origStdout
+		stderr = origStderr
+	}()
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if want := "warning: per-test coverage map: first lost\nwarning: per-test coverage map: second lost\n"; !strings.Contains(errBuf.String(), want) {
+		t.Errorf("stderr = %q, want it to contain %q", errBuf.String(), want)
+	}
+	if !strings.Contains(out.String(), "Building per-test coverage map... done") {
+		t.Errorf("stdout missing 'done' PhaseDone; got: %q", out.String())
+	}
+}
+
+// TestRunBuildTestMapInterrupted: an interrupt during the per-test map
+// stops the run with the cancellation, rather than reading as a map
+// failure and going on without one.
+func TestRunBuildTestMapInterrupted(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
+		cancel()
+		return nil, context.Canceled
+	}
+
+	var out, errBuf bytes.Buffer
+	origStdout := stdout
+	origStderr := stderr
+	stdout = &out
+	stderr = &errBuf
+	defer func() {
+		stdout = origStdout
+		stderr = origStderr
+	}()
+
+	err := run(ctx, []string{
+		"--only", "ARITHMETIC_BASE",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("run = %v, want the cancellation", err)
+	}
+	if strings.Contains(errBuf.String(), "per-test coverage map failed") {
+		t.Errorf("stderr reads as a map failure: %q", errBuf.String())
+	}
+}
+
+// TestRunBuildTestMapGetsTestTimeout pins that the per-test coverage runs
+// are bounded by the suite ceiling (baseline × coefficient). A bare test
+// binary has no timeout of its own, so dropping this would let a test that
+// hangs when run alone block the coverage phase forever.
+func TestRunBuildTestMapGetsTestTimeout(t *testing.T) {
+	t.Setenv("GOMUTANTS_TEST_SHORT", "1")
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	origM := measureBaselineFunc
+	defer func() { measureBaselineFunc = origM }()
+	measureBaselineFunc = func(context.Context, string, []string, string, []string) (time.Duration, error) {
+		return 3 * time.Second, nil
+	}
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	var got coverage.BuildOptions
+	buildTestMapFunc = func(_ context.Context, _ string, _ []string, opts coverage.BuildOptions) (*coverage.TestMap, error) {
+		got = opts
+		return nil, errors.New("stop after capturing options")
+	}
+
+	if _, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{
+			"--only", "ARITHMETIC_BASE", "-w", "1", "--timeout-coefficient", "4", "--test-cpu", "1", "--test-flags=-count=1",
+			"-o", filepath.Join(dir, "r.json"), "testmod",
+		})
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if got.TestTimeout != 12*time.Second {
+		t.Errorf("BuildTestMap TestTimeout = %v, want 12s (3s baseline × coefficient 4)", got.TestTimeout)
+	}
+	if got.Workers != 1 || got.TmpDir == "" {
+		t.Errorf("BuildTestMap options = %+v, want Workers 1 and a TmpDir", got)
+	}
+	if !slices.Equal(got.TestFlags, []string{"-cpu=1", "-short", "-count=1"}) {
+		t.Errorf("BuildTestMap TestFlags = %q, want --test-cpu's -cpu, the runner's -short, then --test-flags", got.TestFlags)
+	}
+}
+
+// TestCoverageTestFlags: -cpu for --test-cpu, then -short when the runner
+// adds it, go before the user's flags, as in the mutant runs' argument
+// order.
+func TestCoverageTestFlags(t *testing.T) {
+	user := []string{"-count=1", "-args", "-x"}
+	if got := coverageTestFlags(user, false, 0); !slices.Equal(got, user) {
+		t.Errorf("short=false: %q, want %q", got, user)
+	}
+	if got := coverageTestFlags(user, true, 0); !slices.Equal(got, []string{"-short", "-count=1", "-args", "-x"}) {
+		t.Errorf("short=true: %q, want -short prepended", got)
+	}
+	if got := coverageTestFlags(user, true, 2); !slices.Equal(got, []string{"-cpu=2", "-short", "-count=1", "-args", "-x"}) {
+		t.Errorf("testCPU=2: %q, want -cpu=2 then -short prepended", got)
+	}
+}
+
+// TestRunRechecksOrderDependentSurvivor is the end-to-end gate for a test
+// that covers a line only after another test has run: TestCheck skips
+// alone, so the map routes Max's mutants to TestWeak, which passes them.
+// The re-check against the whole package runs TestCheck after TestSetup
+// and kills them, where routing alone reported them LIVED.
+func TestRunRechecksOrderDependentSurvivor(t *testing.T) {
+	dir := t.TempDir()
+	for name, content := range map[string]string{
+		"go.mod": "module testmod\n\ngo 1.26\n",
+		"max.go": "package testmod\n\nfunc Max(a, b int) int {\n\tif a > b {\n\t\treturn a\n\t}\n\treturn b\n}\n",
+		"max_test.go": "package testmod\n\nimport \"testing\"\n\nvar ready bool\n\n" +
+			"func TestSetup(t *testing.T) { ready = true }\n\n" +
+			"func TestWeak(t *testing.T) { _ = Max(2, 1) }\n\n" +
+			"func TestCheck(t *testing.T) {\n\tif !ready {\n\t\tt.Skip(\"needs TestSetup\")\n\t}\n" +
+			"\tif Max(2, 1) != 2 || Max(1, 2) != 2 {\n\t\tt.Fatal(\"max\")\n\t}\n}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	outPath := filepath.Join(dir, "r.json")
+	out, err := captureOutput(t, func() error {
+		return run(context.Background(), []string{"--only", "CONDITIONALS_NEGATION", "-w", "1", "-o", outPath, "./..."})
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	data, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatalf("reading report: %v", err)
+	}
+	var r struct {
+		MutantsKilled        int `json:"mutants_killed"`
+		MutantsLived         int `json:"mutants_lived"`
+		MutantsRechecked     int `json:"mutants_rechecked"`
+		MutantsRecheckKilled int `json:"mutants_recheck_killed"`
+	}
+	if err := json.Unmarshal(data, &r); err != nil {
+		t.Fatalf("parsing report: %v", err)
+	}
+	if r.MutantsKilled != 1 || r.MutantsLived != 0 || r.MutantsRechecked != 1 || r.MutantsRecheckKilled != 1 {
+		t.Errorf("report = %+v, want the one mutant killed by its re-check", r)
+	}
+	if !strings.Contains(out, "Re-checked:   1  (1 killed by tests the coverage map missed)") {
+		t.Errorf("summary lacks the re-check line; got:\n%s", out)
+	}
+}
+
+// TestTestFilesResolverAddsSuitePackages: every package suite a survivor
+// is re-checked against decides its verdict through every file, so they
+// all key the cache; the mutant's own package is left to the production
+// dimension.
+func TestTestFilesResolverAddsSuitePackages(t *testing.T) {
+	target := t.TempDir()
+	importer := t.TempDir()
+	for path, src := range map[string]string{
+		filepath.Join(target, "calc.go"):       "package calc\n",
+		filepath.Join(target, "calc_test.go"):  "package calc\n\nimport \"testing\"\n\nfunc TestCalc(t *testing.T) {}\n",
+		filepath.Join(importer, "app.go"):      "package app\n",
+		filepath.Join(importer, "app_test.go"): "package app\n\nimport \"testing\"\n\nfunc TestApp(t *testing.T) {}\n",
+	} {
+		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ti := cache.BuildTestIndex([]string{target, importer})
+	m := mutator.Mutant{Pkg: "m/calc", File: filepath.Join(target, "calc.go"), CoverageFile: "m/calc/calc.go", Line: 1}
+	base := func(files []string) []string {
+		var names []string
+		for _, f := range files {
+			names = append(names, filepath.Base(f))
+		}
+		slices.Sort(names)
+		return names
+	}
+
+	suites := []coverage.Package{{ImportPath: "m/calc", Dir: target}, {ImportPath: "m/app", Dir: importer}}
+	cross := coverage.NewTestMapForTesting(nil, nil).WithSuitesForTesting(true, nil, suites...)
+	if got := base(testFilesResolver(ti, cross, true)(m)); !slices.Equal(got, []string{"app.go", "app_test.go", "calc_test.go"}) {
+		t.Errorf("linking importer: files = %v, want the importer's files plus the own test file", got)
+	}
+	own := coverage.NewTestMapForTesting(nil, nil).WithSuitesForTesting(false, nil, suites...)
+	if got := base(testFilesResolver(ti, own, false)(m)); !slices.Equal(got, []string{"calc_test.go"}) {
+		t.Errorf("own-package coverage: files = %v, want only the own test file", got)
+	}
+	if got := base(testFilesResolver(ti, nil, false)(m)); !slices.Equal(got, []string{"calc_test.go"}) {
+		t.Errorf("nil map: files = %v, want only the own test file", got)
 	}
 }
 
@@ -2522,5 +2786,18 @@ func TestEmbedFilesByDir(t *testing.T) {
 	}
 	if !slices.Equal(got["/m/a"], []string{"data/schema.json", "tmpl/x.tmpl"}) {
 		t.Errorf("got[\"/m/a\"] = %v, want both embed inputs", got["/m/a"])
+	}
+}
+
+// TestSuiteDirs: the directory of each suite in the map's scope, in order;
+// a nil map, as when it failed to build, has none.
+func TestSuiteDirs(t *testing.T) {
+	if got := suiteDirs(nil); got != nil {
+		t.Errorf("suiteDirs(nil) = %v, want nil", got)
+	}
+	tm := coverage.NewTestMapForTesting(nil, nil).WithSuitesForTesting(true, nil,
+		coverage.Package{ImportPath: "m/b", Dir: "/b"}, coverage.Package{ImportPath: "m/a", Dir: "/a"})
+	if got, want := suiteDirs(tm), []string{"/a", "/b"}; !slices.Equal(got, want) {
+		t.Errorf("suiteDirs = %v, want %v", got, want)
 	}
 }

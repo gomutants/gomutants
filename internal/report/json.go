@@ -29,6 +29,11 @@ import (
 // MutantsInfraError counts mutants for which environmental resource or I/O
 // failure prevented a verdict. They stay in MutantsTotal and mutation
 // coverage, but count as neither KILLED nor LIVED for TestEfficacy.
+// MutantsRechecked counts mutants their covering tests didn't kill that
+// were then run against every test suite that can kill them, and
+// MutantsRecheckKilled those of them that re-check killed: survivors the
+// per-test coverage map would have reported, a sign of tests that depend
+// on running after others.
 type Report struct {
 	GoModule          string       `json:"go_module"`
 	Files             []FileReport `json:"files"`
@@ -48,6 +53,8 @@ type Report struct {
 	// Generate, since only it knows the split.
 	MutantsSuppressedByCalls int            `json:"mutants_suppressed_by_calls,omitempty"`
 	MutantsEquivalent        int            `json:"mutants_equivalent,omitempty"`
+	MutantsRechecked         int            `json:"mutants_rechecked,omitempty"`
+	MutantsRecheckKilled     int            `json:"mutants_recheck_killed,omitempty"`
 	ElapsedTime              float64        `json:"elapsed_time"`
 	MutatorStatistics        map[string]int `json:"mutator_statistics"`
 }
@@ -76,6 +83,40 @@ type MutationReport struct {
 	Replacement string `json:"replacement,omitempty"`
 }
 
+// count adds m to the report's totals: overall, by status, and the
+// cache and re-check counts. Split out of Generate to keep it within the
+// cognitive-complexity budget.
+func (r *Report) count(m mutator.Mutant) {
+	r.MutantsTotal++
+
+	if m.FromCache {
+		r.MutantsCached++
+	}
+	if m.Rechecked {
+		r.MutantsRechecked++
+		if m.Status == mutator.StatusKilled {
+			r.MutantsRecheckKilled++
+		}
+	}
+
+	switch m.Status {
+	case mutator.StatusKilled:
+		r.MutantsKilled++
+	case mutator.StatusLived:
+		r.MutantsLived++
+	case mutator.StatusNotViable:
+		r.MutantsNotViable++
+	case mutator.StatusNotCovered:
+		r.MutantsNotCovered++
+	case mutator.StatusTimedOut:
+		r.MutantsTimedOut++
+	case mutator.StatusInfraError:
+		r.MutantsInfraError++
+	case mutator.StatusEquivalent:
+		r.MutantsEquivalent++
+	}
+}
+
 // Generate builds a Report from the list of mutants. suppressedCount
 // is the number of mutants dropped before this point by
 // `// gomutants:disable*` directives or by --exclude-calls — they are not
@@ -92,28 +133,7 @@ func Generate(mutants []mutator.Mutant, goModule string, elapsed time.Duration, 
 	fileMap := make(map[string][]MutationReport)
 
 	for _, m := range mutants {
-		r.MutantsTotal++
-
-		if m.FromCache {
-			r.MutantsCached++
-		}
-
-		switch m.Status {
-		case mutator.StatusKilled:
-			r.MutantsKilled++
-		case mutator.StatusLived:
-			r.MutantsLived++
-		case mutator.StatusNotViable:
-			r.MutantsNotViable++
-		case mutator.StatusNotCovered:
-			r.MutantsNotCovered++
-		case mutator.StatusTimedOut:
-			r.MutantsTimedOut++
-		case mutator.StatusInfraError:
-			r.MutantsInfraError++
-		case mutator.StatusEquivalent:
-			r.MutantsEquivalent++
-		}
+		r.count(m)
 
 		// Mutator statistics use lower_snake_case keys.
 		statKey := strings.ToLower(string(m.Type))

@@ -95,6 +95,45 @@ func TestIntegrationCrossPackageRouting(t *testing.T) {
 	}
 }
 
+// TestIntegrationKillsWithoutRoutes: under --integration, a per-test map
+// that can route nothing still decides which suites run. calc here has no
+// tests of its own, and app's tests can't be listed (its TestMain refuses
+// -test.list), so no mutant routes anywhere. The map was dropped, and each
+// calc mutant then ran only `go test ./calc/`, which has no test files and
+// passes, reading LIVED although app's test kills it.
+func TestIntegrationKillsWithoutRoutes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	dir := writeCrossPkgModule(t)
+	if err := os.Remove(filepath.Join(dir, "calc", "calc_test.go")); err != nil {
+		t.Fatal(err)
+	}
+	mainTest := "package app\n\nimport (\n\t\"flag\"\n\t\"os\"\n\t\"testing\"\n)\n\n" +
+		"func TestMain(m *testing.M) {\n\tflag.Parse()\n" +
+		"\tif flag.Lookup(\"test.list\").Value.String() != \"\" {\n\t\tos.Exit(3)\n\t}\n" +
+		"\tos.Exit(m.Run())\n}\n"
+	if err := os.WriteFile(filepath.Join(dir, "app", "main_test.go"), []byte(mainTest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+
+	out := filepath.Join(t.TempDir(), "report.json")
+	if err := run(context.Background(), []string{
+		"-o", out,
+		"--only", "ARITHMETIC_BASE",
+		"--cache=off",
+		"--integration",
+		"./calc/",
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if r := loadReport(t, out); r.MutantsKilled != 1 || r.MutantsLived != 0 {
+		t.Fatalf("killed=%d lived=%d, want killed=1 lived=0 (app's suite must still run)", r.MutantsKilled, r.MutantsLived)
+	}
+}
+
 // TestIntegrationCoverpkgConflict pins the guard that --integration and
 // --coverpkg cannot be combined: integration mode computes -coverpkg itself.
 func TestIntegrationCoverpkgConflict(t *testing.T) {
