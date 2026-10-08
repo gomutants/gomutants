@@ -255,14 +255,24 @@ func NewHasher(srcCache map[string][]byte) *Hasher {
 // coverage-key calc runs before discovery) and want subsequent File()
 // calls to skip the disk read.
 //
-// Every memoized file and directory hash is dropped. They were read from
+// The memoized hash of every file srcCache holds is dropped, and so is the
+// directory hash of every package one of them sits in. They were read from
 // disk before srcCache was, possibly before an edit srcCache now holds, and
-// a verdict measured on srcCache's bytes must be keyed on those bytes —
-// not on a version of the file that was never tested.
+// a verdict measured on srcCache's bytes must be keyed on those bytes — not
+// on a version of the file that was never tested.
+//
+// Every other memo is kept. srcCache holds production sources only, so a
+// test file's hash taken by the coverage-key calc stays the one the cache
+// entries are stored under: a snapshot from before any mutant ran, which an
+// edit to the test mid-run can only turn into a miss on the next run. A
+// re-hash at write time would instead record the edited test against a
+// verdict measured on the old one, and replay that verdict.
 func (h *Hasher) SetSrcCache(srcCache map[string][]byte) {
 	h.srcCache = srcCache
-	h.files = make(map[string]string)
-	h.dirs = make(map[string]string)
+	for p := range srcCache {
+		delete(h.files, p)
+		delete(h.dirs, filepath.Dir(p))
+	}
 }
 
 // SetEmbedFiles attaches the //go:embed inputs of each package, keyed by

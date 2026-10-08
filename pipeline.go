@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"go/token"
+	"io"
 	"os"
 	"runtime"
 	"slices"
@@ -63,6 +65,14 @@ type mutationRun struct {
 	suppressed     []discover.Suppression
 	callSuppressed []discover.Suppression
 	pendingCount   int
+
+	// --changed-since's repository root and changed line ranges, read
+	// once by changedLines. Under --run-mutant-id both the pre-check and
+	// the discovery after the baseline filter by them, and must agree: a
+	// branch the ref names can move between the two.
+	diffLoaded bool
+	diffRoot   string
+	diffRanges map[string][]discover.LineRange
 
 	// Coverage scope: the patterns `go test` runs, the -coverpkg it
 	// passes, and the directories of the packages those tests live in.
@@ -184,25 +194,41 @@ func (mr *mutationRun) resolvePackages(ctx context.Context) error {
 // The parse is thrown away: discoverMutants parses again after the
 // baseline, so the bytes the overlays patch are no older than the sibling
 // files and the TCE reference build, which both read from disk.
+//
+// discoverMutants parses the same files, so it prints their warnings —
+// an unparseable file, a malformed directive. This check holds them back,
+// and prints them only when it fails and discoverMutants never runs; one
+// may well be why it failed.
 func (mr *mutationRun) checkRunMutantID(ctx context.Context) error {
 	id := mr.cfg.RunMutantID
 	if id == "" {
 		return nil
 	}
-	scope := discover.ScopeToStableID(mr.pkgs, id, mr.projectDir)
+	scope := mr.discoveryPkgs()
 	if !slices.ContainsFunc(scope, func(p discover.Package) bool { return len(p.GoFiles) > 0 }) {
 		return usageError(fmt.Errorf(
 			"no mutant matches --run-mutant-id %q: no source file in the resolved packages has a path it could name; check the package argument and that the id came from a report for this revision",
 			id))
 	}
+	var warnings bytes.Buffer
+	err := mr.resolveEarlyTarget(ctx, scope, &warnings)
+	if err != nil {
+		_, _ = stderr.Write(warnings.Bytes())
+	}
+	return err
+}
+
+// resolveEarlyTarget is checkRunMutantID's parse and filters, with every
+// warning written to warn.
+func (mr *mutationRun) resolveEarlyTarget(ctx context.Context, scope []discover.Package, warn io.Writer) error {
+	id := mr.cfg.RunMutantID
 	fset := token.NewFileSet()
-	found := discover.Discover(fset, scope, mr.enabledMutators, mr.projectDir, mr.goModule)
+	found := discover.DiscoverTo(fset, scope, mr.enabledMutators, mr.projectDir, mr.goModule, warn)
 	target, err := discover.FilterByStableID(found.Mutants, id)
 	if err != nil {
 		return usageError(err)
 	}
-	// Silent: discoverMutants filters this file again and warns there.
-	kept, suppressed, _, err := mr.filterBySource(ctx, fset, target, found.Files, false)
+	kept, suppressed, _, err := mr.filterBySource(ctx, fset, target, found.Files, warn)
 	if err != nil {
 		return err
 	}
@@ -211,6 +237,18 @@ func (mr *mutationRun) checkRunMutantID(ctx context.Context) error {
 	}
 	mr.earlyTarget = target[0]
 	return nil
+}
+
+// discoveryPkgs is what discovery parses: every resolved package, narrowed
+// under --run-mutant-id to the files the id could name. No other file can
+// hold the target, and the narrowed set yields the identical mutant (see
+// ScopeToStableID), so the run need not parse and walk the whole module
+// to keep one mutant of it.
+func (mr *mutationRun) discoveryPkgs() []discover.Package {
+	if mr.cfg.RunMutantID == "" {
+		return mr.pkgs
+	}
+	return discover.ScopeToStableID(mr.pkgs, mr.cfg.RunMutantID, mr.projectDir)
 }
 
 // checkSameRunTarget fails when the id, resolved again after the
@@ -366,27 +404,32 @@ func (mr *mutationRun) measureBaseline(ctx context.Context) error {
 func (mr *mutationRun) discoverMutants(ctx context.Context) (map[string]*discover.ParsedFile, error) {
 	mr.term.Phase("Discovering mutants...")
 	fset := token.NewFileSet()
-	found := discover.Discover(fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
+	found := discover.DiscoverTo(fset, mr.discoveryPkgs(), mr.enabledMutators, mr.projectDir, mr.goModule, stderr)
 	mr.mutants = found.Mutants
 	if mr.cfg.RunMutantID != "" {
 		// checkRunMutantID resolved the id against the source as it was
 		// before coverage and the baseline; an edit since can change the
 		// answer. Runs before every other filter so that "no mutant
-		// matches this id" is diagnosed against the full discovered set
+		// matches this id" is diagnosed against everything discovered
 		// rather than against whatever --changed-since happened to leave
 		// behind. Both drop mutants, so the order doesn't change the
 		// intersection.
+		//
+		// Every failure from here on is a runtime error, not a usage one:
+		// checkRunMutantID accepted this id on this command line, so only
+		// the source changing during the run can make it fail now, and
+		// running again is the fix.
 		var err error
 		mr.mutants, err = discover.FilterByStableID(mr.mutants, mr.cfg.RunMutantID)
 		if err != nil {
-			return nil, usageError(err)
+			return nil, err
 		}
 		if err := mr.checkSameRunTarget(mr.mutants[0]); err != nil {
-			return nil, usageError(err)
+			return nil, err
 		}
 	}
 	var err error
-	mr.mutants, mr.suppressed, mr.callSuppressed, err = mr.filterBySource(ctx, fset, mr.mutants, found.Files, true)
+	mr.mutants, mr.suppressed, mr.callSuppressed, err = mr.filterBySource(ctx, fset, mr.mutants, found.Files, stderr)
 	if err != nil {
 		return nil, err
 	}
@@ -410,7 +453,7 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) (map[string]*discove
 	// the filters only drop.
 	if mr.cfg.RunMutantID != "" {
 		if len(mr.mutants) == 0 {
-			return nil, usageError(runMutantDroppedError(mr.cfg.RunMutantID, mr.cfg.ChangedSince, mr.suppressed))
+			return nil, runMutantDroppedError(mr.cfg.RunMutantID, mr.cfg.ChangedSince, mr.suppressed)
 		}
 		mr.runTarget = &mr.mutants[0]
 	}
@@ -432,26 +475,17 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) (map[string]*discove
 // filterBySource applies the filters that need only the source and git:
 // --changed-since, then directives, then --exclude-calls. suppressed holds
 // every mutant the last two dropped, callSuppressed the --exclude-calls
-// share of it. warn=false silences directive warnings, for a pre-check
-// whose files the run filters again.
-func (mr *mutationRun) filterBySource(ctx context.Context, fset *token.FileSet, mutants []mutator.Mutant, files map[string]*discover.ParsedFile, warn bool) (kept []mutator.Mutant, suppressed, callSuppressed []discover.Suppression, err error) {
+// share of it. Directive warnings go to warn.
+func (mr *mutationRun) filterBySource(ctx context.Context, fset *token.FileSet, mutants []mutator.Mutant, files map[string]*discover.ParsedFile, warn io.Writer) (kept []mutator.Mutant, suppressed, callSuppressed []discover.Suppression, err error) {
 	kept = mutants
 	if mr.cfg.ChangedSince != "" {
-		gitRoot, gerr := discover.GitRoot(ctx, mr.projectDir)
-		if gerr != nil {
-			return nil, nil, nil, fmt.Errorf("--changed-since requires a git repository: %w", gerr)
-		}
-		ranges, gerr := discover.RunGitDiff(ctx, mr.projectDir, mr.cfg.ChangedSince)
+		gitRoot, ranges, gerr := mr.changedLines(ctx)
 		if gerr != nil {
 			return nil, nil, nil, gerr
 		}
 		kept = discover.FilterByDiff(kept, ranges, gitRoot)
 	}
-	filterDirectives := discover.FilterByDirectivesWithCache
-	if !warn {
-		filterDirectives = discover.FilterByDirectivesSilently
-	}
-	kept, suppressed, err = filterDirectives(fset, kept, files)
+	kept, suppressed, err = discover.FilterByDirectivesTo(fset, kept, files, warn)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("applying directives: %w", err)
 	}
@@ -459,6 +493,24 @@ func (mr *mutationRun) filterBySource(ctx context.Context, fset *token.FileSet, 
 	// surfaced under --verbose is the one a human wrote at the site.
 	kept, callSuppressed = discover.FilterByCalls(fset, kept, files, mr.filters.callExcluder)
 	return kept, append(suppressed, callSuppressed...), callSuppressed, nil
+}
+
+// changedLines returns the repository root and the line ranges changed
+// since --changed-since, asking git on the first call only.
+func (mr *mutationRun) changedLines(ctx context.Context) (string, map[string][]discover.LineRange, error) {
+	if mr.diffLoaded {
+		return mr.diffRoot, mr.diffRanges, nil
+	}
+	root, err := discover.GitRoot(ctx, mr.projectDir)
+	if err != nil {
+		return "", nil, fmt.Errorf("--changed-since requires a git repository: %w", err)
+	}
+	ranges, err := discover.RunGitDiff(ctx, mr.projectDir, mr.cfg.ChangedSince)
+	if err != nil {
+		return "", nil, err
+	}
+	mr.diffLoaded, mr.diffRoot, mr.diffRanges = true, root, ranges
+	return root, ranges, nil
 }
 
 // printDryRun lists the discovered mutants for --dry-run.
@@ -484,9 +536,10 @@ func (mr *mutationRun) preReadSources(parsed map[string]*discover.ParsedFile) er
 		// Hasher was created early (before PreReadFiles) for the
 		// coverage-key calc; attach the in-memory source map now so
 		// per-mutant Lookup's prodHash calls skip disk reads. It also
-		// drops what the coverage-key calc memoized: those hashes were
-		// read before coverage and the baseline, and the cache entries
-		// must be keyed on the bytes the mutants are measured on.
+		// drops what the coverage-key calc memoized for these files:
+		// those hashes were read before coverage and the baseline, and
+		// the cache entries must be keyed on the bytes the mutants are
+		// measured on.
 		mr.hasher.SetSrcCache(mr.srcCache)
 	}
 	return nil

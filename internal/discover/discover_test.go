@@ -1126,6 +1126,24 @@ func TestDiscoverContinuesPastUnparseable(t *testing.T) {
 	}
 }
 
+// TestDiscoverToWritesWarningsToWriter: the skip warning goes to the
+// writer the caller passed, which is what lets the --run-mutant-id
+// pre-check hold it back instead of printing it twice.
+func TestDiscoverToWritesWarningsToWriter(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "bad.go"), []byte("not valid go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgs := []Package{{Dir: dir, ImportPath: "example.com/bad", GoFiles: []string{"bad.go"}}}
+
+	var warn strings.Builder
+	DiscoverTo(token.NewFileSet(), pkgs, nil, dir, "example.com", &warn)
+	want := "gomutants: skipping unparseable " + filepath.Join(dir, "bad.go") + ": "
+	if !strings.HasPrefix(warn.String(), want) {
+		t.Errorf("warnings = %q, want prefix %q", warn.String(), want)
+	}
+}
+
 // TestPreReadFilesContinuesPastDuplicate kills INVERT_LOOP_CTRL on the
 // `continue` in PreReadFiles (files.go:20). Mutated to `break`, hitting
 // an already-cached path stops the inner file loop, dropping later files

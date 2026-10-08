@@ -151,6 +151,64 @@ func TestHasher_SetSrcCacheDropsDirMemo(t *testing.T) {
 	}
 }
 
+// TestHasher_SetSrcCacheKeepsOtherMemos: a hash memoized for a file the
+// source map does not hold — a test file, hashed by the coverage-key calc
+// before any mutant ran — must survive. Re-reading it at write time would
+// key a verdict measured on the old test under an edit saved mid-run.
+func TestHasher_SetSrcCacheKeepsOtherMemos(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "x.go")
+	test := filepath.Join(dir, "x_test.go")
+	mustWrite(t, src, "package x\n")
+	mustWrite(t, test, "package x // before\n")
+
+	h := NewHasher(nil)
+	before, err := h.File(test)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	mustWrite(t, test, "package x // edited mid-run\n")
+	h.SetSrcCache(map[string][]byte{src: []byte("package x\n")})
+
+	got, err := h.File(test)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if got != before {
+		t.Fatalf("File re-read a file SetSrcCache does not hold; its pre-run hash was dropped")
+	}
+}
+
+// TestHasher_SetSrcCacheKeepsOtherDirMemos: only the directories srcCache
+// has a file in lose their pkg_hash memo.
+func TestHasher_SetSrcCacheKeepsOtherDirMemos(t *testing.T) {
+	root := t.TempDir()
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	for _, d := range []string{a, b} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite(t, filepath.Join(a, "a.go"), "package a\n")
+	mustWrite(t, filepath.Join(b, "b.go"), "package b\n")
+
+	h := NewHasher(nil)
+	before, err := h.HashPkgFiles(b)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	mustWrite(t, filepath.Join(b, "b.go"), "package b // edited\n")
+	h.SetSrcCache(map[string][]byte{filepath.Join(a, "a.go"): []byte("package a\n")})
+
+	got, err := h.HashPkgFiles(b)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	if got != before {
+		t.Fatalf("HashPkgFiles dropped the memo of a directory SetSrcCache holds no file in")
+	}
+}
+
 func TestHashTestFiles_OrderInvariantAndContentSensitive(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a_test.go")

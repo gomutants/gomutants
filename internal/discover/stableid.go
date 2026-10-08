@@ -207,6 +207,10 @@ const maxAmbiguousListed = 5
 // Both failure modes are errors because both mean the run cannot do what
 // was asked, but they carry different messages: an unknown id is usually
 // a scoping mistake, while an ambiguous one just needs more characters.
+//
+// mutants is expected to be what Discover found over ScopeToStableID(pkgs,
+// id), and the no-match message counts it as that: the mutants in the
+// files the id's path could name, not every mutant of the run.
 func FilterByStableID(mutants []mutator.Mutant, id string) ([]mutator.Mutant, error) {
 	for _, m := range mutants {
 		if m.StableID == id {
@@ -226,7 +230,7 @@ func FilterByStableID(mutants []mutator.Mutant, id string) ([]mutator.Mutant, er
 		return matches, nil
 	case 0:
 		return nil, fmt.Errorf(
-			"no mutant matches --run-mutant-id %q among the %d discovered; check the package argument, --only/--disable, and that the id came from a report for this revision",
+			"no mutant matches --run-mutant-id %q among the %d discovered in the files its path could name; check --only/--disable and that the id came from a report for this revision",
 			id, len(mutants))
 	default:
 		return nil, fmt.Errorf(
