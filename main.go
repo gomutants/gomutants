@@ -270,17 +270,18 @@ func run(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	mr := &mutationRun{cfg: cfg, opts: opts, filters: filters}
 
 	packages := opts.packages
 
 	// Determine project directory (current working directory).
-	projectDir, err := getwdFunc()
+	mr.projectDir, err = getwdFunc()
 	if err != nil {
 		return fmt.Errorf("getting working directory: %w", err)
 	}
 
 	// Read go module name from go.mod.
-	goModule, err := readModuleName(projectDir)
+	mr.goModule, err = readModuleName(mr.projectDir)
 	if err != nil {
 		return err
 	}
@@ -291,24 +292,14 @@ func run(ctx context.Context, args []string) error {
 	// of the pipeline treats as "no cache at all". A single Hasher is
 	// reused across the coverage-key calc and Lookup so per-file sha256s
 	// are memoized only once.
-	var (
-		loadedCache  *cache.Cache
-		hasher       *cache.Hasher
-		testFilesFor cache.TestFilesForFn
-		// goToolchain fingerprints the project's `go` (its `go version`
-		// string). It joins the cache metadata gate because EQUIVALENT
-		// verdicts are decided by the compiler, and feeds the coverage-key
-		// toolchain dimension below. Computed once, only when caching is on.
-		goToolchain string
-	)
-	if cfg.Cache != "" {
-		goToolchain = goVersionFunc(ctx)
-		loadedCache = cacheLoadFunc(cfg.Cache, goModule, cacheToolVersion(), cfg.Tags, cfg.CanonicalTestFlags(), goToolchain)
+	if mr.cfg.Cache != "" {
+		mr.goToolchain = goVersionFunc(ctx)
+		mr.loadedCache = cacheLoadFunc(mr.cfg.Cache, mr.goModule, cacheToolVersion(), mr.cfg.Tags, mr.cfg.CanonicalTestFlags(), mr.goToolchain)
 		// Hasher is created before discovery's PreReadFiles so the
 		// coverage-key calc can use it. SetSrcCache is called once
 		// the in-memory source map exists (after step 6), so
 		// per-mutant Lookup's prodHash calls reuse already-loaded bytes.
-		hasher = cache.NewHasher(nil)
+		mr.hasher = cache.NewHasher(nil)
 	}
 
 	// Get enabled mutators. Validate names first so a typo in --only /
@@ -316,8 +307,8 @@ func run(ctx context.Context, args []string) error {
 	// instead of a silent filter miss. EnabledMutators already ignores
 	// unknown names; warning is purely additive.
 	reg := mutator.NewRegistry()
-	unknownOnly := reg.UnknownNames(cfg.Only)
-	unknownDisable := reg.UnknownNames(cfg.Disable)
+	unknownOnly := reg.UnknownNames(mr.cfg.Only)
+	unknownDisable := reg.UnknownNames(mr.cfg.Disable)
 	for _, n := range unknownOnly {
 		fmt.Fprintf(stderr, "gomutants: unknown mutator %q in --only (ignored)\n", n)
 	}
@@ -327,32 +318,33 @@ func run(ctx context.Context, args []string) error {
 	if len(unknownOnly)+len(unknownDisable) > 0 {
 		fmt.Fprintln(stderr, `gomutants: run "gomutants --list-mutators" to see valid mutator names`)
 	}
-	enabledMutators := reg.EnabledMutators(cfg.Only, cfg.Disable)
+	mr.enabledMutators = reg.EnabledMutators(mr.cfg.Only, mr.cfg.Disable)
 
-	term := report.NewTerminal(stdout, 0, cfg.Verbose, cfg.Quiet)
-	term.Header(effectiveVersion(), fmt.Sprintf("%v", packages), cfg.Workers, len(enabledMutators))
+	mr.term = report.NewTerminal(stdout, 0, mr.cfg.Verbose, mr.cfg.Quiet)
+	mr.term.Header(effectiveVersion(), fmt.Sprintf("%v", packages), mr.cfg.Workers, len(mr.enabledMutators))
 
 	// 1. Resolve packages.
-	term.Phase("Resolving packages...")
-	pkgs, err := discover.ResolvePackages(ctx, projectDir, packages, cfg.Tags)
+	mr.term.Phase("Resolving packages...")
+	mr.pkgs, err = discover.ResolvePackages(ctx, mr.projectDir, packages, mr.cfg.Tags)
 	if err != nil {
 		return err
 	}
-	pkgs, excludedFiles := discover.ApplyExcludes(pkgs, filters.excluder, projectDir)
-	if hasher != nil {
+	var excludedFiles int
+	mr.pkgs, excludedFiles = discover.ApplyExcludes(mr.pkgs, mr.filters.excluder, mr.projectDir)
+	if mr.hasher != nil {
 		// Feed the cache's pkg_hash the //go:embed inputs go list resolved
 		// for these packages. Mutants only ever live in the packages
 		// resolved here, so every directory HashPkgFiles is asked about as
 		// a *mutant's* package is covered. Set here, before any Lookup or
 		// Update, so every pkg_hash this run computes carries the
 		// dimension.
-		hasher.SetEmbedFiles(embedFilesByDir(pkgs))
+		mr.hasher.SetEmbedFiles(embedFilesByDir(mr.pkgs))
 	}
-	resolveMsg := fmt.Sprintf("done (%d packages)", len(pkgs))
+	resolveMsg := fmt.Sprintf("done (%d packages)", len(mr.pkgs))
 	if excludedFiles > 0 {
-		resolveMsg = fmt.Sprintf("done (%d packages, %d files excluded)", len(pkgs), excludedFiles)
+		resolveMsg = fmt.Sprintf("done (%d packages, %d files excluded)", len(mr.pkgs), excludedFiles)
 	}
-	term.PhaseDone(resolveMsg)
+	mr.term.PhaseDone(resolveMsg)
 
 	// Resolve --run-mutant-id here, not at step 5. Discovery is pure AST
 	// work over the packages just resolved, so an unknown or ambiguous id
@@ -360,18 +352,14 @@ func run(ctx context.Context, args []string) error {
 	// `go test -cover` plus a baseline run before reporting a typo or a
 	// stale id — on the one flag whose purpose is to avoid paying for the
 	// whole package. The result is carried to step 5 rather than re-parsed.
-	fset := token.NewFileSet()
-	var (
-		discovered *discover.Result
-		mutants    []mutator.Mutant
-	)
-	if cfg.RunMutantID != "" {
-		discovered = discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
+	mr.fset = token.NewFileSet()
+	if mr.cfg.RunMutantID != "" {
+		mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
 		// Runs before every other filter so that "no mutant matches this
 		// id" is diagnosed against the full discovered set rather than
 		// against whatever --changed-since happened to leave behind. Both
 		// drop mutants, so the order doesn't change the intersection.
-		mutants, err = discover.FilterByStableID(discovered.Mutants, cfg.RunMutantID)
+		mr.mutants, err = discover.FilterByStableID(mr.discovered.Mutants, mr.cfg.RunMutantID)
 		if err != nil {
 			return usageError(err)
 		}
@@ -383,35 +371,30 @@ func run(ctx context.Context, args []string) error {
 	// that imports it — with -coverpkg pinned to T so those importing tests
 	// record coverage on the mutated code. Mutant *discovery* stays on T.
 	// Non-integration runs leave the patterns and -coverpkg untouched.
-	coveragePatterns := packages
-	coverPkgEff := cfg.CoverPkg
-	rDirs := dirsOfPackages(pkgs)
-	if cfg.Integration {
-		coveragePatterns, rDirs, coverPkgEff = integrationScope(ctx, projectDir, goModule, pkgs, cfg.Tags, stderr)
+	mr.coveragePatterns = packages
+	mr.coverPkgEff = mr.cfg.CoverPkg
+	mr.rDirs = dirsOfPackages(mr.pkgs)
+	if mr.cfg.Integration {
+		mr.coveragePatterns, mr.rDirs, mr.coverPkgEff = integrationScope(ctx, mr.projectDir, mr.goModule, mr.pkgs, mr.cfg.Tags, stderr)
 	}
 
 	// 2. Create temp directory.
-	tmpDir, err := mkdirTempFunc("", "gomutants-*")
+	mr.tmpDir, err = mkdirTempFunc("", "gomutants-*")
 	if err != nil {
 		return fmt.Errorf("creating temp dir: %w", err)
 	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
+	defer func() { _ = os.RemoveAll(mr.tmpDir) }()
 
 	// 3. Collect coverage. With --cache enabled, the profile is memoized
 	// under a content-hash key that fingerprints every input that can
 	// change `go test -coverprofile` output (sources, go.mod/sum, toolchain,
 	// env, -coverpkg). A key match parses the cached profile in-process and
 	// skips the multi-second `go test` invocation.
-	term.Phase("Collecting coverage...")
-	coverStart := time.Now()
+	mr.term.Phase("Collecting coverage...")
+	mr.coverStart = time.Now()
 
-	var (
-		profile        *coverage.Profile
-		profileBytes   []byte
-		coverageKey    string
-		coverFromCache bool
-	)
-	if loadedCache != nil {
+	var coverFromCache bool
+	if mr.loadedCache != nil {
 		// Hash failures (unreadable file/dir) fall through to a fresh
 		// coverage run rather than aborting — same conservative policy
 		// as the per-mutant Lookup path.
@@ -424,28 +407,28 @@ func run(ctx context.Context, args []string) error {
 			hashDirs []string
 			derr     error
 		)
-		if cfg.Integration {
-			hashDirs = rDirs
+		if mr.cfg.Integration {
+			hashDirs = mr.rDirs
 		} else {
-			hashDirs, derr = coveragePkgDirs(ctx, projectDir, pkgs, coverPkgEff, cfg.Tags)
+			hashDirs, derr = coveragePkgDirs(ctx, mr.projectDir, mr.pkgs, mr.coverPkgEff, mr.cfg.Tags)
 		}
 		if derr == nil {
-			toolchain := fmt.Sprintf("gomutants/%s|go/%s", runtime.Version(), goToolchain)
-			if k, herr := hasher.HashCoverageInputs(hashDirs, projectDir, coverPkgEff, cfg.Tags, cfg.CanonicalTestFlags(), toolchain, captureCoverageEnv()); herr == nil {
-				coverageKey = k
+			toolchain := fmt.Sprintf("gomutants/%s|go/%s", runtime.Version(), mr.goToolchain)
+			if k, herr := mr.hasher.HashCoverageInputs(hashDirs, mr.projectDir, mr.coverPkgEff, mr.cfg.Tags, mr.cfg.CanonicalTestFlags(), toolchain, captureCoverageEnv()); herr == nil {
+				mr.coverageKey = k
 			}
 		}
-		if coverageKey != "" && coverageKey == loadedCache.CoverageKey && loadedCache.CoverageProfile != "" {
-			if p, perr := parseBytesFunc([]byte(loadedCache.CoverageProfile)); perr == nil {
-				profile = p
-				profileBytes = []byte(loadedCache.CoverageProfile)
+		if mr.coverageKey != "" && mr.coverageKey == mr.loadedCache.CoverageKey && mr.loadedCache.CoverageProfile != "" {
+			if p, perr := parseBytesFunc([]byte(mr.loadedCache.CoverageProfile)); perr == nil {
+				mr.profile = p
+				mr.profileBytes = []byte(mr.loadedCache.CoverageProfile)
 				coverFromCache = true
 			}
 		}
 	}
 
-	if profile == nil {
-		profilePath, rerr := runCoverageFunc(ctx, projectDir, coveragePatterns, coverPkgEff, cfg.Tags, tmpDir, cfg.TestFlagFields())
+	if mr.profile == nil {
+		profilePath, rerr := runCoverageFunc(ctx, mr.projectDir, mr.coveragePatterns, mr.coverPkgEff, mr.cfg.Tags, mr.tmpDir, mr.cfg.TestFlagFields())
 		if rerr != nil {
 			return rerr
 		}
@@ -459,64 +442,64 @@ func run(ctx context.Context, args []string) error {
 		if perr != nil {
 			return perr
 		}
-		profile = p
-		profileBytes = bs
+		mr.profile = p
+		mr.profileBytes = bs
 	}
 
 	coverSuffix := ""
 	if coverFromCache {
 		coverSuffix = ", cached"
 	}
-	term.PhaseDone(fmt.Sprintf("done (%s%s)", phaseDurationDisplay(time.Since(coverStart)), coverSuffix))
+	mr.term.PhaseDone(fmt.Sprintf("done (%s%s)", phaseDurationDisplay(time.Since(mr.coverStart)), coverSuffix))
 
 	// 4. Measure baseline test duration.
-	term.Phase("Measuring baseline...")
-	baseline, err := measureBaselineFunc(ctx, projectDir, coveragePatterns, cfg.Tags, cfg.TestFlagFields())
+	mr.term.Phase("Measuring baseline...")
+	baseline, err := measureBaselineFunc(ctx, mr.projectDir, mr.coveragePatterns, mr.cfg.Tags, mr.cfg.TestFlagFields())
 	if err != nil {
 		return err
 	}
-	testTimeout := baseline * time.Duration(cfg.TimeoutCoefficient)
+	mr.testTimeout = baseline * time.Duration(mr.cfg.TimeoutCoefficient)
 	// Distinguish the displayed value: with adaptive sizing, testTimeout
 	// is the upper-bound ceiling, not the deadline every mutant gets.
 	// Without this, users see "timeout: 4m" and assume each mutant has
 	// 4 minutes; in reality fast packages get sub-second deadlines.
 	timeoutLabel := "timeout"
-	if cfg.AdaptiveTimeoutEnabled() {
+	if mr.cfg.AdaptiveTimeoutEnabled() {
 		timeoutLabel = "ceiling"
 	}
-	term.PhaseDone(fmt.Sprintf("done (%s, %s: %s)", phaseDurationDisplay(baseline), timeoutLabel, testTimeout.Round(time.Second)))
+	mr.term.PhaseDone(fmt.Sprintf("done (%s, %s: %s)", phaseDurationDisplay(baseline), timeoutLabel, mr.testTimeout.Round(time.Second)))
 
 	// 5. Discover mutants.
-	term.Phase("Discovering mutants...")
+	mr.term.Phase("Discovering mutants...")
 	// discovered is already set when --run-mutant-id resolved it above,
 	// along with the single mutant it narrowed to.
-	if discovered == nil {
-		discovered = discover.Discover(fset, pkgs, enabledMutators, projectDir, goModule)
-		mutants = discovered.Mutants
+	if mr.discovered == nil {
+		mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
+		mr.mutants = mr.discovered.Mutants
 	}
-	if cfg.ChangedSince != "" {
-		gitRoot, err := discover.GitRoot(ctx, projectDir)
+	if mr.cfg.ChangedSince != "" {
+		gitRoot, err := discover.GitRoot(ctx, mr.projectDir)
 		if err != nil {
 			return fmt.Errorf("--changed-since requires a git repository: %w", err)
 		}
-		ranges, err := discover.RunGitDiff(ctx, projectDir, cfg.ChangedSince)
+		ranges, err := discover.RunGitDiff(ctx, mr.projectDir, mr.cfg.ChangedSince)
 		if err != nil {
 			return err
 		}
-		mutants = discover.FilterByDiff(mutants, ranges, gitRoot)
+		mr.mutants = discover.FilterByDiff(mr.mutants, ranges, gitRoot)
 	}
-	discover.FilterByCoverage(mutants, profile, pkgs, goModule)
+	discover.FilterByCoverage(mr.mutants, mr.profile, mr.pkgs, mr.goModule)
 
-	mutants, suppressed, err := discover.FilterByDirectivesWithCache(fset, mutants, discovered.Files)
+	mr.mutants, mr.suppressed, err = discover.FilterByDirectivesWithCache(mr.fset, mr.mutants, mr.discovered.Files)
 	if err != nil {
 		return fmt.Errorf("applying directives: %w", err)
 	}
 	// Directives run first so that where both could apply, the reason
 	// surfaced under --verbose is the one a human wrote at the site.
-	mutants, callSuppressed := discover.FilterByCalls(fset, mutants, discovered.Files, filters.callExcluder)
-	suppressed = append(suppressed, callSuppressed...)
-	if cfg.Verbose {
-		for _, s := range suppressed {
+	mr.mutants, mr.callSuppressed = discover.FilterByCalls(mr.fset, mr.mutants, mr.discovered.Files, mr.filters.callExcluder)
+	mr.suppressed = append(mr.suppressed, mr.callSuppressed...)
+	if mr.cfg.Verbose {
+		for _, s := range mr.suppressed {
 			reason := s.Reason
 			if reason == "" {
 				reason = "no reason"
@@ -529,24 +512,24 @@ func run(ctx context.Context, args []string) error {
 	// what it found. Without this the run would test nothing, print
 	// "0 found" and exit 0 — indistinguishable, to a script reading the
 	// exit code, from the mutant having been killed.
-	if cfg.RunMutantID != "" && len(mutants) == 0 {
-		return usageError(runMutantDroppedError(cfg.RunMutantID, cfg.ChangedSince, suppressed))
+	if mr.cfg.RunMutantID != "" && len(mr.mutants) == 0 {
+		return usageError(runMutantDroppedError(mr.cfg.RunMutantID, mr.cfg.ChangedSince, mr.suppressed))
 	}
 
-	pendingCount := 0
+	mr.pendingCount = 0
 	notCoveredCount := 0
-	for _, m := range mutants {
+	for _, m := range mr.mutants {
 		switch m.Status {
 		case mutator.StatusPending:
-			pendingCount++
+			mr.pendingCount++
 		case mutator.StatusNotCovered:
 			notCoveredCount++
 		}
 	}
-	term.PhaseDone(fmt.Sprintf("%d found (%d not covered, %d to test)", len(mutants), notCoveredCount, pendingCount))
+	mr.term.PhaseDone(fmt.Sprintf("%d found (%d not covered, %d to test)", len(mr.mutants), notCoveredCount, mr.pendingCount))
 
-	if cfg.DryRun {
-		for _, m := range mutants {
+	if mr.cfg.DryRun {
+		for _, m := range mr.mutants {
 			fmt.Fprintf(stdout, "[%s] %s:%d:%d  %s → %s  (%s)\n",
 				m.Status.String(), m.RelFile, m.Line, m.Col,
 				m.Original, m.Replacement, m.Type)
@@ -555,31 +538,31 @@ func run(ctx context.Context, args []string) error {
 	}
 
 	// 6. Pre-read source files.
-	srcCache, err := preReadFilesFunc(pkgs)
+	mr.srcCache, err = preReadFilesFunc(mr.pkgs)
 	if err != nil {
 		return fmt.Errorf("pre-reading source files: %w", err)
 	}
-	if hasher != nil {
+	if mr.hasher != nil {
 		// Hasher was created early (before PreReadFiles) for the
 		// coverage-key calc; attach the in-memory source map now so
 		// per-mutant Lookup's prodHash calls skip disk reads. Files
 		// hashed during the coverage-key phase remain in the hasher's
 		// internal memo, so this only affects newly seen paths.
-		hasher.SetSrcCache(srcCache)
+		mr.hasher.SetSrcCache(mr.srcCache)
 	}
 
 	// 7. Build per-test coverage map.
-	term.Phase("Building per-test coverage map...")
+	mr.term.Phase("Building per-test coverage map...")
 	// testTimeout also bounds each test's solo coverage run: a test that
 	// can't finish in the suite's ceiling would time out every mutant it
 	// covers anyway, and a bare test binary has no timeout of its own.
-	testMap, err := buildTestMapFunc(ctx, projectDir, coveragePatterns, coverage.BuildOptions{
-		CoverPkg:    coverPkgEff,
-		Tags:        cfg.Tags,
-		TmpDir:      tmpDir,
-		Workers:     cfg.Workers,
-		TestTimeout: testTimeout,
-		TestFlags:   coverageTestFlags(cfg.TestFlagFields(), runner.ShortFlagFromEnv(), cfg.TestCPU),
+	mr.testMap, err = buildTestMapFunc(ctx, mr.projectDir, mr.coveragePatterns, coverage.BuildOptions{
+		CoverPkg:    mr.coverPkgEff,
+		Tags:        mr.cfg.Tags,
+		TmpDir:      mr.tmpDir,
+		Workers:     mr.cfg.Workers,
+		TestTimeout: mr.testTimeout,
+		TestFlags:   coverageTestFlags(mr.cfg.TestFlagFields(), runner.ShortFlagFromEnv(), mr.cfg.TestCPU),
 	})
 	if err != nil {
 		// An interrupt stops the run here, as in every other phase; it
@@ -591,16 +574,16 @@ func run(ctx context.Context, args []string) error {
 		// packages have tests (see coverage.BuildTestMap). Those are
 		// the suites a mutant's verdict rests on beyond its own package's:
 		// without them a mutant only an importer's tests kill reads LIVED.
-		if coverPkgEff != "" {
+		if mr.coverPkgEff != "" {
 			return fmt.Errorf("per-test coverage map: %w", err)
 		}
 		// Non-fatal: fall back to running all tests per mutant.
 		fmt.Fprintf(stderr, "warning: per-test coverage map failed: %v\n", err)
-		testMap = nil
-		term.PhaseDone("skipped (will run all tests per mutant)")
+		mr.testMap = nil
+		mr.term.PhaseDone("skipped (will run all tests per mutant)")
 	} else {
-		term.PhaseDone("done")
-		for _, w := range testMap.Warnings() {
+		mr.term.PhaseDone("done")
+		for _, w := range mr.testMap.Warnings() {
 			fmt.Fprintf(stderr, "warning: per-test coverage map: %s\n", w)
 		}
 	}
@@ -611,7 +594,7 @@ func run(ctx context.Context, args []string) error {
 	// loadedCache + hasher were created at module-read time so the
 	// coverage phase could already consult them — here we just build
 	// the test-files resolver and run the lookup.
-	if loadedCache != nil {
+	if mr.loadedCache != nil {
 		// TestIndex is built from the reverse-dependency closure's directories
 		// (rDirs; equal to the target dirs when integration mode is off) so
 		// cross-package coverage — tests in an importing package exercising a
@@ -620,10 +603,10 @@ func run(ctx context.Context, args []string) error {
 		// (see testFilesResolver), and one need not be in rDirs — a package
 		// --exclude-files emptied is gone from pkgs, but its tests still
 		// run under --coverpkg, and a file the index lacks is in no key.
-		testIndex := cache.BuildTestIndex(slices.Concat(rDirs, suiteDirs(testMap)))
+		testIndex := cache.BuildTestIndex(slices.Concat(mr.rDirs, suiteDirs(mr.testMap)))
 
-		crossPkg := cfg.Integration || cfg.CoverPkg != ""
-		testFilesFor = testFilesResolver(testIndex, testMap, crossPkg)
+		crossPkg := mr.cfg.Integration || mr.cfg.CoverPkg != ""
+		mr.testFilesFor = testFilesResolver(testIndex, mr.testMap, crossPkg)
 
 		// --run-mutant-id skips the lookup, not the resolver above: the
 		// point of naming one mutant is to measure it again after editing
@@ -632,24 +615,24 @@ func run(ctx context.Context, args []string) error {
 		// checkpoint's loadedCache.Update, so the fresh verdict lands in
 		// the cache file as usual.
 		hits := 0
-		if cfg.RunMutantID == "" {
-			hits = loadedCache.Lookup(mutants, hasher, testFilesFor)
+		if mr.cfg.RunMutantID == "" {
+			hits = mr.loadedCache.Lookup(mr.mutants, mr.hasher, mr.testFilesFor)
 		}
 		if hits > 0 {
-			pendingCount -= hits
+			mr.pendingCount -= hits
 			// When equivalence detection is off this run, a cached EQUIVALENT
 			// must not surface — report the survivor honestly as LIVED. The
 			// reuse already validated prod+tests hashes (EQUIVALENT needs a
 			// tests hash), so a LIVED reading is sound.
-			if !cfg.DetectEquivalentEnabled() {
-				for i := range mutants {
-					if mutants[i].Status == mutator.StatusEquivalent {
-						mutants[i].Status = mutator.StatusLived
+			if !mr.cfg.DetectEquivalentEnabled() {
+				for i := range mr.mutants {
+					if mr.mutants[i].Status == mutator.StatusEquivalent {
+						mr.mutants[i].Status = mutator.StatusLived
 					}
 				}
 			}
-			if !cfg.Quiet {
-				fmt.Fprintf(stdout, "Cache: %d mutant outcomes reused from %s\n", hits, cfg.Cache)
+			if !mr.cfg.Quiet {
+				fmt.Fprintf(stdout, "Cache: %d mutant outcomes reused from %s\n", hits, mr.cfg.Cache)
 			}
 		}
 	}
@@ -658,8 +641,8 @@ func run(ctx context.Context, args []string) error {
 	// TimeoutPolicy resolves per-mutant deadlines from the per-test
 	// durations recorded on the testMap, falling back to the global
 	// baseline×coefficient ceiling. testTimeout stays the absolute cap.
-	policy := timeoutPolicyFor(&cfg, testTimeout)
-	term2 := report.NewTerminal(stdout, pendingCount, cfg.Verbose, cfg.Quiet)
+	policy := timeoutPolicyFor(&mr.cfg, mr.testTimeout)
+	term2 := report.NewTerminal(stdout, mr.pendingCount, mr.cfg.Verbose, mr.cfg.Quiet)
 	// Idle "(compiling)" heartbeat so the TTY doesn't sit silent during
 	// the first per-package go-test compile (no OnResult until the first
 	// mutant completes). First OnResult auto-stops it; the defer covers
@@ -672,9 +655,9 @@ func run(ctx context.Context, args []string) error {
 	// re-serialize the (potentially large) profile on every checkpoint.
 	// An empty coverageKey means hashing failed earlier and we silently
 	// fell back to a fresh run; don't poison the cache with a missing key.
-	if loadedCache != nil && coverageKey != "" && len(profileBytes) > 0 {
-		loadedCache.CoverageKey = coverageKey
-		loadedCache.CoverageProfile = string(profileBytes)
+	if mr.loadedCache != nil && mr.coverageKey != "" && len(mr.profileBytes) > 0 {
+		mr.loadedCache.CoverageKey = mr.coverageKey
+		mr.loadedCache.CoverageProfile = string(mr.profileBytes)
 	}
 
 	// 8a. checkpoint flushes completed mutant outcomes to the cache file,
@@ -684,30 +667,29 @@ func run(ctx context.Context, args []string) error {
 	// needed: pool.Run invokes onResult from a single goroutine, so the
 	// mutants-slice reads here are serialized with the collector's writes.
 	// Write failures are non-fatal — a stale cache only costs speed.
-	var lastCheckpoint time.Time
 	checkpoint := func(force bool) {
-		if loadedCache == nil {
+		if mr.loadedCache == nil {
 			return
 		}
-		if !force && cfg.CheckpointInterval <= 0 {
+		if !force && mr.cfg.CheckpointInterval <= 0 {
 			return
 		}
-		if !force && time.Since(lastCheckpoint) < cfg.CheckpointInterval {
+		if !force && time.Since(mr.lastCheckpoint) < mr.cfg.CheckpointInterval {
 			return
 		}
-		loadedCache.Update(mutants, hasher, projectDir, testFilesFor)
-		if err := cacheSaveFunc(loadedCache, cfg.Cache); err != nil {
-			fmt.Fprintf(stderr, "warning: writing cache to %s: %v\n", cfg.Cache, err)
+		mr.loadedCache.Update(mr.mutants, mr.hasher, mr.projectDir, mr.testFilesFor)
+		if err := cacheSaveFunc(mr.loadedCache, mr.cfg.Cache); err != nil {
+			fmt.Fprintf(stderr, "warning: writing cache to %s: %v\n", mr.cfg.Cache, err)
 			return // leave lastCheckpoint stale so the next onResult retries
 		}
-		lastCheckpoint = time.Now()
+		mr.lastCheckpoint = time.Now()
 	}
 
-	pool := runner.NewPool(cfg.Workers, runner.ExecOpts{TestCPU: cfg.TestCPU, Tags: cfg.Tags, TestFlags: cfg.TestFlagFields()}, policy, tmpDir, srcCache, projectDir, testMap)
+	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields()}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
 	// interval into the run, not on the very first mutant.
-	lastCheckpoint = time.Now()
-	pool.Run(ctx, mutants, func(m mutator.Mutant) {
+	mr.lastCheckpoint = time.Now()
+	pool.Run(ctx, mr.mutants, func(m mutator.Mutant) {
 		term2.OnResult(m)
 		checkpoint(false)
 	})
@@ -720,13 +702,13 @@ func run(ctx context.Context, args []string) error {
 	// the detector), so a hard kill mid-pass keeps the equivalence work done
 	// so far. Cached EQUIVALENT survivors stay EQUIVALENT and are skipped
 	// (their Status is no longer LIVED).
-	if cfg.DetectEquivalentEnabled() {
-		term.Phase("Detecting equivalent mutants...")
-		det := tce.NewDetector(projectDir, cfg.Tags, srcCache)
-		equiv := det.Run(ctx, mutants, cfg.Workers, tmpDir, func(mutator.Mutant) {
+	if mr.cfg.DetectEquivalentEnabled() {
+		mr.term.Phase("Detecting equivalent mutants...")
+		det := tce.NewDetector(mr.projectDir, mr.cfg.Tags, mr.srcCache)
+		equiv := det.Run(ctx, mr.mutants, mr.cfg.Workers, mr.tmpDir, func(mutator.Mutant) {
 			checkpoint(false)
 		})
-		term.PhaseDone(fmt.Sprintf("%d equivalent", equiv))
+		mr.term.PhaseDone(fmt.Sprintf("%d equivalent", equiv))
 	}
 
 	// Final flush. force=true bypasses the throttle and the disable
@@ -734,31 +716,31 @@ func run(ctx context.Context, args []string) error {
 	checkpoint(true)
 
 	// 9. Generate report.
-	totalElapsed := time.Since(coverStart)
-	r := report.Generate(mutants, goModule, totalElapsed, len(suppressed))
+	totalElapsed := time.Since(mr.coverStart)
+	r := report.Generate(mr.mutants, mr.goModule, totalElapsed, len(mr.suppressed))
 	// Breakdown only; the aggregate stays in MutantsSuppressed so the two
 	// suppression sources share one bucket everywhere else.
-	r.MutantsSuppressedByCalls = len(callSuppressed)
+	r.MutantsSuppressedByCalls = len(mr.callSuppressed)
 	term2.Summary(r)
 
-	if err := report.WriteJSON(r, cfg.Output); err != nil {
+	if err := report.WriteJSON(r, mr.cfg.Output); err != nil {
 		return fmt.Errorf("writing report: %w", err)
 	}
-	if !cfg.Quiet {
-		fmt.Fprintf(stdout, "Report: %s\n", cfg.Output)
+	if !mr.cfg.Quiet {
+		fmt.Fprintf(stdout, "Report: %s\n", mr.cfg.Output)
 	}
 
 	if opts.strykerOutput != "" {
-		if err := report.WriteStryker(opts.strykerOutput, mutants, projectDir, effectiveVersion()); err != nil {
+		if err := report.WriteStryker(opts.strykerOutput, mr.mutants, mr.projectDir, effectiveVersion()); err != nil {
 			return fmt.Errorf("writing Stryker report: %w", err)
 		}
-		if !cfg.Quiet {
+		if !mr.cfg.Quiet {
 			fmt.Fprintf(stdout, "Stryker report: %s\n", opts.strykerOutput)
 		}
 	}
 
 	if opts.htmlOutput != "" {
-		if err := report.WriteHTML(opts.htmlOutput, mutants, projectDir, effectiveVersion()); err != nil {
+		if err := report.WriteHTML(opts.htmlOutput, mr.mutants, mr.projectDir, effectiveVersion()); err != nil {
 			return fmt.Errorf("writing HTML report: %w", err)
 		}
 		fmt.Fprintf(stdout, "HTML report: %s\n", opts.htmlOutput)
@@ -795,9 +777,9 @@ func run(ctx context.Context, args []string) error {
 	// rather than let a script read it as a kill. mutants holds exactly the
 	// one FilterByStableID returned; anything that empties it has already
 	// returned above.
-	if cfg.RunMutantID != "" {
-		if s := mutants[0].Status; s != mutator.StatusKilled && s != mutator.StatusLived {
-			return fmt.Errorf("--run-mutant-id %q produced no verdict: the mutant is %s", cfg.RunMutantID, s)
+	if mr.cfg.RunMutantID != "" {
+		if s := mr.mutants[0].Status; s != mutator.StatusKilled && s != mutator.StatusLived {
+			return fmt.Errorf("--run-mutant-id %q produced no verdict: the mutant is %s", mr.cfg.RunMutantID, s)
 		}
 	}
 	tested := r.MutantsKilled + r.MutantsLived
