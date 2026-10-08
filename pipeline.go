@@ -48,8 +48,8 @@ type mutationRun struct {
 
 	pkgs []discover.Package
 	// fset and discovered (which holds every parsed AST) are discovery
-	// scratch: discoverMutants clears them once its filters have run, so
-	// they don't stay reachable for the whole mutation run.
+	// scratch: preReadSources clears them once it has taken the source
+	// bytes, so they don't stay reachable for the whole mutation run.
 	fset       *token.FileSet
 	discovered *discover.Result
 	// mutants is set by findMutants, narrowed by discoverMutants's filters,
@@ -172,22 +172,30 @@ func (mr *mutationRun) resolvePackages(ctx context.Context) error {
 	return nil
 }
 
-// findMutants parses the resolved packages for mutants and, under
-// --run-mutant-id, narrows them to the one named. discoverMutants filters
-// the result once coverage is known.
-//
-// It runs before coverage collection: discovery is pure AST work over the
-// packages just resolved, so an unknown or ambiguous id costs nothing to
-// diagnose here. Later, it would charge a full `go test -cover` plus a
-// baseline run before reporting a typo or a stale id — on the one flag
-// whose purpose is to avoid paying for the whole package.
-func (mr *mutationRun) findMutants() error {
+// parseMutants parses the resolved packages and collects every candidate
+// mutant, keeping the parse cache for the filters and preReadSources.
+func (mr *mutationRun) parseMutants() {
 	mr.fset = token.NewFileSet()
 	mr.discovered = discover.Discover(mr.fset, mr.pkgs, mr.enabledMutators, mr.projectDir, mr.goModule)
 	mr.mutants = mr.discovered.Mutants
+}
+
+// findMutants, under --run-mutant-id, parses the resolved packages and
+// narrows the mutants to the one named. discoverMutants filters the result
+// once coverage is known.
+//
+// Only that flag parses this early: discovery is pure AST work over the
+// packages just resolved, so an unknown or ambiguous id costs nothing to
+// diagnose here. Later, it would charge a full `go test -cover` plus a
+// baseline run before reporting a typo or a stale id — on the one flag
+// whose purpose is to avoid paying for the whole package. Every other run
+// parses in discoverMutants, so the parse cache isn't held through
+// coverage and the baseline, and a failed coverage run doesn't pay for it.
+func (mr *mutationRun) findMutants() error {
 	if mr.cfg.RunMutantID == "" {
 		return nil
 	}
+	mr.parseMutants()
 	// Runs before every other filter so that "no mutant matches this id"
 	// is diagnosed against the full discovered set rather than against
 	// whatever --changed-since happened to leave behind. Both drop
@@ -334,12 +342,16 @@ func (mr *mutationRun) measureBaseline(ctx context.Context) error {
 	return nil
 }
 
-// discoverMutants applies the --changed-since, coverage, directive and
-// --exclude-calls filters to the mutants findMutants parsed.
+// discoverMutants parses the packages, unless findMutants already has, and
+// applies the --changed-since, coverage, directive and --exclude-calls
+// filters to the mutants found.
 func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	var err error
 	// 5. Discover mutants.
 	mr.term.Phase("Discovering mutants...")
+	if mr.discovered == nil {
+		mr.parseMutants()
+	}
 	if mr.cfg.ChangedSince != "" {
 		gitRoot, err := discover.GitRoot(ctx, mr.projectDir)
 		if err != nil {
@@ -362,8 +374,6 @@ func (mr *mutationRun) discoverMutants(ctx context.Context) error {
 	// surfaced under --verbose is the one a human wrote at the site.
 	mr.mutants, mr.callSuppressed = discover.FilterByCalls(mr.fset, mr.mutants, mr.discovered.Files, mr.filters.callExcluder)
 	mr.suppressed = append(mr.suppressed, mr.callSuppressed...)
-	// The parsed ASTs are needed by no later phase.
-	mr.fset, mr.discovered = nil, nil
 	if mr.cfg.Verbose {
 		for _, s := range mr.suppressed {
 			reason := s.Reason
@@ -405,12 +415,15 @@ func (mr *mutationRun) printDryRun() {
 	}
 }
 
-// preReadSources loads every production source file into memory once, for
-// the overlays and for cache hashing.
+// preReadSources collects every production source file into memory once,
+// for the overlays and for cache hashing, and releases the parse cache.
 func (mr *mutationRun) preReadSources() error {
 	var err error
-	// 6. Pre-read source files.
-	mr.srcCache, err = preReadFilesFunc(mr.pkgs)
+	// 6. Pre-read source files. The bytes discovery parsed are reused, so
+	// the overlays patch exactly what the mutant offsets were computed on.
+	mr.srcCache, err = preReadFilesFunc(mr.pkgs, mr.discovered.Files)
+	// The parsed ASTs are needed by no later phase.
+	mr.fset, mr.discovered = nil, nil
 	if err != nil {
 		return fmt.Errorf("pre-reading source files: %w", err)
 	}

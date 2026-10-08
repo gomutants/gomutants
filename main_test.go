@@ -1388,7 +1388,7 @@ func TestRunPreReadFilesErrorMessage(t *testing.T) {
 
 	origRead := preReadFilesFunc
 	defer func() { preReadFilesFunc = origRead }()
-	preReadFilesFunc = func([]discover.Package) (map[string][]byte, error) {
+	preReadFilesFunc = func([]discover.Package, map[string]*discover.ParsedFile) (map[string][]byte, error) {
 		return nil, errors.New("inject pre-read failure: marker_klm")
 	}
 
