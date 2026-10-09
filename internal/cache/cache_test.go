@@ -245,7 +245,7 @@ func TestHasher_SetSrcCacheRehashesExcludedSibling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HashPkgFiles: %v", err)
 	}
-	if want := freshPkgHash(t, dir, srcCache, nil); got != want {
+	if got != freshPkgHash(t, dir, srcCache, nil) {
 		t.Fatalf("HashPkgFiles kept the pre-coverage hash of a sibling srcCache does not hold")
 	}
 }
@@ -275,7 +275,7 @@ func TestHasher_SetSrcCacheRehashesEmbedFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HashPkgFiles: %v", err)
 	}
-	if want := freshPkgHash(t, dir, srcCache, embeds); got != want {
+	if got != freshPkgHash(t, dir, srcCache, embeds) {
 		t.Fatalf("HashPkgFiles kept the pre-coverage hash of an embedded file")
 	}
 }
