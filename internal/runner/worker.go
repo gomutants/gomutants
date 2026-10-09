@@ -1017,11 +1017,18 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 // mean the host failed (see infraFromOutput for the narrower reading a
 // test run's output gets). So does a SIGKILL gomutants didn't send.
 //
+// That SIGKILL usually lands on a tool rather than on `go`: the kernel
+// OOM-killer picks the largest RSS, a compiler or linker. `go` survives
+// it, exits 1 with nothing on stdout, and reports the tool's death on
+// stderr mid-line ("pkg.test: …/link: signal: killed"), so stderr is read
+// for it anywhere, not only at the start of a line as unexplainedKill
+// reads a test's output, which the tested code can also write.
+//
 // Priority order:
 //  1. memKilled → TimedOut (RSS monitor SIGKILL'd the build).
 //  2. stderr carries a `file.go:N:N:` compile error → NotViable.
-//  3. a recognized infrastructure signature, or an unexplained SIGKILL →
-//     InfraError.
+//  3. a recognized infrastructure signature, or an unexplained SIGKILL of
+//     `go` or a tool it ran → InfraError.
 //  4. Otherwise → Killed, as such a failure of the whole `go test` read.
 func classifyBuildFailure(runErr error, memKilled bool, stdout, stderr string) mutator.MutantStatus {
 	if memKilled {
@@ -1033,7 +1040,8 @@ func classifyBuildFailure(runErr error, memKilled bool, stdout, stderr string) m
 	lower := strings.ToLower(stdout + "\n" + stderr)
 	if matchesAnySignature(lower, buildPhaseInfraSignatures) ||
 		matchesAnySignature(lower, testPhaseInfraSignatures) ||
-		unexplainedKill(runErr, stdout) {
+		unexplainedKill(runErr, stdout) ||
+		strings.Contains(stderr, sigkillMessage) {
 		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled
