@@ -710,21 +710,65 @@ func TestWorkerTestRecheckStopsAtKill(t *testing.T) {
 // mutants get, as a heavy package's link under --workers contention is.
 const slowLinkDelay = 3 * time.Second
 
-// slowLinkGoflags returns a GOFLAGS value whose -toolexec makes every link
-// sleep slowLinkDelay first. `go` also runs `link -V=full` to identify the
-// tool, which doesn't sleep. Compiles are untouched, so the build cache
-// already holds every package but the module's own.
-func slowLinkGoflags(t *testing.T) string {
+// onLinkGoflags returns a GOFLAGS value whose -toolexec runs the shell
+// command onLink before every link. `go` also runs `link -V=full` to
+// identify the tool, which doesn't run it. Compiles are untouched, so the
+// build cache already holds every package but the module's own.
+func onLinkGoflags(t *testing.T, onLink string) string {
 	t.Helper()
-	wrapper := filepath.Join(t.TempDir(), "slowlink.sh")
+	wrapper := filepath.Join(t.TempDir(), "onlink.sh")
 	script := "#!/bin/sh\n" +
-		"if [ \"$(basename \"$1\")\" = link ] && [ \"$2\" != -V=full ]; then sleep " +
-		strconv.Itoa(int(slowLinkDelay/time.Second)) + "; fi\n" +
+		"if [ \"$(basename \"$1\")\" = link ] && [ \"$2\" != -V=full ]; then " + onLink + "; fi\n" +
 		"exec \"$@\"\n"
 	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return "-toolexec=" + wrapper
+}
+
+// slowLinkGoflags returns a GOFLAGS value that makes every link sleep
+// slowLinkDelay first (see onLinkGoflags).
+func slowLinkGoflags(t *testing.T) string {
+	t.Helper()
+	return onLinkGoflags(t, "sleep "+strconv.Itoa(int(slowLinkDelay/time.Second)))
+}
+
+// addWorker writes a module testmod whose Add is covered by TestAdd, with
+// body as TestAdd's body, and returns a worker on it, its policy, and the
+// mutant that turns Add's + into -. TestAdd ran in 10ms when the map was
+// built, so the mutant's deadline is the policy's 1s floor.
+func addWorker(t *testing.T, body string) (*Worker, TimeoutPolicy, mutator.Mutant) {
+	t.Helper()
+	dir := t.TempDir()
+	// The comment keeps the mutant's build, link included, out of the
+	// build cache of an earlier run.
+	src := fmt.Sprintf("package testpkg\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n\n// %d\n", time.Now().UnixNano())
+	testSrc := "package testpkg\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nvar _ = time.Second\n\n" +
+		"func TestAdd(t *testing.T) {\n\t" + body + "\n}\n"
+	for name, content := range map[string]string{
+		"go.mod": "module testmod\n\ngo 1.26\n", "add.go": src, "add_test.go": testSrc,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tm := coverage.NewTestMapForTesting(
+		map[[2]string]time.Duration{{"testmod", "TestAdd"}: 10 * time.Millisecond},
+		map[string][]coverage.TestRef{"testmod/add.go:4": {{Pkg: "testmod", Name: "TestAdd"}}},
+	)
+	policy := TimeoutPolicy{Global: time.Minute, Margin: 3, Min: time.Second, Adaptive: true}
+	file := filepath.Join(dir, "add.go")
+	w, err := NewWorker(0, t.TempDir(), policy, map[string][]byte{file: []byte(src)}, dir, tm)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	plus := strings.Index(src, "+")
+	m := mutator.Mutant{
+		ID: 1, File: file, Pkg: "testmod", CoverageFile: "testmod/add.go", Line: 4,
+		StartOffset: plus, EndOffset: plus + 1, Replacement: "-",
+		Status: mutator.StatusPending,
+	}
+	return w, policy, m
 }
 
 // TestWorkerTestDeadlineExcludesBuild (#106): the adaptive deadline is
@@ -748,37 +792,7 @@ func TestWorkerTestDeadlineExcludesBuild(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			// The comment keeps the mutant's build, link included, out of
-			// the build cache of an earlier run.
-			src := fmt.Sprintf("package testpkg\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n\n// %d\n", time.Now().UnixNano())
-			testSrc := "package testpkg\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nvar _ = time.Second\n\n" +
-				"func TestAdd(t *testing.T) {\n\t" + tc.test + "\n}\n"
-			for name, body := range map[string]string{
-				"go.mod": "module testmod\n\ngo 1.26\n", "add.go": src, "add_test.go": testSrc,
-			} {
-				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-					t.Fatal(err)
-				}
-			}
-			// TestAdd ran in 10ms when the map was built, so the deadline
-			// is the 1s floor.
-			tm := coverage.NewTestMapForTesting(
-				map[[2]string]time.Duration{{"testmod", "TestAdd"}: 10 * time.Millisecond},
-				map[string][]coverage.TestRef{"testmod/add.go:4": {{Pkg: "testmod", Name: "TestAdd"}}},
-			)
-			policy := TimeoutPolicy{Global: time.Minute, Margin: 3, Min: time.Second, Adaptive: true}
-			file := filepath.Join(dir, "add.go")
-			w, err := NewWorker(0, t.TempDir(), policy, map[string][]byte{file: []byte(src)}, dir, tm)
-			if err != nil {
-				t.Fatalf("NewWorker: %v", err)
-			}
-			plus := strings.Index(src, "+")
-			m := mutator.Mutant{
-				ID: 1, File: file, Pkg: "testmod", CoverageFile: "testmod/add.go", Line: 4,
-				StartOffset: plus, EndOffset: plus + 1, Replacement: "-",
-				Status: mutator.StatusPending,
-			}
+			w, policy, m := addWorker(t, tc.test)
 			if got := w.computeTimeout(m); got != time.Second {
 				t.Fatalf("computeTimeout = %v, want the 1s floor", got)
 			}
@@ -793,5 +807,19 @@ func TestWorkerTestDeadlineExcludesBuild(t *testing.T) {
 				t.Errorf("Test took %v, want under %v: the run's deadline must be the 1s floor", got.Duration.Round(time.Millisecond), limit)
 			}
 		})
+	}
+}
+
+// TestWorkerTestKilledLinkIsInfraError (#106): a linker SIGKILLed from
+// outside — the kernel OOM-killer under a cgroup limit below the RSS
+// monitor's ceiling — fails the build, not the mutant. `go` survives it,
+// exits 1 with nothing on stdout, and reports the tool's death on stderr
+// ("testmod.test: …/link: signal: killed"). Read as KILLED, the false kill
+// would be cached and never re-run.
+func TestWorkerTestKilledLinkIsInfraError(t *testing.T) {
+	t.Setenv("GOFLAGS", onLinkGoflags(t, "kill -KILL $$"))
+	w, _, m := addWorker(t, "_ = Add(1, 2)")
+	if got := w.Test(context.Background(), m); got.Status != mutator.StatusInfraError {
+		t.Errorf("Status=%v, want %v: an outside kill of the linker is no verdict on the mutant", got.Status, mutator.StatusInfraError)
 	}
 }

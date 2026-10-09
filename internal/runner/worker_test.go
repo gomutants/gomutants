@@ -1097,6 +1097,8 @@ func TestClassifyBuildFailure(t *testing.T) {
 		{"generic build-phase signature => infra error", anyErr, false, "", "go: fork/exec compile: resource temporarily unavailable\n", mutator.StatusInfraError},
 		{"test-phase signature => infra error", anyErr, false, "no space left on device\n", "", mutator.StatusInfraError},
 		{"unexplained signal killed => infra error", errors.New("signal: killed"), false, "", "", mutator.StatusInfraError},
+		{"killed linker on stderr => infra error", anyErr, false, "", "testmod.test: /usr/local/go/pkg/tool/linux_amd64/link: signal: killed\n", mutator.StatusInfraError},
+		{"killed compiler on stderr => infra error", anyErr, false, "", "testmod: /usr/local/go/pkg/tool/linux_amd64/compile: signal: killed\n", mutator.StatusInfraError},
 		{"anything else => killed", anyErr, false, "", "go: something unexpected\n", mutator.StatusKilled},
 	}
 	for _, tc := range tests {
