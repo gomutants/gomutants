@@ -5,10 +5,12 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -446,5 +448,91 @@ func TestWorkerTestRecheckStopsAtKill(t *testing.T) {
 	}
 	if want := []string{"m/app", "m/calc"}; !slices.Equal(*started, want) {
 		t.Errorf("runs = %v, want %v: nothing after m/calc's kill", *started, want)
+	}
+}
+
+// slowLinkDelay is how long slowLinkGoflags makes each test binary's link
+// take: well past the 1s deadline TestWorkerTestDeadlineExcludesBuild's
+// mutants get, as a heavy package's link under --workers contention is.
+const slowLinkDelay = 3 * time.Second
+
+// slowLinkGoflags returns a GOFLAGS value whose -toolexec makes every link
+// sleep slowLinkDelay first. `go` also runs `link -V=full` to identify the
+// tool, which doesn't sleep. Compiles are untouched, so the build cache
+// already holds every package but the module's own.
+func slowLinkGoflags(t *testing.T) string {
+	t.Helper()
+	wrapper := filepath.Join(t.TempDir(), "slowlink.sh")
+	script := "#!/bin/sh\n" +
+		"if [ \"$(basename \"$1\")\" = link ] && [ \"$2\" != -V=full ]; then sleep " +
+		strconv.Itoa(int(slowLinkDelay/time.Second)) + "; fi\n" +
+		"exec \"$@\"\n"
+	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return "-toolexec=" + wrapper
+}
+
+// TestWorkerTestDeadlineExcludesBuild (#106): the adaptive deadline is
+// sized from the covering tests' run time, so it must bound running them,
+// not building their binary too. A mutant's `go test` recompiles and
+// relinks its package first, and a heavy package's link under --workers
+// contention outlasts the --timeout-min floor, which the measured rebuild
+// (timed alone, before the mutant runs) doesn't widen enough. A mutant
+// its tests kill, or survive, at once must not be reported TIMED_OUT for
+// that, which drops it from the efficacy denominator. A test that hangs
+// still times out.
+func TestWorkerTestDeadlineExcludesBuild(t *testing.T) {
+	t.Setenv("GOFLAGS", slowLinkGoflags(t))
+	cases := []struct {
+		name string
+		test string
+		want mutator.MutantStatus
+	}{
+		{"killed", "if Add(1, 2) != 3 {\n\t\tt.Fatal(\"add\")\n\t}", mutator.StatusKilled},
+		{"lived", "_ = Add(1, 2)", mutator.StatusLived},
+		{"hangs", "time.Sleep(time.Minute)", mutator.StatusTimedOut},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			// The comment keeps the mutant's build, link included, out of
+			// the build cache of an earlier run.
+			src := fmt.Sprintf("package testpkg\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n\n// %d\n", time.Now().UnixNano())
+			testSrc := "package testpkg\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nvar _ = time.Second\n\n" +
+				"func TestAdd(t *testing.T) {\n\t" + tc.test + "\n}\n"
+			for name, body := range map[string]string{
+				"go.mod": "module testmod\n\ngo 1.26\n", "add.go": src, "add_test.go": testSrc,
+			} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// TestAdd ran in 10ms and the package rebuilt in 100ms when the
+			// map was built, so the deadline is the 1s floor.
+			tm := coverage.NewTestMapForTesting(
+				map[[2]string]time.Duration{{"testmod", "TestAdd"}: 10 * time.Millisecond},
+				map[string][]coverage.TestRef{"testmod/add.go:4": {{Pkg: "testmod", Name: "TestAdd"}}},
+			).WithRebuildsForTesting(map[string]time.Duration{"testmod": 100 * time.Millisecond})
+			policy := TimeoutPolicy{Global: time.Minute, Margin: 3, Min: time.Second, Adaptive: true}
+			file := filepath.Join(dir, "add.go")
+			w, err := NewWorker(0, t.TempDir(), policy, map[string][]byte{file: []byte(src)}, dir, tm)
+			if err != nil {
+				t.Fatalf("NewWorker: %v", err)
+			}
+			plus := strings.Index(src, "+")
+			m := mutator.Mutant{
+				ID: 1, File: file, Pkg: "testmod", CoverageFile: "testmod/add.go", Line: 4,
+				StartOffset: plus, EndOffset: plus + 1, Replacement: "-",
+				Status: mutator.StatusPending,
+			}
+			if got := w.computeTimeout(m); got != time.Second {
+				t.Fatalf("computeTimeout = %v, want the 1s floor", got)
+			}
+			if got := w.Test(context.Background(), m); got.Status != tc.want {
+				t.Errorf("Status=%v after %v, want %v: the %v link must not count against the 1s deadline",
+					got.Status, got.Duration.Round(time.Millisecond), tc.want, slowLinkDelay)
+			}
+		})
 	}
 }
