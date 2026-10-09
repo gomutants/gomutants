@@ -173,6 +173,7 @@ Published release artifacts are append-only and signed. Every release includes:
 **Verify the checksums signature:**
 
 ```bash
+# Releases up to v0.6.1 were signed when the repo lived at szhekpisov/gomutants.
 cosign verify-blob checksums.txt \
   --bundle checksums.txt.sigstore.json \
   --certificate-identity-regexp '^https://github.com/(szhekpisov|gomutants)/gomutants/' \
