@@ -602,11 +602,11 @@ func (w *Worker) runGroups(ctx context.Context, m mutator.Mutant, groups map[str
 		// A package without tests has no binary to run: its `go test`
 		// reports "no test files" and passes.
 		if bin != "" {
-			start := time.Now()
-			if status := w.runBin(ctx, m, run, bin, short, left); status != mutator.StatusLived {
+			status, ran := w.runBin(ctx, m, run, bin, short, left)
+			if status != mutator.StatusLived {
 				return status
 			}
-			left -= time.Since(start)
+			left -= ran
 		}
 	}
 	return mutator.StatusLived
@@ -691,7 +691,10 @@ func (w *Worker) removeBins() {
 // runBin runs bin, the test binary of run.pkg, as `go test` runs it: from
 // the package's directory, filtered to run.tests, with the arguments `go
 // test` passes for the run's flags (see binArgsCache). The run is cut off
-// TIMED_OUT after timeout.
+// TIMED_OUT after timeout. It returns the run's outcome and how long the
+// run took against timeout: from its deadline's start, after the
+// arguments are read, which can wait on another worker's read and is no
+// time the tests took.
 //
 // The binary gets no -test.timeout: it would start its own clock along
 // with the deadline's, and its timeout panic, winning the race, would
@@ -702,17 +705,18 @@ func (w *Worker) removeBins() {
 // Its stderr goes to the same buffer as its stdout, as `go test` merges
 // them: the classifier reads one stream for a test's own failure markers,
 // and a panic is reported on stderr.
-func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) mutator.MutantStatus {
+func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) (mutator.MutantStatus, time.Duration) {
 	dir, ok := w.pkgDir(m, run.pkg)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: no directory known for package %s, treating as %s\n", w.id, run.pkg, mutator.StatusInfraError)
-		return mutator.StatusInfraError
+		return mutator.StatusInfraError, 0
 	}
 	binArgs, err := w.binArgs.get(ctx, w.projectDir, w.tags, run.pkg, w.binFlags(short))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %v, treating as %s\n", w.id, err, mutator.StatusInfraError)
-		return mutator.StatusInfraError
+		return mutator.StatusInfraError, 0
 	}
+	start := time.Now()
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd, output, _ := w.makeCmd(runCtx, bin, dir, runArgs(run.tests, binArgs))
@@ -724,11 +728,11 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 		// A deadline that ran out by the start (the routed run's earlier
 		// packages took all of it) fails the start with it.
 		if runCtx.Err() == context.DeadlineExceeded {
-			return mutator.StatusTimedOut
+			return mutator.StatusTimedOut, time.Since(start)
 		}
-		return w.startFailure(err)
+		return w.startFailure(err), time.Since(start)
 	}
-	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), "", output.truncated)
+	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), "", output.truncated), time.Since(start)
 }
 
 // pkgDir returns the directory pkg's test binary runs from: the mutated
