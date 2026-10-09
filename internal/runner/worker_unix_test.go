@@ -506,20 +506,25 @@ func TestWorkerTestPackageWithoutTests(t *testing.T) {
 }
 
 // TestWorkerTestRunDeadline: the routed run's deadline is shared by the
-// runs of its packages, and is not spent on their builds. Each run takes
-// 0.6s of a 1s deadline: shared, the second is cut off. Each build takes
-// 1.2s: counted, even one would be.
+// runs of its packages, and is not spent on their builds, or on reading
+// the binaries' arguments, which can wait on another worker's read. Each
+// run takes 0.6s of a 1s deadline: shared, the second is cut off. Each
+// build takes 1.2s: counted, even one would be. A 0.6s read and two 0.3s
+// runs: counted, the second run would get 0.1s.
 func TestWorkerTestRunDeadline(t *testing.T) {
 	const calc, app = "m/calc", "m/app"
+	both := []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}, {Pkg: app, Name: "TestApp"}}
 	cases := []struct {
 		name  string
 		refs  []coverage.TestRef
 		build []string
+		args  time.Duration
 		run   []string
 		want  mutator.MutantStatus
 	}{
-		{"builds don't count", []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}}, []string{"sleep", "1.2"}, []string{"true"}, mutator.StatusLived},
-		{"runs share it", []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}, {Pkg: app, Name: "TestApp"}}, []string{"true"}, []string{"sleep", "0.6"}, mutator.StatusTimedOut},
+		{"builds don't count", []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}}, []string{"sleep", "1.2"}, 0, []string{"true"}, mutator.StatusLived},
+		{"reading args doesn't count", both, []string{"true"}, 600 * time.Millisecond, []string{"sleep", "0.3"}, mutator.StatusLived},
+		{"runs share it", both, []string{"true"}, 0, []string{"sleep", "0.6"}, mutator.StatusTimedOut},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -529,6 +534,10 @@ func TestWorkerTestRunDeadline(t *testing.T) {
 				coverage.Package{ImportPath: calc}, coverage.Package{ImportPath: app})
 			w, m := fakeWorker(t, tm, time.Second)
 			fakeBuildsAndRuns(t, func(string) []string { return tc.build }, func(string) []string { return tc.run })
+			testBinaryArgsFunc = func(context.Context, string, string, string, []string) ([]string, error) {
+				time.Sleep(tc.args)
+				return nil, nil
+			}
 			// The re-check of a survivor gets a deadline of its own; only
 			// the routed run is under test.
 			if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, w.computeTimeout(m)); got != tc.want {
