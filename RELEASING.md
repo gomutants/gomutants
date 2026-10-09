@@ -53,7 +53,7 @@ an rc; those track stable releases only.
 Pin both the action ref and the `version` input:
 
 ```yaml
-- uses: szhekpisov/gomutants@v0.5.1-rc0
+- uses: gomutants/gomutants@v0.5.1-rc0
   with:
     version: v0.5.1-rc0
     args: --changed-since origin/main ./...
@@ -109,7 +109,7 @@ everything that shipped through the intervening rcs.
 
    ```bash
    gh release download v0.5.1 --pattern 'gomutants_0.5.1_linux_amd64.tar.gz'
-   gh attestation verify gomutants_0.5.1_linux_amd64.tar.gz --repo szhekpisov/gomutants
+   gh attestation verify gomutants_0.5.1_linux_amd64.tar.gz --repo gomutants/gomutants
    ```
 
 ## If a release fails midway
