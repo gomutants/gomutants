@@ -536,10 +536,10 @@ func (mr *mutationRun) preReadSources(parsed map[string]*discover.ParsedFile) er
 		// Hasher was created early (before PreReadFiles) for the
 		// coverage-key calc; attach the in-memory source map now so
 		// per-mutant Lookup's prodHash calls skip disk reads. It also
-		// drops what the coverage-key calc memoized for these files:
-		// those hashes were read before coverage and the baseline, and
-		// the cache entries must be keyed on the bytes the mutants are
-		// measured on.
+		// drops what the coverage-key calc memoized for production files
+		// and hashes each package again: those hashes were read before
+		// coverage and the baseline, and the cache entries must be keyed
+		// on the inputs the mutants are measured on.
 		mr.hasher.SetSrcCache(mr.srcCache)
 	}
 	return nil
