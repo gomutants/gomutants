@@ -231,13 +231,12 @@ func TestKillPgroupSendsNegativePgid(t *testing.T) {
 // on `killPgroup(pgid)`. Stubbing syscallKillFunc lets us assert the kill
 // was actually issued without sending a real signal that would tear down
 // the test process tree.
+//
+// The test binary is a stand-in that runs for 0.5s, so the monitor polls
+// it several times over. A real one can exit before the first poll: a
+// build's sample alone, which a failed build reads, decides nothing when
+// the build succeeds, as it does here with the kill stubbed out.
 func TestWorkerTestRSSKillsRunaway(t *testing.T) {
-	dir := setupTestProject(t)
-	srcPath := filepath.Join(dir, "add.go")
-	src, _ := os.ReadFile(srcPath)
-	cache := map[string][]byte{srcPath: src}
-	plusIdx := strings.IndexByte(string(src), '+')
-
 	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
 	origPS := psOutputFunc
@@ -262,16 +261,9 @@ func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 		return nil
 	}
 
-	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 30 * time.Second}, cache, dir, nil)
-	if err != nil {
-		t.Fatalf("NewWorker: %v", err)
-	}
-
-	m := mutator.Mutant{
-		ID: 1, File: srcPath, Pkg: "testmod",
-		StartOffset: plusIdx, EndOffset: plusIdx + 1,
-		Replacement: "-", Status: mutator.StatusPending,
-	}
+	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), 30*time.Second)
+	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
+		func(string) []string { return []string{"sleep", "0.5"} })
 	result := w.Test(context.Background(), m)
 	if result.Status != mutator.StatusTimedOut {
 		t.Errorf("Status=%v, want TimedOut — BRANCH_IF on `pgroupRSSBytes > cap` body skips the kill", result.Status)
@@ -547,6 +539,18 @@ func TestWorkerTestRunDeadline(t *testing.T) {
 	}
 }
 
+// failRunStarts makes every start of a test binary fail with err, on top
+// of fakeBuildsAndRuns' stand-ins, which still build.
+func failRunStarts(err error) {
+	fake := startCommandFunc
+	startCommandFunc = func(cmd *exec.Cmd) error {
+		if _, ok := builtBin(cmd.Args); ok {
+			return fake(cmd)
+		}
+		return err
+	}
+}
+
 // TestWorkerTestRunFailures: a run that can't start ends the mutant
 // without a verdict on its tests: a package with no known directory, or
 // binary arguments that can't be read, is an infrastructure error, and a
@@ -579,13 +583,7 @@ func TestWorkerTestRunFailures(t *testing.T) {
 				testBinaryArgsFunc = func(context.Context, string, string, string, []string) ([]string, error) { return nil, tc.args }
 			}
 			if tc.start != nil {
-				fake := startCommandFunc
-				startCommandFunc = func(cmd *exec.Cmd) error {
-					if _, ok := builtBin(cmd.Args); ok {
-						return fake(cmd)
-					}
-					return tc.start
-				}
+				failRunStarts(tc.start)
 			}
 			var got mutator.MutantStatus
 			captured := captureStderr(t, func() {
