@@ -245,6 +245,20 @@ func phaseDurationDisplay(d time.Duration) time.Duration {
 	return d.Round(100 * time.Millisecond)
 }
 
+// runInfoFlag handles the flags that print something instead of running:
+// --version and --list-mutators. done reports whether one was set, and
+// the run ends there.
+func runInfoFlag(opts *cliOptions) (done bool, err error) {
+	if opts.showVersion {
+		fmt.Fprint(stdout, formatVersion())
+		return true, nil
+	}
+	if opts.listMutators {
+		return true, writeMutatorCatalog(stdout, mutator.NewRegistry().Catalog())
+	}
+	return false, nil
+}
+
 func run(ctx context.Context, args []string) error {
 	opts, err := parseFlags(args)
 	if errors.Is(err, flag.ErrHelp) {
@@ -254,12 +268,8 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	if opts.showVersion {
-		fmt.Fprint(stdout, formatVersion())
-		return nil
-	}
-	if opts.listMutators {
-		return writeMutatorCatalog(stdout, mutator.NewRegistry().Catalog())
+	if done, err := runInfoFlag(opts); done {
+		return err
 	}
 
 	cfg, filters, err := loadConfig(opts)
