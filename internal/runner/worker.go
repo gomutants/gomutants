@@ -378,6 +378,10 @@ type overlay struct {
 // still holds open. A var so tests can shorten it.
 var pipeDrainDelay = 5 * time.Second
 
+// buildTimeout bounds building a mutant's test binary (see
+// Worker.buildBin).
+var buildTimeout = 10 * time.Minute
+
 // testBinaryArgsFunc reads the arguments `go test` passes a test binary
 // (see binArgsCache); a var so tests can stub it.
 var testBinaryArgsFunc = coverage.TestBinaryArgs

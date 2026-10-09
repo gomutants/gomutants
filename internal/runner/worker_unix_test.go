@@ -638,6 +638,27 @@ func TestWorkerTestDeadlineKillsProcessGroup(t *testing.T) {
 	}
 }
 
+// TestWorkerTestBuildDeadline: a build that hangs without growing — on a
+// module proxy, a stuck -toolexec — is cut off at buildTimeout with its
+// whole process group, so it can't hold its worker forever, and reads as
+// INFRA ERROR: a host problem, re-run next time rather than cached. With
+// the build unbounded, or `go` alone killed, it would last 3s.
+func TestWorkerTestBuildDeadline(t *testing.T) {
+	origBuild, origDrain := buildTimeout, pipeDrainDelay
+	t.Cleanup(func() { buildTimeout, pipeDrainDelay = origBuild, origDrain })
+	buildTimeout, pipeDrainDelay = 300*time.Millisecond, 10*time.Second
+	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Minute)
+	fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} },
+		func(string) []string { return []string{"true"} })
+	start := time.Now()
+	if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, time.Minute); got != mutator.StatusInfraError {
+		t.Errorf("runGroups = %v, want INFRA ERROR", got)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("runGroups took %v, want the build's group killed at the 300ms build deadline", took)
+	}
+}
+
 // TestWorkerTestDeadlineDrainsBounded: when the group can't be killed, a
 // process the tests started that holds the output open keeps the mutant
 // waiting no longer than pipeDrainDelay past the deadline.
