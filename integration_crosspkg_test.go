@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/szhekpisov/gomutants/internal/report"
+	"github.com/gomutants/gomutants/internal/report"
 )
 
 // writeCrossPkgModule synthesizes a self-contained two-package module:

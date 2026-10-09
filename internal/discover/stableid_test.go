@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // parseSrc parses src as a file named name and returns the AST alongside

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 func parse(t *testing.T, src string) (*token.FileSet, *ast.File, []byte) {

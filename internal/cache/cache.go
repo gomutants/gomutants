@@ -33,7 +33,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // SchemaVersion is the on-disk format version. Bump when Entry shape or

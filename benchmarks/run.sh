@@ -58,7 +58,7 @@ prepare_fixture() {
   cp -R "$REPO_ROOT/internal/mutator" "$WORK_DIR/internal/mutator"
   (
     cd "$WORK_DIR"
-    go mod init github.com/szhekpisov/gomutants >/dev/null
+    go mod init github.com/gomutants/gomutants >/dev/null
     go mod edit -go="${GO_TOOLCHAIN#go}"
     env GOTOOLCHAIN="$GO_TOOLCHAIN" go test ./... >/dev/null
   )

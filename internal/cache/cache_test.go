@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 const (

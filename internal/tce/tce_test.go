@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 func TestNormalizeAsm_StripsHeaderAndTrailingWhitespace(t *testing.T) {

@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // unknownReceiver stands in for a call receiver that isn't a plain

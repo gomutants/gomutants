@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // barWidth is the width of the progress bar in cells. Shared between

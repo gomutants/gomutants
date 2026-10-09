@@ -1,9 +1,9 @@
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/szhekpisov/gomutants/badge)](https://scorecard.dev/viewer/?uri=github.com/szhekpisov/gomutants)
-[![codecov](https://codecov.io/gh/szhekpisov/gomutants/graph/badge.svg?token=XNXMEJDGV2)](https://codecov.io/gh/szhekpisov/gomutants)
-[![Mutation testing badge](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fszhekpisov%2Fgomutants%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/szhekpisov/gomutants/main)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/gomutants/gomutants/badge)](https://scorecard.dev/viewer/?uri=github.com/gomutants/gomutants)
+[![codecov](https://codecov.io/gh/gomutants/gomutants/graph/badge.svg?token=XNXMEJDGV2)](https://codecov.io/gh/gomutants/gomutants)
+[![Mutation testing badge](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fgomutants%2Fgomutants%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/gomutants/gomutants/main)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=gomutants_gomutants&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=gomutants_gomutants)
-[![Security & Static Analysis](https://github.com/szhekpisov/gomutants/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/szhekpisov/gomutants/actions/workflows/security.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/szhekpisov/gomutants.svg)](https://pkg.go.dev/github.com/szhekpisov/gomutants)
+[![Security & Static Analysis](https://github.com/gomutants/gomutants/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/gomutants/gomutants/actions/workflows/security.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/gomutants/gomutants.svg)](https://pkg.go.dev/github.com/gomutants/gomutants)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # gomutants
@@ -97,7 +97,7 @@ These are unchanged-tree reruns, not a claim that all edits are free: editing a 
 ### Go Install
 
 ```bash
-go install github.com/szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
+go install github.com/gomutants/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
 ```
 
 Make sure `$GOPATH/bin` is in your `PATH`:
@@ -116,7 +116,7 @@ gomutants is published as a composite action:
 - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
   with:
     fetch-depth: 0  # required so --changed-since can reach the base ref
-- uses: szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
+- uses: gomutants/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
   with:
     args: --changed-since origin/${{ github.base_ref }} ./...
 ```
@@ -136,13 +136,13 @@ See [`action.yml`](action.yml) for the full composite definition.
 
 ### Direct binary download
 
-Binaries for Linux and macOS (amd64 and arm64) are attached to every [release](https://github.com/szhekpisov/gomutants/releases):
+Binaries for Linux and macOS (amd64 and arm64) are attached to every [release](https://github.com/gomutants/gomutants/releases):
 
 ```bash
 VERSION=0.5.0  # check the releases page for the latest stable
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-curl -fL "https://github.com/szhekpisov/gomutants/releases/download/v${VERSION}/gomutants_${VERSION}_${OS}_${ARCH}.tar.gz" \
+curl -fL "https://github.com/gomutants/gomutants/releases/download/v${VERSION}/gomutants_${VERSION}_${OS}_${ARCH}.tar.gz" \
   | tar -xz
 sudo mv gomutants /usr/local/bin/
 ```
@@ -152,7 +152,7 @@ See [Verifying Releases](#verifying-releases) below to check signatures and prov
 ### From Source
 
 ```bash
-git clone https://github.com/szhekpisov/gomutants.git
+git clone https://github.com/gomutants/gomutants.git
 cd gomutants
 go build ./...
 ./gomutants --version
@@ -173,9 +173,10 @@ Published release artifacts are append-only and signed. Every release includes:
 **Verify the checksums signature:**
 
 ```bash
+# Releases up to v0.6.1 were signed when the repo lived at szhekpisov/gomutants.
 cosign verify-blob checksums.txt \
   --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp 'https://github.com/szhekpisov/gomutants/' \
+  --certificate-identity-regexp '^https://github.com/(szhekpisov|gomutants)/gomutants/' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 
 # Linux
@@ -188,7 +189,7 @@ shasum -a 256 --check checksums.txt --ignore-missing
 
 ```bash
 gh attestation verify gomutants_<VERSION>_linux_amd64.tar.gz \
-  --repo szhekpisov/gomutants
+  --repo gomutants/gomutants
 ```
 
 </details>
@@ -416,7 +417,7 @@ This repo ships a [Claude Code](https://claude.com/claude-code) plugin that expo
 Install:
 
 ```text
-/plugin marketplace add szhekpisov/gomutants
+/plugin marketplace add gomutants/gomutants
 /plugin install gomutants@gomutants
 ```
 
@@ -428,7 +429,7 @@ Use:
 /gomutants:mutants --since HEAD~1     # scope by git ref
 ```
 
-The plugin assumes `gomutants` is on `PATH` (`go install github.com/szhekpisov/gomutants@latest`), and falls back to `go run github.com/szhekpisov/gomutants@latest` otherwise. Plugin sources live under [`plugin/`](plugin/); the marketplace manifest is at [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json).
+The plugin assumes `gomutants` is on `PATH` (`go install github.com/gomutants/gomutants@latest`), and falls back to `go run github.com/gomutants/gomutants@latest` otherwise. Plugin sources live under [`plugin/`](plugin/); the marketplace manifest is at [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json).
 
 ### Inline Ignore Directives
 
@@ -933,7 +934,7 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 
 ## Security & Code Quality
 
-**Supply chain.** Releases are signed with [cosign](https://docs.sigstore.dev/) (keyless Sigstore), ship [SPDX](https://spdx.dev/) SBOMs for every artifact, and carry [SLSA Level 3](https://slsa.dev/spec/v1.0/levels#build-l3) build provenance. Published tags are immutable. Release candidates (`v0.5.1-rc0`) go through the identical signing, SBOM, and provenance pipeline and are marked as pre-releases. See [Verifying Releases](#verifying-releases) for verification commands. The repo is tracked by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/szhekpisov/gomutants) (badge above).
+**Supply chain.** Releases are signed with [cosign](https://docs.sigstore.dev/) (keyless Sigstore), ship [SPDX](https://spdx.dev/) SBOMs for every artifact, and carry [SLSA Level 3](https://slsa.dev/spec/v1.0/levels#build-l3) build provenance. Published tags are immutable. Release candidates (`v0.5.1-rc0`) go through the identical signing, SBOM, and provenance pipeline and are marked as pre-releases. See [Verifying Releases](#verifying-releases) for verification commands. The repo is tracked by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/gomutants/gomutants) (badge above).
 
 **Continuous checks.** Every push and PR is scanned by:
 
@@ -943,11 +944,11 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 
 **Test quality.** Unit + integration test suite (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end). Mutation testing gated per-PR (no LIVED mutant on changed lines), with 96.01% efficacy on the full `./internal/...` library tree — the tool is dogfooded on itself, gated by its own CI gate.
 
-**Reporting vulnerabilities.** Open a [private GitHub Security Advisory](https://github.com/szhekpisov/gomutants/security/advisories/new).
+**Reporting vulnerabilities.** Open a [private GitHub Security Advisory](https://github.com/gomutants/gomutants/security/advisories/new).
 
 ## Contributing
 
-Found a bug or have a feature request? [Open an issue](https://github.com/szhekpisov/gomutants/issues/new).
+Found a bug or have a feature request? [Open an issue](https://github.com/gomutants/gomutants/issues/new).
 
 Maintainers: see [RELEASING.md](RELEASING.md) for the release process.
 
@@ -957,7 +958,7 @@ Maintainers: see [RELEASING.md](RELEASING.md) for the release process.
 **Prerequisites:** Go 1.26+
 
 ```bash
-git clone https://github.com/szhekpisov/gomutants.git
+git clone https://github.com/gomutants/gomutants.git
 cd gomutants
 go build ./...
 ```

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // discoverFixture writes src as the only file of a temp package and runs

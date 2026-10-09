@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	cachepkg "github.com/szhekpisov/gomutants/internal/cache"
-	"github.com/szhekpisov/gomutants/internal/mutator"
-	"github.com/szhekpisov/gomutants/internal/report"
+	cachepkg "github.com/gomutants/gomutants/internal/cache"
+	"github.com/gomutants/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/report"
 )
 
 // TestIncrementalCacheColdThenWarm runs the simple testdata twice with

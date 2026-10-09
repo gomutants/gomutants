@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // TestHeaderExact asserts the exact bytes produced by Header.
