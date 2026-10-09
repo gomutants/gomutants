@@ -11,8 +11,8 @@ You are running `gomutants` (Go mutation testing) and using the report to find t
 Check whether `gomutants` is on PATH (`which gomutants`).
 
 - If found, use `gomutants` directly.
-- If missing, fall back to `go run github.com/szhekpisov/gomutants@latest`. Tell the user once that you are using the fallback and that they can install the binary with:
-  - `go install github.com/szhekpisov/gomutants@latest`, or
+- If missing, fall back to `go run github.com/gomutants/gomutants@latest`. Tell the user once that you are using the fallback and that they can install the binary with:
+  - `go install github.com/gomutants/gomutants@latest`, or
   - downloading a release from https://github.com/gomutants/gomutants/releases.
 
 In the rest of these instructions, `<gomutants>` means whichever of the two you picked.

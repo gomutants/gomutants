@@ -105,14 +105,6 @@ everything that shipped through the intervening rcs.
 
    Commit as `docs: pin README examples to v0.5.1`.
 
-   **First stable release after the module rename only:** releases up to
-   v0.6.1 declare `github.com/szhekpisov/gomutants` in `go.mod`, so the
-   `go install` / `go run` examples and the pkg.go.dev badge still use that
-   path. Once a stable release declares `github.com/gomutants/gomutants`,
-   `@latest` only works with the new path. In the same commit, switch them in
-   `README.md`, `plugin/README.md` and `plugin/commands/mutants.md`, then
-   delete this note.
-
 3. **Smoke-test the published artifact.**
 
    ```bash

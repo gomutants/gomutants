@@ -1,9 +1,9 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/gomutants/gomutants/badge)](https://scorecard.dev/viewer/?uri=github.com/gomutants/gomutants)
 [![codecov](https://codecov.io/gh/gomutants/gomutants/graph/badge.svg?token=XNXMEJDGV2)](https://codecov.io/gh/gomutants/gomutants)
-[![Mutation testing badge](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fszhekpisov%2Fgomutants%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/szhekpisov/gomutants/main)
+[![Mutation testing badge](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fgomutants%2Fgomutants%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/gomutants/gomutants/main)
 [![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=gomutants_gomutants&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=gomutants_gomutants)
 [![Security & Static Analysis](https://github.com/gomutants/gomutants/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/gomutants/gomutants/actions/workflows/security.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/szhekpisov/gomutants.svg)](https://pkg.go.dev/github.com/szhekpisov/gomutants)
+[![Go Reference](https://pkg.go.dev/badge/github.com/gomutants/gomutants.svg)](https://pkg.go.dev/github.com/gomutants/gomutants)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # gomutants
@@ -97,7 +97,7 @@ These are unchanged-tree reruns, not a claim that all edits are free: editing a 
 ### Go Install
 
 ```bash
-go install github.com/szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
+go install github.com/gomutants/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
 ```
 
 Make sure `$GOPATH/bin` is in your `PATH`:
@@ -429,7 +429,7 @@ Use:
 /gomutants:mutants --since HEAD~1     # scope by git ref
 ```
 
-The plugin assumes `gomutants` is on `PATH` (`go install github.com/szhekpisov/gomutants@latest`), and falls back to `go run github.com/szhekpisov/gomutants@latest` otherwise. Plugin sources live under [`plugin/`](plugin/); the marketplace manifest is at [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json).
+The plugin assumes `gomutants` is on `PATH` (`go install github.com/gomutants/gomutants@latest`), and falls back to `go run github.com/gomutants/gomutants@latest` otherwise. Plugin sources live under [`plugin/`](plugin/); the marketplace manifest is at [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json).
 
 ### Inline Ignore Directives
 

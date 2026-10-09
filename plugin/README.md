@@ -45,7 +45,7 @@ The wrap-up line points at the HTML report: `open /tmp/gomutants-report.html` (m
 ## Requirements
 
 - Go 1.26+ on `PATH` (the plugin shells out to `go test` on the project under test).
-- `gomutants` on `PATH` is preferred (`go install github.com/szhekpisov/gomutants@latest`). If absent, the plugin falls back to `go run github.com/szhekpisov/gomutants@latest` — works out of the box, slower on first run.
+- `gomutants` on `PATH` is preferred (`go install github.com/gomutants/gomutants@latest`). If absent, the plugin falls back to `go run github.com/gomutants/gomutants@latest` — works out of the box, slower on first run.
 - A git repository for `--changed-since`-style invocations.
 
 ## What it doesn't do

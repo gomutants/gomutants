@@ -82,4 +82,4 @@ jobs:
             -H "X-Api-Key: $STRYKER_DASHBOARD_KEY" \
             -H "Content-Type: application/json" \
             --data @stryker-report.json \
-            "https://dashboard.stryker-mutator.io/api/reports/github.com/szhekpisov/gomutants/main"
+            "https://dashboard.stryker-mutator.io/api/reports/github.com/gomutants/gomutants/main"
