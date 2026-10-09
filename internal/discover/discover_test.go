@@ -226,7 +226,7 @@ func TestPreReadFiles(t *testing.T) {
 		{Dir: dir, GoFiles: []string{"a.go", "b.go"}},
 	}
 
-	files, err := PreReadFiles(pkgs)
+	files, err := PreReadFiles(pkgs, nil)
 	if err != nil {
 		t.Fatalf("PreReadFiles: %v", err)
 	}
@@ -243,7 +243,7 @@ func TestPreReadFilesMissing(t *testing.T) {
 		{Dir: "/nonexistent", GoFiles: []string{"missing.go"}},
 	}
 
-	_, err := PreReadFiles(pkgs)
+	_, err := PreReadFiles(pkgs, nil)
 	if err == nil {
 		t.Fatal("expected error for missing file")
 	}
@@ -819,7 +819,7 @@ func TestPreReadFilesActuallyDeduplicates(t *testing.T) {
 		{Dir: dir, GoFiles: []string{"a.go"}}, // triplicate
 	}
 
-	files, err := PreReadFiles(pkgs)
+	files, err := PreReadFiles(pkgs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -831,6 +831,42 @@ func TestPreReadFilesActuallyDeduplicates(t *testing.T) {
 	}
 
 	_ = path
+}
+
+// TestPreReadFilesReusesParsedSource checks that a file in Discover's parse
+// cache contributes the bytes it was parsed from — not what is on disk now —
+// and that only the files Discover skipped are read.
+func TestPreReadFilesReusesParsedSource(t *testing.T) {
+	dir := t.TempDir()
+	parsedPath := filepath.Join(dir, "a.go")
+	skippedPath := filepath.Join(dir, "b.go")
+	os.WriteFile(parsedPath, []byte("package p // edited after discovery\n"), 0o644)
+	os.WriteFile(skippedPath, []byte("package p\n"), 0o644)
+
+	orig := readFileBytesFunc
+	var reads []string
+	readFileBytesFunc = func(p string) ([]byte, error) {
+		reads = append(reads, p)
+		return os.ReadFile(p)
+	}
+	defer func() { readFileBytesFunc = orig }()
+
+	pkgs := []Package{{Dir: dir, GoFiles: []string{"a.go", "b.go"}}}
+	parsed := map[string]*ParsedFile{parsedPath: {Src: []byte("package p\n")}}
+
+	files, err := PreReadFiles(pkgs, parsed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(files[parsedPath]); got != "package p\n" {
+		t.Errorf("parsed file: got %q, want the bytes discovery parsed", got)
+	}
+	if got := string(files[skippedPath]); got != "package p\n" {
+		t.Errorf("skipped file: got %q, want its disk contents", got)
+	}
+	if len(reads) != 1 || reads[0] != skippedPath {
+		t.Errorf("reads = %v, want only %s", reads, skippedPath)
+	}
 }
 
 // TestFilterByCoveragePreservesNonPendingStatus kills BRANCH_IF on the
@@ -914,7 +950,7 @@ func TestPreReadFilesDeduplicate(t *testing.T) {
 		{Dir: dir, GoFiles: []string{"a.go"}},
 	}
 
-	files, err := PreReadFiles(pkgs)
+	files, err := PreReadFiles(pkgs, nil)
 	if err != nil {
 		t.Fatalf("PreReadFiles: %v", err)
 	}
@@ -1090,6 +1126,24 @@ func TestDiscoverContinuesPastUnparseable(t *testing.T) {
 	}
 }
 
+// TestDiscoverToWritesWarningsToWriter: the skip warning goes to the
+// writer the caller passed, which is what lets the --run-mutant-id
+// pre-check hold it back instead of printing it twice.
+func TestDiscoverToWritesWarningsToWriter(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "bad.go"), []byte("not valid go"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pkgs := []Package{{Dir: dir, ImportPath: "example.com/bad", GoFiles: []string{"bad.go"}}}
+
+	var warn strings.Builder
+	DiscoverTo(token.NewFileSet(), pkgs, nil, dir, "example.com", &warn)
+	want := "gomutants: skipping unparseable " + filepath.Join(dir, "bad.go") + ": "
+	if !strings.HasPrefix(warn.String(), want) {
+		t.Errorf("warnings = %q, want prefix %q", warn.String(), want)
+	}
+}
+
 // TestPreReadFilesContinuesPastDuplicate kills INVERT_LOOP_CTRL on the
 // `continue` in PreReadFiles (files.go:20). Mutated to `break`, hitting
 // an already-cached path stops the inner file loop, dropping later files
@@ -1110,7 +1164,7 @@ func TestPreReadFilesContinuesPastDuplicate(t *testing.T) {
 		{Dir: dir, GoFiles: []string{"shared.go", "after.go"}},
 	}
 
-	files, err := PreReadFiles(pkgs)
+	files, err := PreReadFiles(pkgs, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

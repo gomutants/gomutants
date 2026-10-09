@@ -231,6 +231,49 @@ func F(a, b int) int { return a + b }
 	}
 }
 
+// TestFilterByDirectivesTo: same verdicts as the stderr variant, with the
+// warnings written to the given writer and nothing to stderr.
+func TestFilterByDirectivesTo(t *testing.T) {
+	src := `package p
+
+func F(a, b int) int { return a + b } // gomutants:disable reason=unterminated"
+
+func G(a, b int) int { return a - b } // gomutants:disable ARITHMETIC_BASE
+`
+	mutants, _ := writeFixture(t, src)
+
+	// Point stderr at a file for the call: the warnings it must not
+	// print there would otherwise go straight to os.Stderr.
+	errFile, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer errFile.Close()
+	origStderr := os.Stderr
+	os.Stderr = errFile
+	var warn bytes.Buffer
+	kept, suppressed, err := FilterByDirectivesTo(token.NewFileSet(), mutants, nil, &warn)
+	os.Stderr = origStderr
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := os.ReadFile(errFile.Name()); len(out) > 0 {
+		t.Errorf("FilterByDirectivesTo wrote to stderr: %q", out)
+	}
+	if !strings.Contains(warn.String(), "malformed reason=") {
+		t.Errorf("warnings = %q, want the malformed-reason warning", warn.String())
+	}
+
+	wantKept, wantSuppressed, err := filterByDirectives(token.NewFileSet(), mutants, nil, io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kept) != len(wantKept) || len(suppressed) != len(wantSuppressed) || len(suppressed) == 0 {
+		t.Errorf("kept=%d suppressed=%d, want kept=%d suppressed=%d (>0)",
+			len(kept), len(suppressed), len(wantKept), len(wantSuppressed))
+	}
+}
+
 func TestParseDirectiveRegexpUnknownMutatorHintsWhitespace(t *testing.T) {
 	// `disable-regexp foo bar` — `bar` becomes the mutator name and is
 	// unknown; under the all-unknown-drops-directive rule the directive

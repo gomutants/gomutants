@@ -163,6 +163,33 @@ func stableIDFile(absPath, moduleRoot string) string {
 	return filepath.ToSlash(rel)
 }
 
+// ScopeToStableID narrows pkgs to the source files that could hold a
+// mutant FilterByStableID would match against id, so a caller resolving one
+// id need not parse the whole run. A file qualifies when its ID segment F
+// and id agree up to the shorter of the two: id is a prefix of "F:" (it
+// stops inside the file segment), or "F:" is a prefix of id (it goes on to
+// name something inside F). Every StableID in F starts with "F:", so no
+// other file can match.
+//
+// Every package is kept, emptied when none of its files qualify, and only
+// GoFiles is narrowed: Discover derives RelFile from the set of import
+// paths, and stable-ID ordinals are counted per file, so a mutant found
+// over the narrowed packages is identical to the one the full set yields.
+func ScopeToStableID(pkgs []Package, id, moduleRoot string) []Package {
+	scoped := make([]Package, len(pkgs))
+	for i, pkg := range pkgs {
+		scoped[i] = pkg
+		scoped[i].GoFiles = nil
+		for _, name := range pkg.GoFiles {
+			seg := stableIDFile(filepath.Join(pkg.Dir, name), moduleRoot) + ":"
+			if strings.HasPrefix(seg, id) || strings.HasPrefix(id, seg) {
+				scoped[i].GoFiles = append(scoped[i].GoFiles, name)
+			}
+		}
+	}
+	return scoped
+}
+
 // maxAmbiguousListed caps how many candidate IDs an ambiguity error
 // spells out. Enough to pick from, short enough to stay readable when a
 // one-character prefix matches a whole package.
@@ -180,6 +207,10 @@ const maxAmbiguousListed = 5
 // Both failure modes are errors because both mean the run cannot do what
 // was asked, but they carry different messages: an unknown id is usually
 // a scoping mistake, while an ambiguous one just needs more characters.
+//
+// mutants is expected to be what Discover found over ScopeToStableID(pkgs,
+// id), and the no-match message counts it as that: the mutants in the
+// files the id's path could name, not every mutant of the run.
 func FilterByStableID(mutants []mutator.Mutant, id string) ([]mutator.Mutant, error) {
 	for _, m := range mutants {
 		if m.StableID == id {
@@ -199,7 +230,7 @@ func FilterByStableID(mutants []mutator.Mutant, id string) ([]mutator.Mutant, er
 		return matches, nil
 	case 0:
 		return nil, fmt.Errorf(
-			"no mutant matches --run-mutant-id %q among the %d discovered; check the package argument, --only/--disable, and that the id came from a report for this revision",
+			"no mutant matches --run-mutant-id %q among the %d discovered in the files its path could name; check --only/--disable and that the id came from a report for this revision",
 			id, len(mutants))
 	default:
 		return nil, fmt.Errorf(

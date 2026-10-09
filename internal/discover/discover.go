@@ -126,6 +126,14 @@ type Result struct {
 // moduleRoot is the absolute path to the project root (for computing absolute paths).
 // goModule is the Go module name (for computing gremlins-compatible relative paths).
 func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, moduleRoot, goModule string) *Result {
+	return DiscoverTo(fset, pkgs, mutators, moduleRoot, goModule, os.Stderr)
+}
+
+// DiscoverTo is Discover with its warnings written to warn instead of
+// os.Stderr, for a pre-check that parses files a later Discover parses
+// again: it holds them back and prints them only when that later call
+// will not run.
+func DiscoverTo(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, moduleRoot, goModule string, warn io.Writer) *Result {
 	var allCandidates []mutator.MutantCandidate
 	files := make(map[string]*ParsedFile)
 	// Function spans per file, for resolving each candidate's stable-ID
@@ -140,7 +148,7 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 			if err != nil {
 				// Soft failure: skip unparseable files. Log so silent
 				// skips don't hide classifier-blindspots in reports.
-				fmt.Fprintf(os.Stderr, "gomutants: skipping unparseable %s: %v\n", absPath, err)
+				fmt.Fprintf(warn, "gomutants: skipping unparseable %s: %v\n", absPath, err)
 				continue
 			}
 			files[absPath] = &ParsedFile{Src: src, File: file}

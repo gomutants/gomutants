@@ -723,3 +723,51 @@ func TestFormatCandidatesExactlyAtCap(t *testing.T) {
 		t.Errorf("formatCandidates =\n%q\nwant\n%q", got, want)
 	}
 }
+
+func TestScopeToStableID(t *testing.T) {
+	root := filepath.FromSlash("/mod")
+	pkgs := []Package{
+		{Dir: root, ImportPath: "m", GoFiles: []string{"add.go", "sub.go"}, TestGoFiles: []string{"add_test.go"}},
+		{Dir: filepath.Join(root, "internal", "x"), ImportPath: "m/internal/x", GoFiles: []string{"x.go"}},
+	}
+	tests := []struct {
+		id   string
+		want [][]string // GoFiles per package, in order
+	}{
+		{"add.go:Add:ARITHMETIC_BASE#1", [][]string{{"add.go"}, nil}},
+		{"add.go:", [][]string{{"add.go"}, nil}},
+		{"add.go", [][]string{{"add.go"}, nil}},
+		{"ad", [][]string{{"add.go"}, nil}},
+		{"", [][]string{{"add.go", "sub.go"}, {"x.go"}}},
+		{"internal/", [][]string{nil, {"x.go"}}},
+		{"internal/x/x.go:F:CONDITIONALS_NEGATION#2", [][]string{nil, {"x.go"}}},
+		// "add.go:" is not a prefix of "add.gox", and vice versa.
+		{"add.gox", [][]string{nil, nil}},
+		{"nope.go:F", [][]string{nil, nil}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.id, func(t *testing.T) {
+			checkScoped(t, pkgs, ScopeToStableID(pkgs, tt.id, root), tt.want)
+		})
+	}
+	if len(pkgs[0].GoFiles) != 2 {
+		t.Errorf("input packages were modified: %v", pkgs[0].GoFiles)
+	}
+}
+
+// checkScoped asserts that got keeps every package of pkgs, changed only
+// in GoFiles, which must equal want package by package.
+func checkScoped(t *testing.T, pkgs, got []Package, want [][]string) {
+	t.Helper()
+	if len(got) != len(pkgs) {
+		t.Fatalf("got %d packages, want every one of the %d kept", len(got), len(pkgs))
+	}
+	for i := range got {
+		if fmt.Sprint(got[i].GoFiles) != fmt.Sprint(want[i]) {
+			t.Errorf("pkg %d GoFiles = %v, want %v", i, got[i].GoFiles, want[i])
+		}
+		if got[i].ImportPath != pkgs[i].ImportPath || got[i].Dir != pkgs[i].Dir || len(got[i].TestGoFiles) != len(pkgs[i].TestGoFiles) {
+			t.Errorf("pkg %d: only GoFiles may change, got %+v", i, got[i])
+		}
+	}
+}

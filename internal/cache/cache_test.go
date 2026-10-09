@@ -103,6 +103,208 @@ func TestHasher_SetSrcCacheAttachesAfterConstruction(t *testing.T) {
 	}
 }
 
+// TestHasher_SetSrcCacheDropsFileMemo: a hash memoized from disk before
+// the source map was attached (the coverage-key calc) must not outlive it.
+// The run measures the bytes in srcCache, so an edit saved in between has
+// to change the hash its verdict is stored under.
+func TestHasher_SetSrcCacheDropsFileMemo(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.go")
+	mustWrite(t, p, "DISK CONTENT\n")
+
+	h := NewHasher(nil)
+	disk, err := h.File(p)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	h.SetSrcCache(map[string][]byte{p: []byte("MEMORY CONTENT\n")})
+
+	got, err := h.File(p)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if got == disk {
+		t.Fatalf("File returned the hash memoized from disk before SetSrcCache")
+	}
+}
+
+// TestHasher_SetSrcCacheDropsDirMemo: the same for the per-directory
+// pkg_hash memo, which would otherwise pin every sibling file's old hash.
+func TestHasher_SetSrcCacheDropsDirMemo(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "x.go")
+	mustWrite(t, p, "package x\n")
+
+	h := NewHasher(nil)
+	before, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	h.SetSrcCache(map[string][]byte{p: []byte("package x // edited\n")})
+
+	after, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	if after == before {
+		t.Fatalf("HashPkgFiles returned the directory hash memoized before SetSrcCache")
+	}
+}
+
+// TestHasher_SetSrcCacheKeepsOtherMemos: a hash memoized for a file the
+// source map does not hold — a test file, hashed by the coverage-key calc
+// before any mutant ran — must survive. Re-reading it at write time would
+// key a verdict measured on the old test under an edit saved mid-run.
+func TestHasher_SetSrcCacheKeepsOtherMemos(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "x.go")
+	test := filepath.Join(dir, "x_test.go")
+	mustWrite(t, src, "package x\n")
+	mustWrite(t, test, "package x // before\n")
+
+	h := NewHasher(nil)
+	before, err := h.File(test)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	mustWrite(t, test, "package x // edited mid-run\n")
+	h.SetSrcCache(map[string][]byte{src: []byte("package x\n")})
+
+	got, err := h.File(test)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	if got != before {
+		t.Fatalf("File re-read a file SetSrcCache does not hold; its pre-run hash was dropped")
+	}
+}
+
+// TestHasher_SetSrcCacheKeepsOtherDirMemos: only the directories srcCache
+// has a file in lose their pkg_hash memo.
+func TestHasher_SetSrcCacheKeepsOtherDirMemos(t *testing.T) {
+	root := t.TempDir()
+	a, b := filepath.Join(root, "a"), filepath.Join(root, "b")
+	for _, d := range []string{a, b} {
+		if err := os.Mkdir(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustWrite(t, filepath.Join(a, "a.go"), "package a\n")
+	mustWrite(t, filepath.Join(b, "b.go"), "package b\n")
+
+	h := NewHasher(nil)
+	before, err := h.HashPkgFiles(b)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	mustWrite(t, filepath.Join(b, "b.go"), "package b // edited\n")
+	h.SetSrcCache(map[string][]byte{filepath.Join(a, "a.go"): []byte("package a\n")})
+
+	got, err := h.HashPkgFiles(b)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	if got != before {
+		t.Fatalf("HashPkgFiles dropped the memo of a directory SetSrcCache holds no file in")
+	}
+}
+
+// freshPkgHash is HashPkgFiles(dir) on a new Hasher holding srcCache and
+// embeds: what a package hashes to with nothing memoized.
+func freshPkgHash(t *testing.T, dir string, srcCache map[string][]byte, embeds map[string][]string) string {
+	t.Helper()
+	h := NewHasher(srcCache)
+	h.SetEmbedFiles(embeds)
+	v, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles(%s): %v", dir, err)
+	}
+	return v
+}
+
+// TestHasher_SetSrcCacheRehashesExcludedSibling: a production file
+// srcCache leaves out (--exclude-files, a build tag) still compiles into
+// every mutant from disk. Its hash memoized before coverage must not
+// outlive SetSrcCache, or an edit saved during the baseline would be
+// measured but keyed on the version before it.
+func TestHasher_SetSrcCacheRehashesExcludedSibling(t *testing.T) {
+	dir := t.TempDir()
+	src, gen := filepath.Join(dir, "x.go"), filepath.Join(dir, "gen.go")
+	mustWrite(t, src, "package x\n")
+	mustWrite(t, gen, "package x // before\n")
+
+	h := NewHasher(nil)
+	if _, err := h.File(gen); err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	mustWrite(t, gen, "package x // edited during the baseline\n")
+	srcCache := map[string][]byte{src: []byte("package x\n")}
+	h.SetSrcCache(srcCache)
+
+	got, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	if got != freshPkgHash(t, dir, srcCache, nil) {
+		t.Fatalf("HashPkgFiles kept the pre-coverage hash of a sibling srcCache does not hold")
+	}
+}
+
+// TestHasher_SetSrcCacheRehashesEmbedFile: the same for an embedded file,
+// which sits in a subdirectory of the package.
+func TestHasher_SetSrcCacheRehashesEmbedFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "data"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	src, data := filepath.Join(dir, "x.go"), filepath.Join(dir, "data", "schema.json")
+	mustWrite(t, src, "package x\n")
+	mustWrite(t, data, "{}\n")
+	embeds := map[string][]string{dir: {"data/schema.json"}}
+
+	h := NewHasher(nil)
+	h.SetEmbedFiles(embeds)
+	if _, err := h.File(data); err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	mustWrite(t, data, "{\"edited\": true}\n")
+	srcCache := map[string][]byte{src: []byte("package x\n")}
+	h.SetSrcCache(srcCache)
+
+	got, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	if got != freshPkgHash(t, dir, srcCache, embeds) {
+		t.Fatalf("HashPkgFiles kept the pre-coverage hash of an embedded file")
+	}
+}
+
+// TestHasher_SetSrcCacheSnapshotsPkgHash: the package hash is taken when
+// srcCache is attached, not on first use. A --run-mutant-id run first asks
+// for it in Update, after the mutant ran; a sibling edited during the run
+// must not be recorded against a verdict measured on the old one.
+func TestHasher_SetSrcCacheSnapshotsPkgHash(t *testing.T) {
+	dir := t.TempDir()
+	src, gen := filepath.Join(dir, "x.go"), filepath.Join(dir, "gen.go")
+	mustWrite(t, src, "package x\n")
+	mustWrite(t, gen, "package x // as measured\n")
+	srcCache := map[string][]byte{src: []byte("package x\n")}
+	want := freshPkgHash(t, dir, srcCache, nil)
+
+	h := NewHasher(nil)
+	h.SetSrcCache(srcCache)
+	mustWrite(t, gen, "package x // edited during the mutant run\n")
+
+	got, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles: %v", err)
+	}
+	if got != want {
+		t.Fatalf("HashPkgFiles hashed the package on first use, not when SetSrcCache froze its sources")
+	}
+}
+
 func TestHashTestFiles_OrderInvariantAndContentSensitive(t *testing.T) {
 	dir := t.TempDir()
 	a := filepath.Join(dir, "a_test.go")

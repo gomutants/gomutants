@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -258,10 +259,41 @@ func NewHasher(srcCache map[string][]byte) *Hasher {
 // discover.PreReadFiles) after the hasher was constructed. Used by
 // callers that need a Hasher before pre-read completes (e.g. the
 // coverage-key calc runs before discovery) and want subsequent File()
-// calls to skip the disk read. Already-memoized hashes in h.files are
-// preserved.
+// calls to skip the disk read.
+//
+// Every package input is hashed again here, at the moment srcCache froze
+// the bytes the mutants are measured on. The memos the coverage-key calc
+// left behind were read from disk before coverage and the baseline ran, so
+// every non-test file memo is dropped: not just srcCache's own files, but a
+// sibling srcCache leaves out (--exclude-files, a build tag) and an
+// embedded file, both of which the mutants still compile from disk. A
+// verdict measured on an edit saved in between must not be keyed on the
+// version before it, or reverting the edit would replay that verdict.
+//
+// The pkg_hash of every directory srcCache has a file in is then taken
+// right away rather than on first use. A --run-mutant-id run skips Lookup,
+// so first use would be Update, after the mutant ran — and a sibling
+// edited during the run would be recorded against a verdict measured on
+// the old one. A directory that fails to hash memoizes nothing; Lookup and
+// Update try again and treat a failure as a miss.
+//
+// Test-file memos are kept. srcCache holds production sources only, so a
+// test file's hash taken by the coverage-key calc stays the one the cache
+// entries are stored under: a snapshot from before any mutant ran, which an
+// edit to the test mid-run can only turn into a miss on the next run. A
+// re-hash at write time would instead record the edited test against a
+// verdict measured on the old one, and replay that verdict.
 func (h *Hasher) SetSrcCache(srcCache map[string][]byte) {
 	h.srcCache = srcCache
+	maps.DeleteFunc(h.files, func(p, _ string) bool {
+		return !strings.HasSuffix(p, "_test.go")
+	})
+	for p := range srcCache {
+		delete(h.dirs, filepath.Dir(p))
+	}
+	for p := range srcCache {
+		_, _ = h.HashPkgFiles(filepath.Dir(p))
+	}
 }
 
 // SetEmbedFiles attaches the //go:embed inputs of each package, keyed by
@@ -455,8 +487,9 @@ func (h *Hasher) embedFrames(pkgDirs []string) ([]string, error) {
 //
 // Results are memoized per directory for the lifetime of the Hasher, so a
 // package is listed and hashed once per run rather than once per mutant.
-// The memo is keyed on dir alone; a run never edits its own sources
-// mid-flight, so there is nothing to stale out.
+// The memo is keyed on dir alone. SetSrcCache retakes it for the mutants'
+// packages once their sources are frozen, so the hash a verdict is stored
+// under is that snapshot, not one from before coverage ran.
 //
 // A read or listing error is propagated — callers treat it as a cache miss
 // for that mutant, never as a match.

@@ -371,6 +371,20 @@ func TestQuietSuppressesHeaderPhaseAndOnResult(t *testing.T) {
 	}
 }
 
+func TestInfoPrintsLineUnlessQuiet(t *testing.T) {
+	var buf bytes.Buffer
+	NewTerminal(&buf, 0, false, false).Info("Report: %s", "r.json")
+	if got := buf.String(); got != "Report: r.json\n" {
+		t.Errorf("Info = %q, want %q", got, "Report: r.json\n")
+	}
+
+	buf.Reset()
+	NewTerminal(&buf, 0, false, true).Info("Report: %s", "r.json")
+	if buf.Len() != 0 {
+		t.Errorf("quiet Info should print nothing, got %q", buf.String())
+	}
+}
+
 func TestQuietStillPrintsSummary(t *testing.T) {
 	var buf bytes.Buffer
 	term := NewTerminal(&buf, 0, false, true)

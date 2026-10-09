@@ -977,11 +977,15 @@ func TestRunQuietSuppressesProgressKeepsSummary(t *testing.T) {
 	defer os.Chdir(orig)
 
 	outPath := filepath.Join(dir, "report.json")
+	htmlPath := filepath.Join(dir, "report.html")
+	strykerPath := filepath.Join(dir, "stryker.json")
 	out, err := captureOutput(t, func() error {
 		return run(context.Background(), []string{
 			"--only", "ARITHMETIC_BASE",
 			"-w", "1",
 			"-o", outPath,
+			"--html-output", htmlPath,
+			"--stryker-output", strykerPath,
 			"--cache=off",
 			"--quiet",
 			"testmod",
@@ -1001,6 +1005,8 @@ func TestRunQuietSuppressesProgressKeepsSummary(t *testing.T) {
 		"Discovering mutants...",
 		"Building per-test coverage map...",
 		"Report:",
+		"Stryker report:",
+		"HTML report:",
 	}
 	for _, s := range mustNotContain {
 		if strings.Contains(out, s) {
@@ -1019,9 +1025,11 @@ func TestRunQuietSuppressesProgressKeepsSummary(t *testing.T) {
 		}
 	}
 
-	// Report file is still written — quiet trims chatter, not artifacts.
-	if _, err := os.Stat(outPath); err != nil {
-		t.Fatalf("report not written under --quiet: %v", err)
+	// Report files are still written — quiet trims chatter, not artifacts.
+	for _, p := range []string{outPath, htmlPath, strykerPath} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("report not written under --quiet: %v", err)
+		}
 	}
 }
 
@@ -1389,7 +1397,7 @@ func TestRunPreReadFilesErrorMessage(t *testing.T) {
 
 	origRead := preReadFilesFunc
 	defer func() { preReadFilesFunc = origRead }()
-	preReadFilesFunc = func([]discover.Package) (map[string][]byte, error) {
+	preReadFilesFunc = func([]discover.Package, map[string]*discover.ParsedFile) (map[string][]byte, error) {
 		return nil, errors.New("inject pre-read failure: marker_klm")
 	}
 
@@ -2536,24 +2544,80 @@ func TestRunRejectsInvalidExcludeCallsDefaults(t *testing.T) {
 	}
 }
 
+// runOneMutant runs gomutants over the testmod module in dir (the working
+// directory), on ARITHMETIC_BASE alone with one worker and no cache,
+// narrowed by --run-mutant-id to id.
+func runOneMutant(dir, id string, extra ...string) error {
+	args := []string{
+		"--only", "ARITHMETIC_BASE",
+		"--run-mutant-id", id,
+		"-w", "1", "--cache=off",
+		"-o", filepath.Join(dir, "report.json"),
+	}
+	return run(context.Background(), append(append(args, extra...), "testmod"))
+}
+
+// stubSlowPhases makes coverage and the baseline fail with a marker error,
+// for tests pinning that a diagnosis comes before either one runs.
+func stubSlowPhases(t *testing.T) {
+	t.Helper()
+	origCov, origM := runCoverageFunc, measureBaselineFunc
+	t.Cleanup(func() { runCoverageFunc, measureBaselineFunc = origCov, origM })
+	runCoverageFunc = func(context.Context, string, []string, string, string, string, []string) (string, error) {
+		return "", errors.New("coverage ran: marker_cov")
+	}
+	measureBaselineFunc = func(context.Context, string, []string, string, []string) (time.Duration, error) {
+		return 0, errors.New("baseline ran: marker_base")
+	}
+}
+
+// editDuringBaseline runs the real baseline, then overwrites path with src:
+// an edit saved while the baseline runs. The returned flag reports whether
+// the baseline was reached.
+func editDuringBaseline(t *testing.T, path, src string) *bool {
+	t.Helper()
+	origM := measureBaselineFunc
+	t.Cleanup(func() { measureBaselineFunc = origM })
+	ran := new(bool)
+	measureBaselineFunc = func(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
+		*ran = true
+		d, err := origM(ctx, projectDir, packages, tags, testFlags)
+		if werr := os.WriteFile(path, []byte(src), 0o644); werr != nil {
+			t.Fatal(werr)
+		}
+		return d, err
+	}
+	return ran
+}
+
 func TestRunUnknownMutantIDIsUsageError(t *testing.T) {
 	dir := setupTinyProject(t)
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
 
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "no/such/file.go:Nope:ARITHMETIC_BASE#1",
-		"-w", "1",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	err := runOneMutant(dir, "no/such/file.go:Nope:ARITHMETIC_BASE#1")
 	// Exit 2, not 1: naming a mutant that doesn't exist is a bad
 	// invocation, in the same class as an unknown flag.
 	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "no mutant matches") {
 		t.Errorf("error should explain the id matched nothing, got: %v", err)
+	}
+	// The file segment names nothing, so no file was even parsed.
+	if !strings.Contains(err.Error(), "no source file in the resolved packages") {
+		t.Errorf("error should say no file matched the id's path, got: %v", err)
+	}
+}
+
+// TestRunUnknownMutantIDInKnownFileIsUsageError: the file exists, so the
+// early check parses it, but nothing in it carries the id.
+func TestRunUnknownMutantIDInKnownFileIsUsageError(t *testing.T) {
+	dir := setupTinyProject(t)
+	t.Chdir(dir)
+
+	err := runOneMutant(dir, "add.go:Nope:ARITHMETIC_BASE#1")
+	requireExitCode(t, err, exitCodeUsageError)
+	want := `no mutant matches --run-mutant-id "add.go:Nope:ARITHMETIC_BASE#1" among the 1 discovered in the files its path could name; check --only/--disable and that the id came from a report for this revision`
+	if !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("error = %q, want prefix %q", err.Error(), want)
 	}
 }
 
@@ -2584,31 +2648,78 @@ func TestRunAmbiguousMutantIDIsUsageError(t *testing.T) {
 // instead of the usage error.
 func TestRunMutantIDResolvesBeforeCoverage(t *testing.T) {
 	dir := setupTinyProject(t)
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
+	t.Chdir(dir)
+	stubSlowPhases(t)
 
-	origCov := runCoverageFunc
-	defer func() { runCoverageFunc = origCov }()
-	runCoverageFunc = func(_ context.Context, _ string, _ []string, _, _, _ string, _ []string) (string, error) {
-		return "", errors.New("coverage ran: marker_cov")
-	}
-	origM := measureBaselineFunc
-	defer func() { measureBaselineFunc = origM }()
-	measureBaselineFunc = func(_ context.Context, _ string, _ []string, _ string, _ []string) (time.Duration, error) {
-		return 0, errors.New("baseline ran: marker_base")
-	}
-
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "no/such/file.go:Nope:ARITHMETIC_BASE#1",
-		"-w", "1",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	err := runOneMutant(dir, "add.go:Nope:ARITHMETIC_BASE#1")
 	requireExitCode(t, err, exitCodeUsageError)
 	if !strings.Contains(err.Error(), "no mutant matches") {
 		t.Errorf("an unknown id must be diagnosed before the coverage and baseline runs, got: %v", err)
+	}
+}
+
+// TestRunMutantIDResolvesAgainAfterBaseline: the early check's parse must
+// not be what the run patches. An edit saved while coverage or the
+// baseline runs has to be seen, or the overlay would patch stale bytes
+// into a package whose other files and TCE reference build come from disk.
+func TestRunMutantIDResolvesAgainAfterBaseline(t *testing.T) {
+	dir := setupTinyProject(t)
+	t.Chdir(dir)
+	// Drop the only arithmetic, so the id no longer names anything.
+	baselineRan := editDuringBaseline(t, filepath.Join(dir, "add.go"),
+		"package testmod\n\nfunc Add(a, b int) int {\n\treturn a\n}\n")
+
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE")
+	if !*baselineRan {
+		t.Fatalf("the id must resolve before the edit, so the run reaches the baseline; got: %v", err)
+	}
+	// Exit 1, not 2: the early check accepted the id, so the command line
+	// is fine and running again is the fix.
+	requireExitCode(t, err, exitCodeRuntimeError)
+	if !strings.Contains(err.Error(), "no mutant matches") {
+		t.Errorf("the id must be resolved again against the source as it is after the baseline, got: %v", err)
+	}
+}
+
+// TestRunMutantIDRetargetedDuringBaselineIsError: an edit saved during the
+// baseline can leave the id valid but pointing elsewhere. Here a new `+`
+// above the original one takes ordinal #1, so the same full id now names
+// the newcomer; the run must refuse rather than measure it.
+func TestRunMutantIDRetargetedDuringBaselineIsError(t *testing.T) {
+	dir := setupTinyProject(t)
+	t.Chdir(dir)
+	editDuringBaseline(t, filepath.Join(dir, "add.go"),
+		"package testmod\n\nfunc Add(a, b int) int {\n\tb = b + 0\n\treturn a + b\n}\n")
+
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1")
+	requireExitCode(t, err, exitCodeRuntimeError)
+	want := `--run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" named add.go:Add:ARITHMETIC_BASE#1 at add.go:4:11 before the baseline but add.go:Add:ARITHMETIC_BASE#1 at add.go:4:8 after it; the source changed during the run, run again`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestCheckSameRunTarget pins every field the comparison reads: each one
+// alone, changed, must fail the check.
+func TestCheckSameRunTarget(t *testing.T) {
+	early := mutator.Mutant{StableID: "a.go:F:ARITHMETIC_BASE#1", RelFile: "a.go", Line: 4, Col: 11, Original: "+"}
+	mr := &mutationRun{earlyTarget: early}
+	if err := mr.checkSameRunTarget(early); err != nil {
+		t.Fatalf("same mutant rejected: %v", err)
+	}
+	for name, edit := range map[string]func(*mutator.Mutant){
+		"stable id": func(m *mutator.Mutant) { m.StableID = "a.go:F:ARITHMETIC_BASE#2" },
+		"line":      func(m *mutator.Mutant) { m.Line = 5 },
+		"col":       func(m *mutator.Mutant) { m.Col = 8 },
+		"original":  func(m *mutator.Mutant) { m.Original = "-" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			m := early
+			edit(&m)
+			if err := mr.checkSameRunTarget(m); err == nil {
+				t.Errorf("a different %s was accepted as the same target", name)
+			}
+		})
 	}
 }
 
@@ -2747,25 +2858,145 @@ func writeModuleWithFiles(t *testing.T, files map[string]string) string {
 	return dir
 }
 
+// TestRunMutantIDOutsideChangedSinceFailsBeforeCoverage: a target on no
+// changed line is as untestable as a suppressed one, and git can say so
+// without coverage.
+func TestRunMutantIDOutsideChangedSinceFailsBeforeCoverage(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	dir := setupTinyProject(t)
+	for _, args := range [][]string{
+		{"init", "-q"},
+		{"add", "."},
+		{"-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "init"},
+	} {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	t.Chdir(dir)
+	stubSlowPhases(t)
+
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1", "--changed-since", "HEAD")
+	requireExitCode(t, err, exitCodeUsageError)
+	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is not on any line changed since "HEAD"`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestRunMutantIDSuppressedDuringBaselineIsError: the early check passed,
+// then a directive was added while the baseline ran. The filters after the
+// baseline must still catch it, or the run would test nothing and exit 0.
+// The command line was accepted, so it is a runtime error, not a usage one.
+func TestRunMutantIDSuppressedDuringBaselineIsError(t *testing.T) {
+	dir := setupTinyProject(t)
+	t.Chdir(dir)
+	editDuringBaseline(t, filepath.Join(dir, "add.go"),
+		"package testmod\n\nfunc Add(a, b int) int {\n\treturn a + b // gomutants:disable reason=\"later\"\n}\n")
+
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1")
+	requireExitCode(t, err, exitCodeRuntimeError)
+	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is suppressed at add.go:4 (later)`
+	if err.Error() != want {
+		t.Errorf("error = %q, want %q", err.Error(), want)
+	}
+}
+
+// TestRunMutantIDSuppressedPrintsDirectiveWarnings: the early check holds
+// its warnings back for discoverMutants to print, but when the check
+// itself fails, discoverMutants never runs. The warning for the misspelled
+// name must still appear, once.
+func TestRunMutantIDSuppressedPrintsDirectiveWarnings(t *testing.T) {
+	dir := writeModuleWithFiles(t, map[string]string{
+		"add.go": "package testmod\n\nfunc Add(a, b int) int {\n" +
+			"\treturn a + b // gomutants:disable ARITHMETIC_BASE,ARITHMETC reason=\"x\"\n}\n",
+	})
+	t.Chdir(dir)
+	stubSlowPhases(t)
+
+	out, err := captureStderr(t, func() error {
+		return runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1")
+	})
+	requireExitCode(t, err, exitCodeUsageError)
+	if n := strings.Count(out, `"ARITHMETC"`); n != 1 {
+		t.Errorf("the unknown-mutator warning appeared %d times, want 1; stderr:\n%s", n, out)
+	}
+}
+
+// TestRunMutantIDPrintsDirectiveWarningsOnce: on a run the early check
+// lets through, the same files are parsed and filtered twice. Their
+// warnings must not be printed twice.
+func TestRunMutantIDPrintsDirectiveWarningsOnce(t *testing.T) {
+	dir := writeModuleWithFiles(t, map[string]string{
+		"add.go":      "package testmod\n\n// gomutants:disable-next-line ARITHMETC reason=\"x\"\nfunc Add(a, b int) int {\n\treturn a + b\n}\n",
+		"add_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
+	})
+	t.Chdir(dir)
+
+	out, err := captureStderr(t, func() error {
+		return runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1")
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if n := strings.Count(out, `"ARITHMETC"`); n != 1 {
+		t.Errorf("the unknown-mutator warning appeared %d times, want 1; stderr:\n%s", n, out)
+	}
+}
+
+// TestDiscoveryPkgsScopesToRunMutantID: under --run-mutant-id, discovery
+// parses only the files the id could name; otherwise every file.
+func TestDiscoveryPkgsScopesToRunMutantID(t *testing.T) {
+	pkgs := []discover.Package{{Dir: "/m", ImportPath: "m", GoFiles: []string{"a.go", "b.go"}}}
+	mr := &mutationRun{pkgs: pkgs, projectDir: "/m"}
+	if got := mr.discoveryPkgs(); !slices.Equal(got[0].GoFiles, []string{"a.go", "b.go"}) {
+		t.Errorf("without an id: GoFiles = %v, want both files", got[0].GoFiles)
+	}
+	mr.cfg.RunMutantID = "b.go:F:ARITHMETIC_BASE#1"
+	if got := mr.discoveryPkgs(); !slices.Equal(got[0].GoFiles, []string{"b.go"}) {
+		t.Errorf("with an id in b.go: GoFiles = %v, want [b.go]", got[0].GoFiles)
+	}
+}
+
+// TestChangedLinesAsksGitOnce: the second call returns what the first one
+// read, without running git — projectDir here is no repository, so a
+// second git call would fail.
+func TestChangedLinesAsksGitOnce(t *testing.T) {
+	ranges := map[string][]discover.LineRange{"a.go": {{Start: 1, End: 2}}}
+	mr := &mutationRun{projectDir: t.TempDir(), diffLoaded: true, diffRoot: "/root", diffRanges: ranges}
+	mr.cfg.ChangedSince = "HEAD"
+	root, got, err := mr.changedLines(context.Background())
+	if err != nil {
+		t.Fatalf("changedLines: %v", err)
+	}
+	if root != "/root" || len(got["a.go"]) != 1 {
+		t.Errorf("changedLines = (%q, %v), want the memoized (/root, %v)", root, got, ranges)
+	}
+
+	mr.diffLoaded = false
+	if _, _, err := mr.changedLines(context.Background()); err == nil {
+		t.Fatal("without the memo, changedLines must ask git, which fails outside a repository")
+	}
+}
+
 func TestRunMutantIDSuppressedIsUsageError(t *testing.T) {
 	dir := writeModuleWithFiles(t, map[string]string{
 		"add.go": "package testmod\n\nfunc Add(a, b int) int {\n" +
 			"\treturn a + b // gomutants:disable ARITHMETIC_BASE reason=\"checked elsewhere\"\n}\n",
 		"add_test.go": "package testmod\n\nimport \"testing\"\n\nfunc TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n\t\tt.Fatal(\"wrong\")\n\t}\n}\n",
 	})
-	orig, _ := os.Getwd()
-	os.Chdir(dir)
-	defer os.Chdir(orig)
-
+	t.Chdir(dir)
 	// The id resolves — the directive filter runs after FilterByStableID —
-	// so without the guard this run would test nothing and exit 0.
-	err := run(context.Background(), []string{
-		"--only", "ARITHMETIC_BASE",
-		"--run-mutant-id", "add.go:Add:ARITHMETIC_BASE#1",
-		"-w", "1", "--cache=off",
-		"-o", filepath.Join(dir, "report.json"),
-		"testmod",
-	})
+	// so without the guard this run would test nothing and exit 0. The
+	// directive needs only the source, so the early check reports it
+	// before coverage or the baseline is paid for.
+	stubSlowPhases(t)
+
+	err := runOneMutant(dir, "add.go:Add:ARITHMETIC_BASE#1")
 	requireExitCode(t, err, exitCodeUsageError)
 	want := `the mutant matching --run-mutant-id "add.go:Add:ARITHMETIC_BASE#1" is suppressed at add.go:4 (checked elsewhere)`
 	if err.Error() != want {
