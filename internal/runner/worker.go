@@ -373,13 +373,17 @@ type overlay struct {
 	Replace map[string]string `json:"Replace"`
 }
 
-// pipeDrainDelay bounds how long a run of a test binary waits, once the
-// binary has exited or been killed, for output pipes a process it started
-// still holds open. A var so tests can shorten it.
+// pipeDrainDelay bounds how long a run of a test binary, or a build of
+// one, waits, once it has exited or been killed, for output pipes a
+// process it started still holds open. A var so tests can shorten it.
 var pipeDrainDelay = 5 * time.Second
 
 // buildTimeout bounds building a mutant's test binary (see
-// Worker.buildBin).
+// Worker.buildBin). It is no deadline sized from anything, only a stop
+// for a build that hangs without growing, which the RSS monitor can't
+// see — on a module proxy, a stuck -toolexec: far past any real compile
+// and link, under any --workers contention. A var so tests can shorten
+// it.
 var buildTimeout = 10 * time.Minute
 
 // testBinaryArgsFunc reads the arguments `go test` passes a test binary
@@ -583,6 +587,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 // contention outlasts any deadline sized from a fast test — so a
 // deadline that covered it would turn a mutant the tests kill or survive
 // at once TIMED_OUT, which drops it from the efficacy denominator (#106).
+// A build gets only buildTimeout's stop for a hang instead.
 //
 // A failed build or start ends the run like any other terminal outcome.
 // So does a cancelled ctx, which kills the build or run in flight or
@@ -627,8 +632,13 @@ func (w *Worker) recheck(ctx context.Context, m mutator.Mutant, full map[string]
 // buildBin returns pkg's test binary with the mutant in place, building it
 // on first use, and Lived, or the outcome that ends the mutant's run
 // instead. The path is "" for a package without tests, of which `go test
-// -c` builds no binary. The build has no deadline (see runGroups): the RSS
-// monitor stops a runaway compile or link, and ctx still cancels it.
+// -c` builds no binary.
+//
+// The build is outside the mutant's deadline (see runGroups). The RSS
+// monitor stops a runaway compile or link, and buildTimeout one that
+// hangs: it kills the build's whole process group, so a tool `go` started
+// goes with it, and reads as InfraError, as a hung build is the host's
+// failure, not the mutant's verdict. ctx still cancels the build.
 func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.MutantStatus) {
 	if bin, ok := w.bins[pkg]; ok {
 		return bin, mutator.StatusLived
@@ -639,7 +649,11 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 	// One an earlier mutant left here must not stand in for a package
 	// without tests, of which the build writes none.
 	_ = os.Remove(bin)
-	cmd, stdout, stderr := w.makeCmd(ctx, "go", w.projectDir, w.buildArgs(pkg, bin))
+	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
+	defer cancel()
+	cmd, stdout, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin))
+	killGroupOnCancel(cmd)
+	cmd.WaitDelay = pipeDrainDelay
 	runErr, memKilled, err := w.runMonitored(cmd)
 	if err != nil {
 		return "", w.startFailure(err)
@@ -647,6 +661,10 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 	// The monitor's kill fails the build too, so a nil error is a build
 	// that finished.
 	if runErr != nil {
+		if buildCtx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s took over %v, treating as %s\n", w.id, pkg, buildTimeout, mutator.StatusInfraError)
+			return "", mutator.StatusInfraError
+		}
 		return "", classifyBuildFailure(runErr, memKilled, stdout.String(), stderr.String())
 	}
 	if _, err := os.Stat(bin); err != nil {

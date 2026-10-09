@@ -44,8 +44,8 @@ func applyProcessGroup(cmd *exec.Cmd) {
 
 // killGroupOnCancel leaves cmd as it is: Windows has no process group to
 // kill, so cancellation kills cmd alone, exec's default. The WaitDelay
-// runBin sets still bounds a wait on output held open by a process it
-// started.
+// runBin and buildBin set still bounds a wait on output held open by a
+// process it started.
 func killGroupOnCancel(*exec.Cmd) {
 	// Intentionally empty: see above.
 }
