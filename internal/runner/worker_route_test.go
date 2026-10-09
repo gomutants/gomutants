@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/coverage"
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/coverage"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // routeMap builds a TestMap whose index routes one position to the given

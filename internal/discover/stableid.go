@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // funcSpan is one top-level function's byte range in a source file,

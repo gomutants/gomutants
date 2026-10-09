@@ -70,7 +70,7 @@ runs:
       shell: bash
       env:
         VERSION: ${{ inputs.version }}
-        REPO: szhekpisov/gomutants
+        REPO: gomutants/gomutants
         GH_TOKEN: ${{ github.token }}
       # For a release tag — stable or -rcN — (or "latest") we download the
       # prebuilt binary and verify its signed build attestation, so the
@@ -98,7 +98,11 @@ runs:
 
         if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$ ]]; then
           echo "::warning::Version '$VERSION' is not a release tag; falling back to 'go install' without signature verification"
-          go install "github.com/szhekpisov/gomutants@$VERSION"
+          # Refs from before the module moved to github.com/gomutants/gomutants
+          # still declare the old path in go.mod, and go install rejects a
+          # path that doesn't match the one go.mod declares.
+          go install "github.com/gomutants/gomutants@$VERSION" \
+            || go install "github.com/szhekpisov/gomutants@$VERSION"
           exit 0
         fi
 

@@ -748,7 +748,7 @@ A future enhancement worth tracking: memoize the coverage profile on
 the cache so warm-cache no-op runs skip the `-count=1` step entirely.
 That would drop the single-package targets below ~1 s and the tsdb-4
 target to single-digit seconds. Filed as
-[issue #38](https://github.com/szhekpisov/gomutants/issues/38).
+[issue #38](https://github.com/gomutants/gomutants/issues/38).
 
 ## Property-based suites: `--test-flags`
 

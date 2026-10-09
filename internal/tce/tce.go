@@ -36,8 +36,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
-	"github.com/szhekpisov/gomutants/internal/patch"
+	"github.com/gomutants/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/patch"
 )
 
 // execCommandContext, writeFileFunc, and marshalFunc are package-level

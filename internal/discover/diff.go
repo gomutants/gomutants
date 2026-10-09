@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // diffMaxBufSize is both the initial allocation and the maximum line size

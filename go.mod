@@ -1,4 +1,4 @@
-module github.com/szhekpisov/gomutants
+module github.com/gomutants/gomutants
 
 go 1.26.1
 

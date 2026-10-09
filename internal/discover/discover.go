@@ -15,7 +15,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // Package holds resolved package info from go list. Imports/TestImports/
@@ -25,7 +25,7 @@ import (
 // target).
 type Package struct {
 	Dir          string   // Absolute directory path.
-	ImportPath   string   // e.g. "github.com/szhekpisov/gomutants/internal/discover"
+	ImportPath   string   // e.g. "github.com/gomutants/gomutants/internal/discover"
 	GoFiles      []string // .go source files (base names).
 	TestGoFiles  []string // _test.go files (base names).
 	Imports      []string // production imports.

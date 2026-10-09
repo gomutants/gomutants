@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 const directivePrefix = "gomutants:"

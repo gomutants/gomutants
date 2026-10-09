@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/coverage"
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/coverage"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // ResultCallback is called for each completed mutant.

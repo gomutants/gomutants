@@ -6,7 +6,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // WriteGitHubAnnotations writes one ::warning:: workflow command per LIVED

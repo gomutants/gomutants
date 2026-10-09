@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/config"
-	"github.com/szhekpisov/gomutants/internal/discover"
+	"github.com/gomutants/gomutants/internal/config"
+	"github.com/gomutants/gomutants/internal/discover"
 )
 
 // cliOptions is the parsed command line. flags is merged over the config

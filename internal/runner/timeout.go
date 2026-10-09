@@ -3,8 +3,8 @@ package runner
 import (
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/coverage"
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/coverage"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // TimeoutPolicy decides the per-mutant `go test` deadline. Without

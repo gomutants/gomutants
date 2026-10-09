@@ -1,13 +1,13 @@
 # gomutants — Claude Code plugin
 
-Run [gomutants](https://github.com/szhekpisov/gomutants) (Go mutation testing) from Claude Code and turn surviving mutants into concrete `*_test.go` cases.
+Run [gomutants](https://github.com/gomutants/gomutants) (Go mutation testing) from Claude Code and turn surviving mutants into concrete `*_test.go` cases.
 
 The plugin exposes one slash command, `/gomutants:mutants`. It runs `gomutants` on changed code, parses the JSON report, and proposes new tests that would kill each surviving mutant — without editing any files. It also writes a self-contained interactive HTML report to `/tmp/gomutants-report.html` for click-through inspection.
 
 ## Install
 
 ```
-/plugin marketplace add szhekpisov/gomutants
+/plugin marketplace add gomutants/gomutants
 /plugin install gomutants@gomutants
 ```
 
@@ -56,10 +56,10 @@ The wrap-up line points at the HTML report: `open /tmp/gomutants-report.html` (m
 
 ## Links
 
-- [gomutants](https://github.com/szhekpisov/gomutants) — the underlying tool, full CLI reference, mutators, and CI integration
-- [Plugin source](https://github.com/szhekpisov/gomutants/tree/main/plugin) — manifest and command body
-- [Marketplace manifest](https://github.com/szhekpisov/gomutants/blob/main/.claude-plugin/marketplace.json)
+- [gomutants](https://github.com/gomutants/gomutants) — the underlying tool, full CLI reference, mutators, and CI integration
+- [Plugin source](https://github.com/gomutants/gomutants/tree/main/plugin) — manifest and command body
+- [Marketplace manifest](https://github.com/gomutants/gomutants/blob/main/.claude-plugin/marketplace.json)
 
 ## License
 
-[MIT](https://github.com/szhekpisov/gomutants/blob/main/LICENSE) — same as the parent project.
+[MIT](https://github.com/gomutants/gomutants/blob/main/LICENSE) — same as the parent project.

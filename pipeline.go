@@ -11,14 +11,14 @@ import (
 	"slices"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/cache"
-	"github.com/szhekpisov/gomutants/internal/config"
-	"github.com/szhekpisov/gomutants/internal/coverage"
-	"github.com/szhekpisov/gomutants/internal/discover"
-	"github.com/szhekpisov/gomutants/internal/mutator"
-	"github.com/szhekpisov/gomutants/internal/report"
-	"github.com/szhekpisov/gomutants/internal/runner"
-	"github.com/szhekpisov/gomutants/internal/tce"
+	"github.com/gomutants/gomutants/internal/cache"
+	"github.com/gomutants/gomutants/internal/config"
+	"github.com/gomutants/gomutants/internal/coverage"
+	"github.com/gomutants/gomutants/internal/discover"
+	"github.com/gomutants/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/report"
+	"github.com/gomutants/gomutants/internal/runner"
+	"github.com/gomutants/gomutants/internal/tce"
 )
 
 // mutationRun is the state one gomutants invocation carries from phase to
