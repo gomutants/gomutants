@@ -182,6 +182,10 @@ func TestPoolCreateWorkersAppliesGOMAXPROCS(t *testing.T) {
 			t.Errorf("worker[%d].childGOMAXPROCS = %d, want %d (STATEMENT_REMOVE drops the assignment)",
 				i, w.childGOMAXPROCS, want)
 		}
+		// One read of the binaries' arguments serves every worker.
+		if w.binArgs != workers[0].binArgs {
+			t.Errorf("worker[%d].binArgs is its own cache, want the pool's shared one", i)
+		}
 	}
 }
 

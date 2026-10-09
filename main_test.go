@@ -757,10 +757,9 @@ func TestCheckTestFlagsRejects(t *testing.T) {
 		// through; only an ordering like this catches that, since the
 		// accept-side `{"-gcflags", "c"}` case ends on the non-flag field.
 		{"managed flag after a non-flag value", []string{"-gcflags", "all=-N", "-overlay=x"}},
-		// -timeout is enforced twice: on the argv and by the context
-		// deadline in Worker.Test. A longer user value is capped by the
-		// context and still lands as TIMED_OUT, so honoring it on argv
-		// alone would be a lie.
+		// -timeout is enforced by the context deadline each test-binary
+		// run gets in Worker.Test. A longer user value is capped by it and
+		// still lands as TIMED_OUT, so passing it through would be a lie.
 		{"timeout", []string{"-timeout=30s"}},
 		// `go test` forwards a `-test.`-prefixed flag straight to the test
 		// binary, where it beats the one gomutants set: `go test -run=A
@@ -896,6 +895,35 @@ func TestTimeoutPolicyFor(t *testing.T) {
 			tc.cfg.TimeoutMin = floor
 			if got := timeoutPolicyFor(&tc.cfg, global); got != tc.want {
 				t.Errorf("timeoutPolicyFor(--test-flags=%q) = %+v, want %+v", tc.cfg.TestFlags, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestTimeoutPolicyForFloorsCeiling (#106): with adaptive sizing on, a
+// ceiling below --timeout-min rises to it, as a mutant falling back to
+// the ceiling must get no less than the floor every mutant is promised.
+// With it off, --timeout-min doesn't apply, and the ceiling stays as
+// measured; a ceiling at the floor or above stays as it is either way.
+func TestTimeoutPolicyForFloorsCeiling(t *testing.T) {
+	const floor = 2 * time.Second
+	off := false
+	cases := []struct {
+		name     string
+		adaptive *bool
+		global   time.Duration
+		want     time.Duration
+	}{
+		{"adaptive, ceiling below the floor", nil, 1887 * time.Millisecond, floor},
+		{"adaptive, ceiling at the floor", nil, floor, floor},
+		{"adaptive, ceiling above the floor", nil, 3 * time.Second, 3 * time.Second},
+		{"adaptive off, ceiling below the floor", &off, 1887 * time.Millisecond, 1887 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{TimeoutMargin: 3, TimeoutMin: floor, AdaptiveTimeout: tc.adaptive}
+			if got := timeoutPolicyFor(&cfg, tc.global).Global; got != tc.want {
+				t.Errorf("Global = %v, want %v", got, tc.want)
 			}
 		})
 	}

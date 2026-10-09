@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -927,7 +926,7 @@ func TestProcessWorkSkipsStalledPackages(t *testing.T) {
 // stubBuildTestMapDeps swaps BuildTestMap's go-tool seams for stubs: every
 // resolved package compiles, listTests returns `tests`, each compiled test
 // run bumps the returned counter, every group of tests passes together,
-// and neither the test deps nor rebuilds can be read. Restored on cleanup.
+// and the test deps can't be read. Restored on cleanup.
 func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPkg) *int32 {
 	t.Helper()
 	origCompile := compileTestBinaryFunc
@@ -935,7 +934,6 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 	origList := listTestsFunc
 	origRun := runCompiledTestFunc
 	origDeps := testDepsFunc
-	origRebuild := measureRebuildFunc
 	origGroup := groupPassesFunc
 	t.Cleanup(func() {
 		groupPassesFunc = origGroup
@@ -944,13 +942,9 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 		listTestsFunc = origList
 		runCompiledTestFunc = origRun
 		testDepsFunc = origDeps
-		measureRebuildFunc = origRebuild
 	})
 	testDepsFunc = func(context.Context, string, BuildOptions, []string) (map[string]map[string]bool, error) {
 		return nil, errors.New("deps not stubbed")
-	}
-	measureRebuildFunc = func(context.Context, string, BuildOptions, *compiledPkg) (time.Duration, error) {
-		return 0, errors.New("rebuild not stubbed")
 	}
 	groupPassesFunc = func(context.Context, *compiledPkg, []string, time.Duration) bool {
 		return true
@@ -1459,8 +1453,8 @@ func TestBuildFlags(t *testing.T) {
 		{[]string{"xrace", "-race"}, []string{"-race"}},
 	}
 	for _, c := range cases {
-		if got := buildFlags(c.in); !slices.Equal(got, c.want) {
-			t.Errorf("buildFlags(%q) = %q, want %q", c.in, got, c.want)
+		if got := BuildFlags(c.in); !slices.Equal(got, c.want) {
+			t.Errorf("BuildFlags(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
@@ -1533,26 +1527,6 @@ func TestProcessWorkForwardsTinyDurations(t *testing.T) {
 	}
 }
 
-// TestRebuildDuration: a nil map has no measurement, and the test helper
-// replaces the measurements wholesale, leaving the map it is called on as
-// it was.
-func TestRebuildDuration(t *testing.T) {
-	if d, ok := (*TestMap)(nil).RebuildDuration("p"); d != 0 || ok {
-		t.Errorf("nil map: RebuildDuration = (%v, %v), want (0, false)", d, ok)
-	}
-	base := NewTestMapForTesting(map[[2]string]time.Duration{{"p", "TestA"}: time.Millisecond}, nil)
-	got := base.WithRebuildsForTesting(map[string]time.Duration{"q": time.Second})
-	if d, ok := got.RebuildDuration("q"); d != time.Second || !ok {
-		t.Errorf("RebuildDuration(q) = (%v, %v), want (1s, true)", d, ok)
-	}
-	if _, ok := got.RebuildDuration("p"); ok {
-		t.Error("RebuildDuration(p) measured, want the helper's map to replace the fixture's")
-	}
-	if _, ok := base.RebuildDuration("p"); !ok {
-		t.Error("the helper changed the map it was called on")
-	}
-}
-
 // TestStalledPkgs: a package is stalled once added, others aren't, and a
 // nil set records nothing.
 func TestStalledPkgs(t *testing.T) {
@@ -1584,41 +1558,6 @@ func TestBuildTestMapReadsTestDepsOnlyWhenNeeded(t *testing.T) {
 		if calls != want {
 			t.Errorf("coverpkg=%q: testDeps called %d times, want %d", coverPkg, calls, want)
 		}
-	}
-}
-
-// TestMeasureRebuildsSkipsFailures: a package whose rebuild can't be
-// measured gets no measurement, rather than a zero one.
-func TestMeasureRebuildsSkipsFailures(t *testing.T) {
-	orig := measureRebuildFunc
-	t.Cleanup(func() { measureRebuildFunc = orig })
-	measureRebuildFunc = func(_ context.Context, _ string, _ BuildOptions, cp *compiledPkg) (time.Duration, error) {
-		if cp.importPath == "bad" {
-			return 0, errors.New("boom")
-		}
-		return time.Second, nil
-	}
-	var got map[string]time.Duration
-	// One worker for two packages: each measurement must free its slot.
-	runWithDeadline(t, 30*time.Second, func() {
-		got = measureRebuilds(context.Background(), "", BuildOptions{Workers: 1}, map[string]*compiledPkg{"good": {importPath: "good"}, "bad": {importPath: "bad"}})
-	})
-	if want := map[string]time.Duration{"good": time.Second}; !maps.Equal(got, want) {
-		t.Errorf("measureRebuilds = %v, want %v", got, want)
-	}
-}
-
-// TestNewTestMapForTestingRebuilds: every package a fixture names, by its
-// timings or its coverage, rebuilds in no time.
-func TestNewTestMapForTestingRebuilds(t *testing.T) {
-	tm := NewTestMapForTesting(map[[2]string]time.Duration{{"p", "TestA"}: time.Millisecond}, map[string][]TestRef{"f.go:1": {{Pkg: "q", Name: "TestB"}}})
-	for _, pkg := range []string{"p", "q"} {
-		if d, ok := tm.RebuildDuration(pkg); d != 0 || !ok {
-			t.Errorf("RebuildDuration(%s) = (%v, %v), want (0, true)", pkg, d, ok)
-		}
-	}
-	if _, ok := tm.RebuildDuration("r"); ok {
-		t.Error("RebuildDuration(r) measured, want a package the fixture doesn't name unmeasured")
 	}
 }
 

@@ -178,10 +178,12 @@ func failPending(mutants []mutator.Mutant, pending []int, onResult ResultCallbac
 // Run so the loop can be unit-tested directly: with a stub
 // newWorkerFunc, the test sees how many workers were created and what
 // childGOMAXPROCS each ended up with — neither of which is observable
-// through the pool's mutant return value.
+// through the pool's mutant return value. The workers share one read of
+// the arguments their test binaries are run with (see binArgsCache).
 func (p *Pool) createWorkers() []*Worker {
 	workers := make([]*Worker, 0, p.workers)
 	cap := childGOMAXPROCSFor(p.workers)
+	binArgs := &binArgsCache{}
 	for i := range p.workers {
 		w, err := newWorkerFunc(i, p.tmpDir, p.policy, p.srcCache, p.projectDir, p.testMap)
 		if err != nil {
@@ -192,6 +194,7 @@ func (p *Pool) createWorkers() []*Worker {
 		w.testCPU = p.exec.TestCPU
 		w.tags = p.exec.Tags
 		w.testFlags = p.exec.TestFlags
+		w.binArgs = binArgs
 		workers = append(workers, w)
 	}
 	return workers
@@ -232,8 +235,8 @@ func mutantLess(a, b mutator.Mutant) bool {
 // it is no longer read as a package — it is forwarded to the test binary
 // as a positional argument and `go test` falls back to `.`. A test-binary
 // flag (`-rapid.checks=N`) ahead of the packages therefore measures the
-// working directory instead of them. See pkgTestArgs for the same
-// ordering on the mutant runs.
+// working directory instead of them. See Worker.buildArgs for the same
+// ordering on the mutant builds.
 func MeasureBaseline(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
 	args := []string{"test", "-count=1"}
 	if tags != "" {

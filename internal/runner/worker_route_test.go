@@ -25,48 +25,47 @@ func lastArg(args []string) string { return args[len(args)-1] }
 
 func runArg(args []string) (string, bool) {
 	for _, a := range args {
-		if strings.HasPrefix(a, "-run=") {
+		if strings.HasPrefix(a, "-test.run=") {
 			return a, true
 		}
 	}
 	return "", false
 }
 
-// routedInvocations returns the `go test` invocations of m's routed run
-// (see Worker.Test).
-func (w *Worker) routedInvocations(m mutator.Mutant, short bool, timeout time.Duration) [][]string {
-	return w.invocations(w.routeGroups(m), m.Pkg, short, timeout)
+// routedInvocations returns the per-package runs of m's routed run (see
+// Worker.Test).
+func (w *Worker) routedInvocations(m mutator.Mutant) []pkgRun {
+	return invocations(w.routeGroups(m), m.Pkg)
 }
 
-// recheckInvocations returns the `go test` invocations of m's re-check
-// (see Worker.Test), empty when it has none.
-func (w *Worker) recheckInvocations(m mutator.Mutant) [][]string {
-	return w.invocations(w.recheckGroups(m, w.routeGroups(m)), m.Pkg, false, time.Second)
+// recheckInvocations returns the per-package runs of m's re-check (see
+// Worker.Test), empty when it has none.
+func (w *Worker) recheckInvocations(m mutator.Mutant) []pkgRun {
+	return invocations(w.recheckGroups(m, w.routeGroups(m)), m.Pkg)
 }
 
-// invocationsFor builds a worker around tm and returns the `go test`
-// invocations it routes for a mutant in ownPkg at f.go:1.
-func invocationsFor(t *testing.T, tm *coverage.TestMap, ownPkg string) [][]string {
+// invocationsFor builds a worker around tm and returns the per-package
+// runs it routes for a mutant in ownPkg at f.go:1.
+func invocationsFor(t *testing.T, tm *coverage.TestMap, ownPkg string) []pkgRun {
 	t.Helper()
 	w := &Worker{testMap: tm}
-	m := mutator.Mutant{Pkg: ownPkg, CoverageFile: "f.go", Line: 1}
-	return w.routedInvocations(m, false, time.Second)
+	return w.routedInvocations(mutator.Mutant{Pkg: ownPkg, CoverageFile: "f.go", Line: 1})
 }
 
-// checkInvocation asserts that invocation i targets wantPkg and carries the
-// expected -run filter. wantRun=="" means the invocation must have no -run
+// checkInvocation asserts that run i targets wantPkg and passes its binary
+// the expected -test.run filter. wantRun=="" means the run must have no
 // filter (the whole package runs).
-func checkInvocation(t *testing.T, i int, inv []string, wantPkg, wantRun string) {
+func checkInvocation(t *testing.T, i int, run pkgRun, wantPkg, wantRun string) {
 	t.Helper()
-	if got := lastArg(inv); got != wantPkg {
-		t.Errorf("invocation %d package = %q, want %q", i, got, wantPkg)
+	if run.pkg != wantPkg {
+		t.Errorf("invocation %d package = %q, want %q", i, run.pkg, wantPkg)
 	}
-	r, ok := runArg(inv)
+	r, ok := runArg(runArgs(run.tests, nil))
 	switch {
 	case wantRun == "" && ok:
-		t.Errorf("invocation %d has unexpected -run %q; whole package should run", i, r)
+		t.Errorf("invocation %d has unexpected filter %q; whole package should run", i, r)
 	case wantRun != "" && r != wantRun:
-		t.Errorf("invocation %d -run = %q, want %q", i, r, wantRun)
+		t.Errorf("invocation %d filter = %q, want %q", i, r, wantRun)
 	}
 }
 
@@ -91,7 +90,7 @@ func TestRoutedInvocations(t *testing.T) {
 			tm:       routeMap("f.go:1", coverage.TestRef{Pkg: calc, Name: "TestA"}),
 			ownPkg:   calc,
 			wantPkgs: []string{calc},
-			wantRuns: []string{"-run=^(TestA)$"},
+			wantRuns: []string{"-test.run=^(TestA)$"},
 		},
 		{
 			name: "cross package orders own first",
@@ -100,14 +99,14 @@ func TestRoutedInvocations(t *testing.T) {
 				coverage.TestRef{Pkg: calc, Name: "TestCalc"}),
 			ownPkg:   calc,
 			wantPkgs: []string{calc, app},
-			wantRuns: []string{"-run=^(TestCalc)$", "-run=^(TestApp)$"},
+			wantRuns: []string{"-test.run=^(TestCalc)$", "-test.run=^(TestApp)$"},
 		},
 		{
 			name:     "importer only, never own package",
 			tm:       routeMap("f.go:1", coverage.TestRef{Pkg: app, Name: "TestApp"}),
 			ownPkg:   calc,
 			wantPkgs: []string{app},
-			wantRuns: []string{"-run=^(TestApp)$"},
+			wantRuns: []string{"-test.run=^(TestApp)$"},
 		},
 		{
 			name:     "no routing runs whole own package",
@@ -192,6 +191,30 @@ func TestRecheckInvocations(t *testing.T) {
 				checkInvocation(t, i, inv, tc.wantPkgs[i], "")
 			}
 		})
+	}
+}
+
+// TestPkgDir: a test binary runs from its package's directory, as `go
+// test` runs it: the mutated file's for the mutant's own package, the
+// map's for one of its suites, none for a package the map doesn't hold.
+func TestPkgDir(t *testing.T) {
+	tm := routeMap("f.go:1").WithSuitesForTesting(true, nil,
+		coverage.Package{ImportPath: "m/app", Dir: "/src/app"}, coverage.Package{ImportPath: "m/lib", Dir: "/src/lib"})
+	w := &Worker{testMap: tm}
+	m := mutator.Mutant{Pkg: "m/calc", File: filepath.Join("/src", "calc", "c.go")}
+	cases := []struct {
+		pkg, want string
+		ok        bool
+	}{
+		{"m/calc", filepath.Join("/src", "calc"), true},
+		{"m/app", "/src/app", true},
+		{"m/lib", "/src/lib", true},
+		{"m/other", "", false},
+	}
+	for _, tc := range cases {
+		if got, ok := w.pkgDir(m, tc.pkg); got != tc.want || ok != tc.ok {
+			t.Errorf("pkgDir(%s) = (%q, %v), want (%q, %v)", tc.pkg, got, ok, tc.want, tc.ok)
+		}
 	}
 }
 

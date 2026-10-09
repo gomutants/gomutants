@@ -57,6 +57,20 @@ func applyProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
+// killGroupOnCancel makes the end of cmd's context kill its whole process
+// group (see applyProcessGroup) rather than cmd alone, so a process a test
+// started can't outlive a run cut off at its deadline.
+func killGroupOnCancel(cmd *exec.Cmd) {
+	cmd.Cancel = func() error {
+		// On macOS the child joins its group only after fork, so just
+		// after Start the group may not exist yet: kill cmd alone then.
+		if syscallKillFunc(-cmd.Process.Pid, syscall.SIGKILL) != nil {
+			return cmd.Process.Kill()
+		}
+		return nil
+	}
+}
+
 // processGroup resolves the process group leader for pid. With Setpgid:true,
 // Go invokes setpgid in the parent on Linux before returning from Start, but
 // on macOS it happens in the child post-fork, so there's a brief window

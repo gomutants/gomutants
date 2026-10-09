@@ -386,12 +386,21 @@ func runGoVersion(ctx context.Context) string {
 // mode. --test-flags needs no special case: the per-test timings come
 // from the coverage map's runs, which apply the same flags as the mutant
 // runs (see coverageTestFlags).
+//
+// With adaptive sizing on, --timeout-min floors the ceiling too: a small
+// module's baseline×coefficient can sit below it (1.887s against a 2s
+// floor), and the mutants that fall back to the ceiling would get less
+// time than the floor promises every mutant.
 func timeoutPolicyFor(cfg *config.Config, global time.Duration) runner.TimeoutPolicy {
+	adaptive := cfg.AdaptiveTimeoutEnabled()
+	if adaptive {
+		global = max(global, cfg.TimeoutMin)
+	}
 	return runner.TimeoutPolicy{
 		Global:   global,
 		Margin:   cfg.TimeoutMargin,
 		Min:      cfg.TimeoutMin,
-		Adaptive: cfg.AdaptiveTimeoutEnabled(),
+		Adaptive: adaptive,
 	}
 }
 
@@ -406,12 +415,12 @@ var managedTestFlags = map[string]string{
 	"run":          "the test filter comes from the per-test coverage map",
 	"coverprofile": "gomutants owns the coverage profile path; see --coverpkg",
 	"coverpkg":     "use gomutants' own --coverpkg flag",
-	"c":            "gomutants runs tests here, it does not build binaries",
-	"o":            "gomutants runs tests here, it does not build binaries",
+	"c":            "gomutants builds each mutant's test binaries itself",
+	"o":            "gomutants builds each mutant's test binaries itself",
 	"exec":         "gomutants invokes the test binary itself",
-	// gomutants computes -timeout from the adaptive-timeout policy and
-	// caps every run with a context deadline of the same length, so a
-	// longer user value is silently overridden (the mutant still lands as
+	// gomutants computes each mutant's deadline from the adaptive-timeout
+	// policy and cuts every test-binary run off at it, so a longer user
+	// value would be silently overridden (the mutant still lands as
 	// TIMED_OUT) rather than honored.
 	"timeout": "the per-mutant deadline is computed by gomutants; see --timeout-coefficient, --timeout-margin, and --timeout-min",
 }

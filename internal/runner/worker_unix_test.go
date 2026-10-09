@@ -121,14 +121,14 @@ func TestPgroupRSSBytesParsing(t *testing.T) {
 	})
 }
 
-// TestMakeTestCmdSetpgid kills STATEMENT_REMOVE on `cmd.SysProcAttr =
+// TestMakeCmdSetpgid kills STATEMENT_REMOVE on `cmd.SysProcAttr =
 // &syscall.SysProcAttr{Setpgid: true}` (now wrapped in applyProcessGroup).
 // Without it, the child runs in the parent's process group; the RSS
 // monitor would mistakenly include the parent and SIGKILL the entire
 // test process.
-func TestMakeTestCmdSetpgid(t *testing.T) {
+func TestMakeCmdSetpgid(t *testing.T) {
 	w := &Worker{projectDir: ".", policy: TimeoutPolicy{Global: time.Second}}
-	cmd, _, _ := w.makeTestCmd(context.Background(), []string{"version"})
+	cmd, _, _ := w.makeCmd(context.Background(), "go", w.projectDir, []string{"version"})
 	if cmd.SysProcAttr == nil {
 		t.Fatal("SysProcAttr is nil — STATEMENT_REMOVE strips process-group isolation")
 	}
@@ -383,7 +383,8 @@ func TestWorkerTestMonitorGoroutineExits(t *testing.T) {
 // recheckWorker returns a worker whose map routes a mutant in m/calc to
 // m/app's TestApp, with m/app's tests linking m/calc, so a survivor is
 // re-checked against m/calc and m/app in full, and that mutant. Every
-// `go test` it starts runs cmdFor(its package) instead, and the packages
+// test binary it builds is built at once, and every run of one runs
+// cmdFor(its package) instead (see fakeBuildsAndRuns); the packages run
 // are recorded in the order they start.
 func recheckWorker(t *testing.T, global time.Duration, cmdFor func(pkg string) []string) (*Worker, mutator.Mutant, *[]string) {
 	t.Helper()
@@ -391,18 +392,62 @@ func recheckWorker(t *testing.T, global time.Duration, cmdFor func(pkg string) [
 	tm := routeMap("f.go:1", coverage.TestRef{Pkg: app, Name: "TestApp"}).WithSuitesForTesting(true,
 		map[string]map[string]bool{calc: {}, app: {calc: true}},
 		coverage.Package{ImportPath: calc}, coverage.Package{ImportPath: app})
+	w, m := fakeWorker(t, tm, global)
+	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, cmdFor)
+	return w, m, &runs.runs
+}
+
+// fakeWorker returns a worker around tm whose policy is Global alone, and
+// a mutant in m/calc at f.go:1.
+func fakeWorker(t *testing.T, tm *coverage.TestMap, global time.Duration) (*Worker, mutator.Mutant) {
+	t.Helper()
 	file := filepath.Join(t.TempDir(), "f.go")
 	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: global}, map[string][]byte{file: []byte("package calc\n")}, t.TempDir(), tm)
 	if err != nil {
 		t.Fatalf("NewWorker: %v", err)
 	}
-	var started []string
+	return w, mutator.Mutant{Pkg: "m/calc", File: file, CoverageFile: "f.go", Line: 1, Status: mutator.StatusPending}
+}
+
+// fakeRuns records what fakeBuildsAndRuns' stand-ins did: the package of
+// each build and of each run, in the order they started.
+type fakeRuns struct {
+	builds, runs []string
+}
+
+// fakeBuildsAndRuns replaces every command a worker starts with a
+// stand-in. A build of a test binary writes an empty one, unless
+// buildFor(its package) is nil, which stands for a package without tests,
+// then runs buildFor(its package). A run of the binary runs runFor(its
+// package). The binaries' arguments read as none.
+func fakeBuildsAndRuns(t *testing.T, buildFor, runFor func(pkg string) []string) *fakeRuns {
+	t.Helper()
+	origArgs := testBinaryArgsFunc
+	t.Cleanup(func() { testBinaryArgsFunc = origArgs })
+	testBinaryArgsFunc = func(context.Context, string, string, string, []string) ([]string, error) { return nil, nil }
+	got := &fakeRuns{}
+	binPkg := map[string]string{}
 	origStart := startCommandFunc
 	t.Cleanup(func() { startCommandFunc = origStart })
 	startCommandFunc = func(cmd *exec.Cmd) error {
-		pkg := lastArg(cmd.Args)
-		started = append(started, pkg)
-		argv := cmdFor(pkg)
+		var argv []string
+		if bin, ok := builtBin(cmd.Args); ok {
+			pkg := lastArg(cmd.Args)
+			got.builds = append(got.builds, pkg)
+			argv = buildFor(pkg)
+			if argv == nil {
+				argv = []string{"true"}
+			} else {
+				binPkg[bin] = pkg
+				if err := os.WriteFile(bin, nil, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+		} else {
+			pkg := binPkg[cmd.Path]
+			got.runs = append(got.runs, pkg)
+			argv = runFor(pkg)
+		}
 		path, err := exec.LookPath(argv[0])
 		if err != nil {
 			t.Fatalf("LookPath(%s): %v", argv[0], err)
@@ -410,7 +455,216 @@ func recheckWorker(t *testing.T, global time.Duration, cmdFor func(pkg string) [
 		cmd.Path, cmd.Args, cmd.Err = path, argv, nil
 		return cmd.Start()
 	}
-	return w, mutator.Mutant{Pkg: calc, File: file, CoverageFile: "f.go", Line: 1, Status: mutator.StatusPending}, &started
+	return got
+}
+
+// TestWorkerTestRecheckReusesBuilds: the re-check runs the binaries the
+// routed run built, so each package is built once per mutant, and the
+// binaries are gone once the mutant is done.
+func TestWorkerTestRecheckReusesBuilds(t *testing.T) {
+	const calc, app = "m/calc", "m/app"
+	tm := routeMap("f.go:1", coverage.TestRef{Pkg: app, Name: "TestApp"}).WithSuitesForTesting(true,
+		map[string]map[string]bool{calc: {}, app: {calc: true}},
+		coverage.Package{ImportPath: calc}, coverage.Package{ImportPath: app})
+	w, m := fakeWorker(t, tm, 30*time.Second)
+	got := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, func(string) []string { return []string{"true"} })
+	if r := w.Test(context.Background(), m); r.Status != mutator.StatusLived || !r.Rechecked {
+		t.Fatalf("Status=%v Rechecked=%v, want a re-checked LIVED", r.Status, r.Rechecked)
+	}
+	if want := []string{app, calc}; !slices.Equal(got.builds, want) {
+		t.Errorf("builds = %v, want %v: m/app's routed build reused by the re-check", got.builds, want)
+	}
+	if want := []string{app, calc, app}; !slices.Equal(got.runs, want) {
+		t.Errorf("runs = %v, want %v", got.runs, want)
+	}
+	if left, _ := filepath.Glob(filepath.Join(w.binDir, "*.test")); len(left) != 0 {
+		t.Errorf("binaries left behind: %v", left)
+	}
+}
+
+// TestWorkerTestPackageWithoutTests: a package of which `go test -c`
+// builds no binary has no tests, and passes, as its `go test` reported
+// "no test files"; the other packages still run.
+func TestWorkerTestPackageWithoutTests(t *testing.T) {
+	const calc, app = "m/calc", "m/app"
+	tm := routeMap("f.go:1", coverage.TestRef{Pkg: app, Name: "TestApp"}).WithSuitesForTesting(true,
+		map[string]map[string]bool{calc: {}, app: {calc: true}},
+		coverage.Package{ImportPath: calc}, coverage.Package{ImportPath: app})
+	w, m := fakeWorker(t, tm, 30*time.Second)
+	got := fakeBuildsAndRuns(t, func(pkg string) []string {
+		if pkg == calc {
+			return nil
+		}
+		return []string{"true"}
+	}, func(string) []string { return []string{"true"} })
+	if r := w.Test(context.Background(), m); r.Status != mutator.StatusLived {
+		t.Fatalf("Status=%v, want LIVED", r.Status)
+	}
+	if want := []string{app, app}; !slices.Equal(got.runs, want) {
+		t.Errorf("runs = %v, want %v: nothing to run for m/calc", got.runs, want)
+	}
+}
+
+// TestWorkerTestRunDeadline: the routed run's deadline is shared by the
+// runs of its packages, and is not spent on their builds. Each run takes
+// 0.6s of a 1s deadline: shared, the second is cut off. Each build takes
+// 1.2s: counted, even one would be.
+func TestWorkerTestRunDeadline(t *testing.T) {
+	const calc, app = "m/calc", "m/app"
+	cases := []struct {
+		name  string
+		refs  []coverage.TestRef
+		build []string
+		run   []string
+		want  mutator.MutantStatus
+	}{
+		{"builds don't count", []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}}, []string{"sleep", "1.2"}, []string{"true"}, mutator.StatusLived},
+		{"runs share it", []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}, {Pkg: app, Name: "TestApp"}}, []string{"true"}, []string{"sleep", "0.6"}, mutator.StatusTimedOut},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Suites in scope that are only the routed packages: no re-check
+			// beyond them.
+			tm := routeMap("f.go:1", tc.refs...).WithSuitesForTesting(false, nil,
+				coverage.Package{ImportPath: calc}, coverage.Package{ImportPath: app})
+			w, m := fakeWorker(t, tm, time.Second)
+			fakeBuildsAndRuns(t, func(string) []string { return tc.build }, func(string) []string { return tc.run })
+			// The re-check of a survivor gets a deadline of its own; only
+			// the routed run is under test.
+			if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, w.computeTimeout(m)); got != tc.want {
+				t.Errorf("runGroups = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestWorkerTestRunFailures: a run that can't start ends the mutant
+// without a verdict on its tests: a package with no known directory, or
+// binary arguments that can't be read, is an infrastructure error, and a
+// failed start is classified as any other (see startFailure), unless the
+// deadline had already run out by then, which is a timeout.
+func TestWorkerTestRunFailures(t *testing.T) {
+	refs := []coverage.TestRef{{Pkg: "m/calc", Name: "TestCalc"}}
+	cases := []struct {
+		name    string
+		tm      *coverage.TestMap
+		args    error
+		start   error
+		timeout time.Duration
+		want    mutator.MutantStatus
+		log     string // what the worker reports on stderr
+	}{
+		{"no directory", routeMap("f.go:1", coverage.TestRef{Pkg: "m/other", Name: "TestOther"}), nil, nil, time.Second, mutator.StatusInfraError,
+			"worker 0: no directory known for package m/other, treating as INFRA ERROR"},
+		{"arguments unreadable", routeMap("f.go:1", refs...), errors.New("go test -n: boom"), nil, time.Second, mutator.StatusInfraError,
+			"worker 0: go test -n: boom, treating as INFRA ERROR"},
+		{"start fails", routeMap("f.go:1", refs...), nil, errors.New("injected start failure"), time.Second, mutator.StatusNotViable,
+			"cmd.Start failed"},
+		{"deadline spent by the start", routeMap("f.go:1", refs...), nil, nil, 0, mutator.StatusTimedOut, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, m := fakeWorker(t, tc.tm, time.Second)
+			fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, func(string) []string { return []string{"true"} })
+			if tc.args != nil {
+				testBinaryArgsFunc = func(context.Context, string, string, string, []string) ([]string, error) { return nil, tc.args }
+			}
+			if tc.start != nil {
+				fake := startCommandFunc
+				startCommandFunc = func(cmd *exec.Cmd) error {
+					if _, ok := builtBin(cmd.Args); ok {
+						return fake(cmd)
+					}
+					return tc.start
+				}
+			}
+			var got mutator.MutantStatus
+			captured := captureStderr(t, func() {
+				got = w.runGroups(context.Background(), m, w.routeGroups(m), false, tc.timeout)
+			})
+			if got != tc.want {
+				t.Errorf("runGroups = %v, want %v", got, tc.want)
+			}
+			if !strings.Contains(captured, tc.log) {
+				t.Errorf("stderr = %q, want it to report %q", captured, tc.log)
+			}
+		})
+	}
+}
+
+// TestKillGroupOnCancelFallsBack: when the group can't be signalled (on
+// macOS, just after Start, the child may not have joined it yet), the
+// cancel kills the process alone.
+func TestKillGroupOnCancelFallsBack(t *testing.T) {
+	orig := syscallKillFunc
+	t.Cleanup(func() { syscallKillFunc = orig })
+	syscallKillFunc = func(int, syscall.Signal) error { return syscall.ESRCH }
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := exec.CommandContext(ctx, "sleep", "30")
+	applyProcessGroup(cmd)
+	killGroupOnCancel(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		_ = cmd.Process.Kill()
+		t.Fatal("the cancel left the process running")
+	}
+}
+
+// TestWorkerTestDeadlineKillsProcessGroup: a run cut off at its deadline
+// takes down every process its tests started, so one that holds the
+// output open can't keep the mutant waiting. With the binary alone
+// killed, the wait would last until the started process exits (3s), as
+// the drain delay is longer.
+func TestWorkerTestDeadlineKillsProcessGroup(t *testing.T) {
+	origDrain := pipeDrainDelay
+	t.Cleanup(func() { pipeDrainDelay = origDrain })
+	pipeDrainDelay = 10 * time.Second
+	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Second)
+	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
+		func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} })
+	start := time.Now()
+	if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, 300*time.Millisecond); got != mutator.StatusTimedOut {
+		t.Errorf("runGroups = %v, want TIMED OUT", got)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("runGroups took %v, want the group killed at the 300ms deadline", took)
+	}
+}
+
+// TestWorkerTestDeadlineDrainsBounded: when the group can't be killed, a
+// process the tests started that holds the output open keeps the mutant
+// waiting no longer than pipeDrainDelay past the deadline.
+func TestWorkerTestDeadlineDrainsBounded(t *testing.T) {
+	origDrain, origKill := pipeDrainDelay, syscallKillFunc
+	t.Cleanup(func() { pipeDrainDelay, syscallKillFunc = origDrain, origKill })
+	pipeDrainDelay = 200 * time.Millisecond
+	syscallKillFunc = func(int, syscall.Signal) error { return syscall.ESRCH }
+	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Second)
+	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
+		func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} })
+	start := time.Now()
+	if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, 300*time.Millisecond); got != mutator.StatusTimedOut {
+		t.Errorf("runGroups = %v, want TIMED OUT", got)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Errorf("runGroups took %v, want the wait cut off 200ms past the 300ms deadline", took)
+	}
+}
+
+// builtBin returns the binary a `go test -c -o <bin>` argv builds, and
+// whether args is one.
+func builtBin(args []string) (string, bool) {
+	if len(args) < 5 || args[1] != "test" || args[2] != "-c" || args[3] != "-o" {
+		return "", false
+	}
+	return args[4], true
 }
 
 // TestWorkerTestRecheckDeadlinePerPackage: each package of the re-check
@@ -475,13 +729,12 @@ func slowLinkGoflags(t *testing.T) string {
 
 // TestWorkerTestDeadlineExcludesBuild (#106): the adaptive deadline is
 // sized from the covering tests' run time, so it must bound running them,
-// not building their binary too. A mutant's `go test` recompiles and
-// relinks its package first, and a heavy package's link under --workers
-// contention outlasts the --timeout-min floor, which the measured rebuild
-// (timed alone, before the mutant runs) doesn't widen enough. A mutant
-// its tests kill, or survive, at once must not be reported TIMED_OUT for
-// that, which drops it from the efficacy denominator. A test that hangs
-// still times out.
+// not building their binary too. A mutant's package is recompiled and
+// relinked first, and a heavy package's link under --workers contention
+// outlasts the --timeout-min floor. A mutant its tests kill, or survive,
+// at once must not be reported TIMED_OUT for that, which drops it from
+// the efficacy denominator. A test that hangs still times out, at the
+// floor rather than the minute-long ceiling.
 func TestWorkerTestDeadlineExcludesBuild(t *testing.T) {
 	t.Setenv("GOFLAGS", slowLinkGoflags(t))
 	cases := []struct {
@@ -508,12 +761,12 @@ func TestWorkerTestDeadlineExcludesBuild(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			// TestAdd ran in 10ms and the package rebuilt in 100ms when the
-			// map was built, so the deadline is the 1s floor.
+			// TestAdd ran in 10ms when the map was built, so the deadline
+			// is the 1s floor.
 			tm := coverage.NewTestMapForTesting(
 				map[[2]string]time.Duration{{"testmod", "TestAdd"}: 10 * time.Millisecond},
 				map[string][]coverage.TestRef{"testmod/add.go:4": {{Pkg: "testmod", Name: "TestAdd"}}},
-			).WithRebuildsForTesting(map[string]time.Duration{"testmod": 100 * time.Millisecond})
+			)
 			policy := TimeoutPolicy{Global: time.Minute, Margin: 3, Min: time.Second, Adaptive: true}
 			file := filepath.Join(dir, "add.go")
 			w, err := NewWorker(0, t.TempDir(), policy, map[string][]byte{file: []byte(src)}, dir, tm)
@@ -529,9 +782,15 @@ func TestWorkerTestDeadlineExcludesBuild(t *testing.T) {
 			if got := w.computeTimeout(m); got != time.Second {
 				t.Fatalf("computeTimeout = %v, want the 1s floor", got)
 			}
-			if got := w.Test(context.Background(), m); got.Status != tc.want {
+			got := w.Test(context.Background(), m)
+			if got.Status != tc.want {
 				t.Errorf("Status=%v after %v, want %v: the %v link must not count against the 1s deadline",
 					got.Status, got.Duration.Round(time.Millisecond), tc.want, slowLinkDelay)
+			}
+			// The hang is cut off at the floor, not the minute-long
+			// ceiling, which a run given Global instead would wait out.
+			if limit := policy.Global / 2; got.Duration > limit {
+				t.Errorf("Test took %v, want under %v: the run's deadline must be the 1s floor", got.Duration.Round(time.Millisecond), limit)
 			}
 		})
 	}

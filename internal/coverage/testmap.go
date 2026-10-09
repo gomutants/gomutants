@@ -28,15 +28,13 @@ var (
 	resolvePackagesFunc   = resolvePackages
 	listTestsFunc         = listTests
 	listBinTestsFunc      = listBinTests
-	testBinaryArgsFunc    = testBinaryArgs
+	testBinaryArgsFunc    = TestBinaryArgs
 	testDepsFunc          = testDeps
 	parseFileFunc         = ParseFile
 	compileTestBinaryFunc = compileTestBinary
 	runCompiledTestFunc   = runCompiledTest
-	measureRebuildFunc    = measureRebuild
 	groupPassesFunc       = groupPasses
 	statFileFunc          = os.Stat
-	writeFileFunc         = os.WriteFile
 )
 
 // TestMap maps (file, line) positions to the test functions that cover them.
@@ -62,10 +60,6 @@ type TestMap struct {
 	// packages get distinct entries because go test scopes -run within
 	// a single package.
 	durations map[testKey]time.Duration
-
-	// rebuilds is, per package, how long a mutant's `go test` takes to
-	// rebuild its test binary (see measureRebuild).
-	rebuilds map[string]time.Duration
 
 	// suites holds every package in the map's scope that has tests, sorted
 	// by import path, whether or not its coverage binary compiled. A
@@ -99,7 +93,6 @@ func newTestMap(crossPkg bool) *TestMap {
 	return &TestMap{
 		index:     make(map[string]map[testKey]bool),
 		durations: make(map[testKey]time.Duration),
-		rebuilds:  make(map[string]time.Duration),
 		crossPkg:  crossPkg,
 	}
 }
@@ -173,7 +166,6 @@ type compiledPkg struct {
 	importPath string   // Package import path.
 	dir        string   // Package directory (for running the binary).
 	testArgs   []string // Arguments every run of the binary gets (see setTestArgs).
-	probeFile  string   // The file measureRebuild changes (see resolvedPkg).
 }
 
 // BuildOptions configures BuildTestMap.
@@ -231,7 +223,6 @@ func BuildTestMap(ctx context.Context, projectDir string, packages []string, opt
 	if err := setTestArgs(ctx, projectDir, opts, pkgBins); err != nil {
 		return tm.unrouted(err)
 	}
-	tm.rebuilds = measureRebuilds(ctx, projectDir, opts, pkgBins)
 
 	// 2. List each binary's tests. Keying them by the binary's import path
 	// means every listed test has a binary to run against by construction.
@@ -656,7 +647,7 @@ var errNoTestBinary = errors.New("no test files")
 // the returned error so callers can `continue` on a single check.
 //
 // The build flags among opts.TestFlags follow the package, as in the
-// mutant runs; see buildFlags.
+// mutant runs; see BuildFlags.
 //
 // Each binary gets a directory of its own. A file name flattened from the
 // import path can collide (m/api_v1 and m/api/v1 both flatten to
@@ -676,7 +667,7 @@ func compileTestBinary(ctx context.Context, projectDir string, opts BuildOptions
 		args = append(args, tagsBuildFlag+opts.Tags)
 	}
 	args = append(args, pkg.importPath)
-	args = append(args, buildFlags(opts.TestFlags)...)
+	args = append(args, BuildFlags(opts.TestFlags)...)
 
 	cmd := goCmd(ctx, projectDir, args...)
 	var stderr bytes.Buffer
@@ -691,81 +682,7 @@ func compileTestBinary(ctx context.Context, projectDir string, opts BuildOptions
 		binPath:    binPath,
 		importPath: pkg.importPath,
 		dir:        pkg.dir,
-		probeFile:  pkg.probeFile,
 	}, nil
-}
-
-// measureRebuilds measures, for every compiled package, how long a mutant's
-// `go test` spends rebuilding its test binary (see measureRebuild),
-// `opts.Workers` at a time, so the builds contend as the mutant runs' do.
-// A package whose measurement fails gets no entry.
-func measureRebuilds(ctx context.Context, projectDir string, opts BuildOptions, pkgBins map[string]*compiledPkg) map[string]time.Duration {
-	rebuilds := make(map[string]time.Duration, len(pkgBins))
-	var (
-		mu  sync.Mutex
-		wg  sync.WaitGroup
-		sem = make(chan struct{}, opts.Workers)
-	)
-	for pkg, cp := range pkgBins {
-		sem <- struct{}{}
-		wg.Go(func() {
-			defer func() { <-sem }()
-			d, err := measureRebuildFunc(ctx, projectDir, opts, cp)
-			if err != nil {
-				return
-			}
-			mu.Lock()
-			defer mu.Unlock()
-			rebuilds[pkg] = d
-		})
-	}
-	wg.Wait()
-	return rebuilds
-}
-
-// measureRebuild times what a mutant's `go test` of cp's package spends
-// before its tests start: the package recompiled from a changed file, and
-// its test binary relinked. The coverage compile doesn't show this, as a
-// second run serves it from the build cache. The change is a comment,
-// unique to this call, appended to cp.probeFile through an overlay; the
-// flags are the mutant runs' build flags. Building also warms the cache
-// the mutant runs then use.
-//
-// The changed file and overlay go next to cp's test binary, in its own
-// directory; the probe's binary is removed once built. Its name extends
-// that of cp's binary, as a fixed name can be the binary's own: a package
-// named probe builds probe.test, which the probe would overwrite and then
-// remove before the package's tests are listed.
-func measureRebuild(ctx context.Context, projectDir string, opts BuildOptions, cp *compiledPkg) (time.Duration, error) {
-	src, err := os.ReadFile(cp.probeFile)
-	if err != nil {
-		return 0, err
-	}
-	dir := filepath.Dir(cp.binPath)
-	changed := filepath.Join(dir, filepath.Base(cp.probeFile))
-	src = fmt.Appendf(src, "\n// gomutants rebuild probe %d\n", time.Now().UnixNano())
-	ov, _ := json.Marshal(map[string]map[string]string{"Replace": {cp.probeFile: changed}})
-	ovPath := filepath.Join(dir, "overlay.json")
-	if err := errors.Join(writeFileFunc(changed, src, 0o644), writeFileFunc(ovPath, ov, 0o644)); err != nil {
-		return 0, err
-	}
-
-	probeBin := cp.binPath + ".rebuild"
-	defer func() { _ = os.Remove(probeBin) }()
-	args := []string{"test", "-c", "-vet=off", "-o", probeBin, "-overlay=" + ovPath}
-	if opts.Tags != "" {
-		args = append(args, tagsBuildFlag+opts.Tags)
-	}
-	args = append(args, cp.importPath)
-	args = append(args, buildFlags(opts.TestFlags)...)
-	cmd := goCmd(ctx, projectDir, args...)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	start := time.Now()
-	if err := cmd.Run(); err != nil {
-		return 0, fmt.Errorf("go test -c %s: %w\n%s", cp.importPath, err, stderr.String())
-	}
-	return time.Since(start), nil
 }
 
 // goBuildFlags are the `go build` flags that shape a test binary, each
@@ -781,13 +698,13 @@ var goBuildFlags = map[string]bool{
 	"toolexec": true,
 }
 
-// buildFlags returns the build flags among testFlags, read as `go test`
+// BuildFlags returns the build flags among testFlags, read as `go test`
 // reads them: up to -args or `--`, with a value given as the next field.
 // `go test -c` can't take the rest: it rejects any flag it doesn't know,
 // such as a property framework's -rapid.checks=100, where `go test` would
 // hand it to the test binary. Test flags reach the binary through
 // testArgs instead.
-func buildFlags(testFlags []string) []string {
+func BuildFlags(testFlags []string) []string {
 	var out []string
 	for i := 0; i < len(testFlags); i++ {
 		f := testFlags[i]
@@ -986,17 +903,6 @@ func (tm *TestMap) SumDurationsForRefs(refs []TestRef) (time.Duration, bool) {
 	return total, true
 }
 
-// RebuildDuration returns how long a mutant's `go test` of pkg took to
-// rebuild its test binary when measured (see measureRebuild), and whether
-// it was. A mutant's deadline covers that build as well as its tests.
-func (tm *TestMap) RebuildDuration(pkg string) (time.Duration, bool) {
-	if tm == nil {
-		return 0, false
-	}
-	d, ok := tm.rebuilds[pkg]
-	return d, ok
-}
-
 // NewTestMapForTesting constructs a TestMap directly from raw timing
 // data and a "file:line" → tests cover index. Exposed only because the
 // runner-package timeout selector needs to be exercised against
@@ -1009,21 +915,15 @@ func (tm *TestMap) RebuildDuration(pkg string) (time.Duration, bool) {
 // coverIndex: keys are "file:line"; values are the covering tests as
 // (pkg, name) references, mirroring the package-aware index BuildTestMap
 // produces.
-//
-// Every package the fixture names rebuilds in no time, so its
-// deadlines come from the test durations alone; see
-// WithRebuildsForTesting.
 func NewTestMapForTesting(perTest map[[2]string]time.Duration, coverIndex map[string][]TestRef) *TestMap {
 	tm := newTestMap(false)
 	for k, d := range perTest {
 		tm.recordDuration(k[0], k[1], d)
-		tm.rebuilds[k[0]] = 0
 	}
 	for fileLine, refs := range coverIndex {
 		set := make(map[testKey]bool, len(refs))
 		for _, r := range refs {
 			set[testKey{pkg: r.Pkg, name: r.Name}] = true
-			tm.rebuilds[r.Pkg] = 0
 		}
 		tm.index[fileLine] = set
 	}
@@ -1050,15 +950,6 @@ func (tm *TestMap) WithSuitesForTesting(crossPkg bool, deps map[string]map[strin
 func (tm *TestMap) WithWarningsForTesting(warnings ...string) *TestMap {
 	c := *tm
 	c.warnings = warnings
-	return &c
-}
-
-// WithRebuildsForTesting returns a copy of tm whose rebuild durations (see
-// RebuildDuration) are exactly `rebuilds`: a package left out has none.
-// Exposed for the runner's timeout tests, like NewTestMapForTesting.
-func (tm *TestMap) WithRebuildsForTesting(rebuilds map[string]time.Duration) *TestMap {
-	c := *tm
-	c.rebuilds = maps.Clone(rebuilds)
 	return &c
 }
 
@@ -1193,12 +1084,12 @@ func setTestArgs(ctx context.Context, projectDir string, opts BuildOptions, pkgB
 	return nil
 }
 
-// testBinaryArgs returns the arguments `go test` passes a test binary for
+// TestBinaryArgs returns the arguments `go test` passes a test binary for
 // the given flags. It reads them from `go test -n`, which prints the
 // binary's command line without building or running anything, so build
 // flags, test flags (rewritten to -test.X) and -args are split exactly as
 // `go test` splits them for the mutant runs.
-func testBinaryArgs(ctx context.Context, projectDir, tags, pkg string, flags []string) ([]string, error) {
+func TestBinaryArgs(ctx context.Context, projectDir, tags, pkg string, flags []string) ([]string, error) {
 	args := []string{"test", "-n"}
 	if tags != "" {
 		args = append(args, tagsBuildFlag+tags)
@@ -1258,7 +1149,7 @@ func testDeps(ctx context.Context, projectDir string, opts BuildOptions, pkgs []
 	if opts.Tags != "" {
 		args = append(args, tagsBuildFlag+opts.Tags)
 	}
-	args = append(args, buildFlags(opts.TestFlags)...)
+	args = append(args, BuildFlags(opts.TestFlags)...)
 	args = append(args, pkgs...)
 	cmd := goCmd(ctx, projectDir, args...)
 	var stderr bytes.Buffer
@@ -1299,15 +1190,10 @@ func goCmd(ctx context.Context, projectDir string, args ...string) *exec.Cmd {
 type resolvedPkg struct {
 	importPath string
 	dir        string
-	// probeFile is the file measureRebuild changes: the package's first
-	// production file, as mutants change those, or its first test file
-	// in a package without any.
-	probeFile string
 }
 
 func resolvePackages(ctx context.Context, projectDir string, patterns []string, tags string) ([]resolvedPkg, error) {
-	args := []string{"list", "-f", "{{.ImportPath}}\t{{.Dir}}\t" +
-		"{{if .GoFiles}}{{index .GoFiles 0}}{{else if .TestGoFiles}}{{index .TestGoFiles 0}}{{else if .XTestGoFiles}}{{index .XTestGoFiles 0}}{{end}}"}
+	args := []string{"list", "-f", "{{.ImportPath}}\t{{.Dir}}"}
 	if tags != "" {
 		args = append(args, tagsBuildFlag+tags)
 	}
@@ -1325,10 +1211,8 @@ func resolvePackages(ctx context.Context, projectDir string, patterns []string, 
 	var pkgs []resolvedPkg
 	scanner := bufio.NewScanner(&stdout)
 	for scanner.Scan() {
-		importPath, rest, _ := strings.Cut(scanner.Text(), "\t")
-		dir, file, _ := strings.Cut(rest, "\t")
-		// go list lists only packages with a Go file, so file is set.
-		pkgs = append(pkgs, resolvedPkg{importPath: importPath, dir: dir, probeFile: filepath.Join(dir, file)})
+		importPath, dir, _ := strings.Cut(scanner.Text(), "\t")
+		pkgs = append(pkgs, resolvedPkg{importPath: importPath, dir: dir})
 	}
 	return pkgs, nil
 }

@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -372,15 +373,64 @@ type overlay struct {
 	Replace map[string]string `json:"Replace"`
 }
 
-// Worker tests a single mutant using go test with overlay.
+// pipeDrainDelay bounds how long a run of a test binary waits, once the
+// binary has exited or been killed, for output pipes a process it started
+// still holds open. A var so tests can shorten it.
+var pipeDrainDelay = 5 * time.Second
+
+// testBinaryArgsFunc reads the arguments `go test` passes a test binary
+// (see binArgsCache); a var so tests can stub it.
+var testBinaryArgsFunc = coverage.TestBinaryArgs
+
+// binArgsCache holds the arguments every run of a mutant's test binary
+// gets: those `go test` would pass it for the run's flags (see
+// Worker.binFlags), read once and shared by a pool's workers. They depend
+// only on the flags, which are fixed for a run, but reading them takes a
+// package with tests, so the first package a worker builds a binary of is
+// the one they are read for.
+type binArgsCache struct {
+	mu   sync.Mutex
+	args []string
+	read bool
+}
+
+// get returns the cached arguments, reading them for pkg on first use. A
+// failed read isn't cached, so the next mutant tries again.
+func (c *binArgsCache) get(ctx context.Context, projectDir, tags, pkg string, flags []string) ([]string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.read {
+		return c.args, nil
+	}
+	args, err := testBinaryArgsFunc(ctx, projectDir, tags, pkg, flags)
+	if err != nil {
+		return nil, err
+	}
+	c.args, c.read = args, true
+	return args, nil
+}
+
+// Worker tests a single mutant: it builds the test binary of each package
+// whose tests it runs, with the mutant in place through an overlay, then
+// runs the binary.
 type Worker struct {
 	id          int
 	tmpSrcPath  string // Stable temp source file for this worker.
 	overlayPath string // Stable overlay JSON file for this worker.
+	binDir      string // Where the worker's test binaries are built.
 	policy      TimeoutPolicy
 	sourceCache map[string][]byte // Read-only, shared across workers.
 	projectDir  string            // Working directory for go test.
 	testMap     *coverage.TestMap // Per-test coverage map (may be nil).
+
+	// bins holds the current mutant's test binaries by package, built on
+	// first use (see buildBin) so its routed run and re-check share them;
+	// "" marks a package without tests. Test removes them when it returns.
+	bins map[string]string
+
+	// binArgs reads and caches what every run of a test binary is passed;
+	// a pool's workers share one.
+	binArgs *binArgsCache
 
 	// childGOMAXPROCS, if > 0, caps the GOMAXPROCS of each `go test` child.
 	// Limits compile + test runtime parallelism per child so N parallel workers
@@ -399,21 +449,20 @@ type Worker struct {
 	// Set by the pool after construction, mirroring testCPU.
 	tags string
 
-	// testFlags are the user's --test-flags, appended verbatim to every
-	// inner `go test` argv. Empty appends nothing. They land last of all —
-	// after the flags we set ourselves *and* after the package argument, so
-	// where both spell the same flag the user's value wins (Go's flag
-	// parsing takes the last occurrence) and a flag `go test` does not
-	// recognize cannot demote the package we meant to test into a
-	// positional argument for the test binary.
+	// testFlags are the user's --test-flags. Their build flags go to every
+	// `go test -c` (see buildArgs), and the test-binary arguments `go test`
+	// makes of them to every run of a binary (see binFlags). Empty adds
+	// nothing. They land after the flags we set ourselves, so where both
+	// spell the same flag the user's value wins (Go's flag parsing takes
+	// the last occurrence).
 	//
 	// That "last one wins" rule is argv-level only, and it is not a
-	// general override guarantee: -timeout is also enforced out-of-band by
-	// the context deadline in Worker.Test, so lengthening it via argv
-	// alone would not work. Flags in that class, along with the ones
-	// gomutants depends on (-overlay, -run, …), are rejected at the
-	// CLI boundary and cannot reach here. Set by the pool after
-	// construction, mirroring tags.
+	// general override guarantee: the deadline is enforced out-of-band by
+	// the context each run gets in Worker.Test, so a -timeout would not
+	// lengthen it. Flags in that class, along with the ones gomutants
+	// depends on (-overlay, -run, …), are rejected at the CLI boundary and
+	// cannot reach here. Set by the pool after construction, mirroring
+	// tags.
 	testFlags []string
 }
 
@@ -434,10 +483,12 @@ func NewWorker(id int, tmpDir string, policy TimeoutPolicy, sourceCache map[stri
 		id:          id,
 		tmpSrcPath:  tmpSrc,
 		overlayPath: overlayFile,
+		binDir:      tmpDir,
 		policy:      policy,
 		sourceCache: sourceCache,
 		projectDir:  projectDir,
 		testMap:     testMap,
+		binArgs:     &binArgsCache{},
 	}, nil
 }
 
@@ -487,14 +538,16 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	// The routed run gets the adaptive deadline, sized from its tests'
 	// timings. Each package of the re-check gets the global ceiling: their
 	// timings aren't all known, and a mutant the covering tests pass
-	// rarely hangs.
+	// rarely hangs. Either bounds running the tests only: each test binary
+	// is built first, outside it (see runGroups).
 	short := ShortFlagFromEnv()
+	defer w.removeBins()
 	routed := w.routeGroups(m)
-	status := w.runGroups(ctx, routed, m.Pkg, short, w.computeTimeout(m))
+	status := w.runGroups(ctx, m, routed, short, w.computeTimeout(m))
 	rechecked := false
 	if status == mutator.StatusLived {
 		if full := w.recheckGroups(m, routed); len(full) > 0 {
-			status = w.recheck(ctx, full, m.Pkg, short)
+			status = w.recheck(ctx, m, full, short)
 			rechecked = true
 		}
 	}
@@ -514,23 +567,37 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	return m
 }
 
-// runGroups runs one `go test` per package in groups (see invocations),
-// under one deadline of `timeout` shared by all of them, and returns the
-// first outcome that isn't Lived, or Lived when every package passes. The
-// deadline is computed once and threaded into both the context (which
-// feeds exec.CommandContext's SIGKILL-on-expiry) and the inner -timeout
-// flag (which lets `go test` exit cleanly with its own timeout error), so
-// an odd-shaped TimeoutPolicy can't desync the two. A cmd.Start failure
-// surfaces as NotViable or InfraError from runMutantTest, and ends the run
-// like any other terminal outcome. So does a cancelled ctx, which kills
-// the invocation in flight or fails the next one's start; the caller
-// discards that outcome.
-func (w *Worker) runGroups(ctx context.Context, groups map[string][]string, ownPkg string, short bool, timeout time.Duration) mutator.MutantStatus {
-	testCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	for _, args := range w.invocations(groups, ownPkg, short, timeout) {
-		if status := w.runMutantTest(testCtx, args); status != mutator.StatusLived {
+// runGroups runs the tests of each package in groups in turn (see
+// invocations), and returns the first outcome that isn't Lived, or Lived
+// when every package passes.
+//
+// Each package's test binary is built with m in place (see buildBin)
+// before its tests run, outside the deadline: `timeout` is sized from the
+// tests' run time and bounds running them alone, shared by all of groups.
+// A rebuild takes no time the tests' timings show — a recompile and a
+// relink of the package, which on a heavy package under --workers
+// contention outlasts any deadline sized from a fast test — so a
+// deadline that covered it would turn a mutant the tests kill or survive
+// at once TIMED_OUT, which drops it from the efficacy denominator (#106).
+//
+// A failed build or start ends the run like any other terminal outcome.
+// So does a cancelled ctx, which kills the build or run in flight or
+// fails the next one's start; the caller discards that outcome.
+func (w *Worker) runGroups(ctx context.Context, m mutator.Mutant, groups map[string][]string, short bool, timeout time.Duration) mutator.MutantStatus {
+	left := timeout
+	for _, run := range invocations(groups, m.Pkg) {
+		bin, status := w.buildBin(ctx, run.pkg)
+		if status != mutator.StatusLived {
 			return status
+		}
+		// A package without tests has no binary to run: its `go test`
+		// reports "no test files" and passes.
+		if bin != "" {
+			start := time.Now()
+			if status := w.runBin(ctx, m, run, bin, short, left); status != mutator.StatusLived {
+				return status
+			}
+			left -= time.Since(start)
 		}
 	}
 	return mutator.StatusLived
@@ -542,31 +609,139 @@ func (w *Worker) runGroups(ctx context.Context, groups map[string][]string, ownP
 // to itself. Global is sized from one `go test` of every package at once,
 // in parallel, so one deadline shared by suites run one after another
 // would run out on a mutant many suites link, turning a survivor
-// TIMED_OUT, which drops it from the efficacy denominator.
-func (w *Worker) recheck(ctx context.Context, full map[string][]string, ownPkg string, short bool) mutator.MutantStatus {
-	for _, pkg := range orderRoutePackages(full, ownPkg) {
-		if status := w.runGroups(ctx, map[string][]string{pkg: nil}, ownPkg, short, w.policy.Global); status != mutator.StatusLived {
+// TIMED_OUT, which drops it from the efficacy denominator. A package the
+// routed run built a binary of runs that binary again.
+func (w *Worker) recheck(ctx context.Context, m mutator.Mutant, full map[string][]string, short bool) mutator.MutantStatus {
+	for _, pkg := range orderRoutePackages(full, m.Pkg) {
+		if status := w.runGroups(ctx, m, map[string][]string{pkg: nil}, short, w.policy.Global); status != mutator.StatusLived {
 			return status
 		}
 	}
 	return mutator.StatusLived
 }
 
-// runMutantTest runs one `go test` invocation under the RSS monitor and
-// returns its classified status. A cmd.Start failure (an infrastructure
-// problem — exec/fork failure, PATH misconfig, rlimit — not a mutant-viability
-// signal) is reported as InfraError when it carries a recognized signature,
-// or NotViable otherwise. The caller treats either as a terminal outcome.
-//
-// Extracted from Worker.Test so the integration path can drive it once per
-// covering package while sharing a single per-mutant deadline.
-func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.MutantStatus {
-	cmd, stdout, stderr := w.makeTestCmd(testCtx, args)
+// buildBin returns pkg's test binary with the mutant in place, building it
+// on first use, and Lived, or the outcome that ends the mutant's run
+// instead. The path is "" for a package without tests, of which `go test
+// -c` builds no binary. The build has no deadline (see runGroups): the RSS
+// monitor stops a runaway compile or link, and ctx still cancels it.
+func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.MutantStatus) {
+	if bin, ok := w.bins[pkg]; ok {
+		return bin, mutator.StatusLived
+	}
+	// A file name flattened from the import path can collide (m/api_v1 and
+	// m/api/v1 both flatten to m_api_v1), so binaries are numbered instead.
+	bin := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-%d.test", w.id, len(w.bins)))
+	// One an earlier mutant left here must not stand in for a package
+	// without tests, of which the build writes none.
+	_ = os.Remove(bin)
+	cmd, stdout, stderr := w.makeCmd(ctx, "go", w.projectDir, w.buildArgs(pkg, bin))
+	runErr, memKilled, err := w.runMonitored(cmd)
+	if err != nil {
+		return "", w.startFailure(err)
+	}
+	// The monitor's kill fails the build too, so a nil error is a build
+	// that finished.
+	if runErr != nil {
+		return "", classifyBuildFailure(runErr, memKilled, stdout.String(), stderr.String())
+	}
+	if _, err := os.Stat(bin); err != nil {
+		bin = ""
+	}
+	if w.bins == nil {
+		w.bins = make(map[string]string)
+	}
+	w.bins[pkg] = bin
+	return bin, mutator.StatusLived
+}
 
-	if err := startCommandFunc(cmd); err != nil {
-		status := setupErrorStatus(err)
-		fmt.Fprintf(os.Stderr, "gomutants: worker %d: cmd.Start failed, treating as %s: %v\n", w.id, status, err)
-		return status
+// removeBins removes the current mutant's test binaries; the next mutant
+// builds its own.
+func (w *Worker) removeBins() {
+	for _, bin := range w.bins {
+		if bin != "" {
+			_ = os.Remove(bin)
+		}
+	}
+	w.bins = nil
+}
+
+// runBin runs bin, the test binary of run.pkg, as `go test` runs it: from
+// the package's directory, filtered to run.tests, with the arguments `go
+// test` passes for the run's flags (see binArgsCache). The run is cut off
+// TIMED_OUT after timeout.
+//
+// The binary gets no -test.timeout: it would start its own clock along
+// with the deadline's, and its timeout panic, winning the race, would
+// read as a kill. The deadline kills the binary's whole process group
+// instead (see killGroupOnCancel), as a process a test started would
+// otherwise hold the output open past it.
+//
+// Its stderr goes to the same buffer as its stdout, as `go test` merges
+// them: the classifier reads one stream for a test's own failure markers,
+// and a panic is reported on stderr.
+func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) mutator.MutantStatus {
+	dir, ok := w.pkgDir(m, run.pkg)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: no directory known for package %s, treating as %s\n", w.id, run.pkg, mutator.StatusInfraError)
+		return mutator.StatusInfraError
+	}
+	binArgs, err := w.binArgs.get(ctx, w.projectDir, w.tags, run.pkg, w.binFlags(short))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %v, treating as %s\n", w.id, err, mutator.StatusInfraError)
+		return mutator.StatusInfraError
+	}
+	runCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	cmd, output, _ := w.makeCmd(runCtx, bin, dir, runArgs(run.tests, binArgs))
+	cmd.Stderr = output
+	killGroupOnCancel(cmd)
+	cmd.WaitDelay = pipeDrainDelay
+	runErr, memKilled, err := w.runMonitored(cmd)
+	if err != nil {
+		// A deadline that ran out by the start (the routed run's earlier
+		// packages took all of it) fails the start with it.
+		if runCtx.Err() == context.DeadlineExceeded {
+			return mutator.StatusTimedOut
+		}
+		return w.startFailure(err)
+	}
+	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), "", output.truncated)
+}
+
+// pkgDir returns the directory pkg's test binary runs from: the mutated
+// file's for m's own package, the coverage map's for a package of its
+// suites. Every package a mutant runs the tests of is one of those, as
+// the map routes and re-checks only to its suites.
+func (w *Worker) pkgDir(m mutator.Mutant, pkg string) (string, bool) {
+	if pkg == m.Pkg {
+		return filepath.Dir(m.File), true
+	}
+	for _, p := range w.testMap.Suites() {
+		if p.ImportPath == pkg {
+			return p.Dir, true
+		}
+	}
+	return "", false
+}
+
+// startFailure classifies a command that failed to start: an
+// infrastructure problem (exec/fork failure, PATH misconfig, rlimit), not
+// a mutant-viability signal. It is InfraError when it carries a
+// recognized signature, NotViable otherwise; either ends the mutant's run.
+func (w *Worker) startFailure(err error) mutator.MutantStatus {
+	status := setupErrorStatus(err)
+	fmt.Fprintf(os.Stderr, "gomutants: worker %d: cmd.Start failed, treating as %s: %v\n", w.id, status, err)
+	return status
+}
+
+// runMonitored runs cmd (see makeCmd) under the RSS monitor and returns
+// how it ended: its Wait error, and whether the monitor killed it. A
+// failure to start is returned as startErr, with nothing run (see
+// startFailure).
+func (w *Worker) runMonitored(cmd *exec.Cmd) (runErr error, memKilled bool, startErr error) {
+	if startErr = startCommandFunc(cmd); startErr != nil {
+		return
 	}
 
 	// Resolve the process-group "handle" we'll later kill if RSS runs away.
@@ -578,7 +753,7 @@ func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.M
 	// and processGroup returns pid unchanged.
 	pgid := processGroup(cmd.Process.Pid)
 
-	var memKilled atomic.Bool
+	var killed atomic.Bool
 	monitorDone := make(chan struct{})
 	monitorExited := make(chan struct{})
 	go func() {
@@ -596,7 +771,7 @@ func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.M
 				return
 			case <-t.C:
 				if pgroupRSSBytes(pgid) > maxSubprocRSSBytes {
-					memKilled.Store(true)
+					killed.Store(true)
 					killPgroup(pgid)
 					return
 				}
@@ -611,24 +786,21 @@ func (w *Worker) runMutantTest(testCtx context.Context, args []string) mutator.M
 	// race with the next test's swap of those package-level vars (caught by
 	// `go test -race`).
 	<-monitorExited
-
-	// Only stdout's truncation flag is passed on: the `--- FAIL: ` marker that
-	// vetoes infra classification is printed on stdout, so a dropped tail
-	// there is what makes its absence unsound. Losing the tail of stderr can
-	// only hide a signature, which fails safe as KILLED.
-	return classifyTestOutcome(err, memKilled.Load(), testCtx.Err(), stdout.String(), stderr.String(), stdout.truncated)
+	return err, killed.Load(), nil
 }
 
-// makeTestCmd builds the *exec.Cmd that runs the mutated `go test` plus
-// its capped stdout/stderr buffers. Extracted from Worker.Test so each
-// piece of cmd configuration (process group, GOMAXPROCS env, capped
-// buffers) can be asserted on directly. Without extraction the cmd is
-// local to Test and the SysProcAttr / Env mutations are invisible to tests.
-func (w *Worker) makeTestCmd(ctx context.Context, args []string) (*exec.Cmd, *cappedBuffer, *cappedBuffer) {
-	cmd := execCommandContext(ctx, "go", args...)
-	cmd.Dir = w.projectDir
-	// Put go test + its compiler + test-binary descendants in their own
-	// process group so we can kill the whole tree if RSS runs away.
+// makeCmd builds the *exec.Cmd that runs name with args from dir — a
+// mutant's `go test -c`, or the test binary it built — plus its capped
+// stdout/stderr buffers. Extracted from Worker.Test so each piece of cmd
+// configuration (process group, GOMAXPROCS env, capped buffers) can be
+// asserted on directly. Without extraction the cmd is local to Test and
+// the SysProcAttr / Env mutations are invisible to tests.
+func (w *Worker) makeCmd(ctx context.Context, name, dir string, args []string) (*exec.Cmd, *cappedBuffer, *cappedBuffer) {
+	cmd := execCommandContext(ctx, name, args...)
+	cmd.Dir = dir
+	// Put go test -c + its compiler, or the test binary + what its tests
+	// start, in their own process group so we can kill the whole tree if
+	// RSS runs away.
 	// applyProcessGroup is platform-specific (Setpgid on Unix,
 	// CREATE_NEW_PROCESS_GROUP on Windows).
 	applyProcessGroup(cmd)
@@ -649,60 +821,59 @@ func (w *Worker) makeTestCmd(ctx context.Context, args []string) (*exec.Cmd, *ca
 	return cmd, stdout, stderr
 }
 
-// baseTestArgs builds the flag-only prefix shared by every `go test`
-// invocation for a mutant — everything except the `-run` filter, the
-// package argument, and the user's --test-flags that follow it. Split out
-// so both the single-package builder and the per-package integration
-// builder share one source of truth for the flag wiring (and so each flag
-// stays unit-testable).
+// buildArgs constructs the `go test -c` argv that builds pkg's test binary
+// to bin with the mutant's overlay in place. Kept as a distinct builder so
+// callers can verify the flag and package wiring without spinning up a
+// subprocess.
 //
-// `timeout` is the resolved per-mutant deadline (computed by the caller
-// from TimeoutPolicy), threaded into both the outer context and the
-// `-timeout=` flag.
-func (w *Worker) baseTestArgs(short bool, timeout time.Duration) []string {
+// Of the user's --test-flags only the build flags apply (see
+// coverage.BuildFlags): `go test -c` rejects any flag it doesn't know,
+// such as a property framework's -rapid.checks=100, where `go test` would
+// hand it to the test binary; those reach the binary through binFlags.
+// They go last, after the package, as `go test` reads them there too (see
+// binFlags), and Go takes the last occurrence of a repeated flag, so a
+// user value still beats ours.
+func (w *Worker) buildArgs(pkg, bin string) []string {
 	// -vet=off: vet runs in the user's CI on clean source; re-running it
 	// per mutant is pure overhead. Measured ~17–39% per-mutant wall-clock
 	// reduction on representative packages.
-	args := []string{"test", "-count=1", "-failfast", "-vet=off",
-		fmt.Sprintf("-timeout=%s", timeout),
-		fmt.Sprintf("-overlay=%s", w.overlayPath),
-	}
-	if w.testCPU > 0 {
-		args = append(args, fmt.Sprintf("-cpu=%d", w.testCPU))
-	}
+	args := []string{"test", "-c", "-o", bin, "-vet=off", "-overlay=" + w.overlayPath}
 	if w.tags != "" {
 		args = append(args, "-tags="+w.tags)
 	}
-	// GOMUTANTS_TEST_SHORT=1 propagates -short to inner go test, letting the
-	// target suite skip heavy integration tests. Used for gomutants self-testing
-	// to avoid recursive worker-pool fanout.
-	if short {
-		args = append(args, "-short")
-	}
-	return args
+	args = append(args, pkg)
+	return append(args, coverage.BuildFlags(w.testFlags)...)
 }
 
-// pkgTestArgs constructs the `go test` argv for one package, filtered to
-// `tests` with -run, or running the whole package when tests is nil. Kept
-// as a distinct builder so callers can verify the -short, -run, and
-// package arg wiring without spinning up a subprocess.
-//
-// The user's --test-flags go last, after the package. `go test` goes on
-// parsing its own flags past one it does not recognize, but that first
-// unrecognized flag marks the package list as already seen, so a package
-// name after it is forwarded to the test binary as a positional argument
-// and `go test` falls back to `.`. A test-binary flag ahead of the
-// package therefore leaves the working directory to be tested and every
-// mutant reported LIVED. Trailing placement also preserves the override
-// rule — Go takes the last occurrence of a repeated flag, so a user value
-// still beats ours.
-func (w *Worker) pkgTestArgs(pkg string, tests []string, short bool, timeout time.Duration) []string {
-	args := w.baseTestArgs(short, timeout)
-	if tests != nil {
-		args = append(args, fmt.Sprintf("-run=%s", coverage.RunPattern(tests)))
+// binFlags returns the `go test` flags a mutant's runs of its test
+// binaries are run as: ours, then the user's --test-flags. binArgsCache
+// reads, through `go test -n`, the binary arguments `go test` makes of
+// them, so test flags are rewritten to -test.X and -args split exactly
+// as `go test` would.
+func (w *Worker) binFlags(short bool) []string {
+	flags := []string{"-failfast"}
+	if w.testCPU > 0 {
+		flags = append(flags, fmt.Sprintf("-cpu=%d", w.testCPU))
 	}
-	args = append(args, pkg)
-	return append(args, w.testFlags...)
+	// GOMUTANTS_TEST_SHORT=1 propagates -short to the tests, letting the
+	// target suite skip heavy integration tests. Used for gomutants
+	// self-testing to avoid recursive worker-pool fanout.
+	if short {
+		flags = append(flags, "-short")
+	}
+	return append(flags, w.testFlags...)
+}
+
+// runArgs returns the argv of one run of a test binary: the -test.run
+// filter for tests, or none to run them all when tests is nil, then
+// binArgs (see binArgsCache). Ours go first: a positional argument among
+// binArgs (after a user's -args) ends the binary's flag parsing.
+func runArgs(tests, binArgs []string) []string {
+	var args []string
+	if tests != nil {
+		args = append(args, "-test.run="+coverage.RunPattern(tests))
+	}
+	return append(args, binArgs...)
 }
 
 // routeGroups returns the packages to run first for m, each mapped to the
@@ -745,22 +916,27 @@ func (w *Worker) recheckGroups(m mutator.Mutant, routed map[string][]string) map
 	return full
 }
 
-// invocations returns the ordered `go test` argv lists for groups, one per
-// package, filtered to its tests with -run or running it in full when its
-// entry is nil.
+// pkgRun is one package's part of a mutant's run: the tests to run in it,
+// or nil to run all of them.
+type pkgRun struct {
+	pkg   string
+	tests []string
+}
+
+// invocations returns the ordered runs of groups, one per package.
 //
-// Per-package invocations are required because `go test -run` applies its
-// regex independently per package and `-failfast` does not short-circuit
-// across packages; a single multi-package invocation would mis-route
-// same-named tests and run every package even after one already killed the
-// mutant. The mutant's own package is ordered first so the cheapest, most
-// likely killer runs before any cross-package suite.
-func (w *Worker) invocations(groups map[string][]string, ownPkg string, short bool, timeout time.Duration) [][]string {
-	invs := make([][]string, 0, len(groups))
+// Per-package runs are required because a -run filter names tests
+// independently per package and a failing test ends only its own
+// package's binary; one filter across packages would mis-route same-named
+// tests and run every package even after one already killed the mutant.
+// The mutant's own package is ordered first so the cheapest, most likely
+// killer runs before any cross-package suite.
+func invocations(groups map[string][]string, ownPkg string) []pkgRun {
+	runs := make([]pkgRun, 0, len(groups))
 	for _, pkg := range orderRoutePackages(groups, ownPkg) {
-		invs = append(invs, w.pkgTestArgs(pkg, groups[pkg], short, timeout))
+		runs = append(runs, pkgRun{pkg: pkg, tests: groups[pkg]})
 	}
-	return invs
+	return runs
 }
 
 // orderRoutePackages returns the covering packages with the mutant's own
@@ -829,6 +1005,35 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 		return mutator.StatusInfraError
 	}
 	if unexplainedKill(runErr, stdout) && !killVetoed(stdout, truncated) {
+		return mutator.StatusInfraError
+	}
+	return mutator.StatusKilled
+}
+
+// classifyBuildFailure decides the status of a mutant whose test binary
+// failed to build (see Worker.buildBin). No test has run, so every byte of
+// the output is the toolchain's: a compile diagnostic is the mutation's
+// doing, and both signature lists, the generic build-phase wordings too,
+// mean the host failed (see infraFromOutput for the narrower reading a
+// test run's output gets). So does a SIGKILL gomutants didn't send.
+//
+// Priority order:
+//  1. memKilled → TimedOut (RSS monitor SIGKILL'd the build).
+//  2. stderr carries a `file.go:N:N:` compile error → NotViable.
+//  3. a recognized infrastructure signature, or an unexplained SIGKILL →
+//     InfraError.
+//  4. Otherwise → Killed, as such a failure of the whole `go test` read.
+func classifyBuildFailure(runErr error, memKilled bool, stdout, stderr string) mutator.MutantStatus {
+	if memKilled {
+		return mutator.StatusTimedOut
+	}
+	if compileErrorRe.MatchString(stderr) {
+		return mutator.StatusNotViable
+	}
+	lower := strings.ToLower(stdout + "\n" + stderr)
+	if matchesAnySignature(lower, buildPhaseInfraSignatures) ||
+		matchesAnySignature(lower, testPhaseInfraSignatures) ||
+		unexplainedKill(runErr, stdout) {
 		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled
