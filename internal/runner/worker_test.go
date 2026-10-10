@@ -1007,67 +1007,67 @@ func TestClassifyTestOutcome(t *testing.T) {
 		runErr     error
 		memKilled  bool
 		testCtxErr error
-		stdout     string
-		stderr     string
+		output     string
 		want       mutator.MutantStatus
 	}{
-		{"memkilled beats infrastructure error", anyErr, true, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", "", mutator.StatusTimedOut},
+		{"memkilled beats infrastructure error", anyErr, true, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
 		// memKilled with otherwise-clean outcome: if the BRANCH_IF on the
 		// memKilled early return is elided, execution falls through to
 		// `runErr == nil → Lived`. Asserting TimedOut here kills that
 		// mutation.
-		{"memkilled alone still wins", nil, true, nil, "", "", mutator.StatusTimedOut},
-		{"success beats infrastructure error", nil, false, nil, "FATAL ERROR: OUT OF MEMORY", "", mutator.StatusLived},
-		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "", "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
-		{"compile failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [build failed]\nFATAL ERROR: OUT OF MEMORY\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
-		{"setup failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\nFATAL ERROR: OUT OF MEMORY\n", mutator.StatusNotViable},
-		{"stderr compile regex but no [build failed] in stdout => killed", anyErr, false, nil,
-			"--- FAIL: TestX\nadd_test.go:7: wrong\n", "worker-0.go:5:2: undefined\n", mutator.StatusKilled},
-		{"[build failed] in stdout but no compile regex in stderr => killed", anyErr, false, nil,
-			"FAIL [build failed]\n", "", mutator.StatusKilled},
+		{"memkilled alone still wins", nil, true, nil, "", mutator.StatusTimedOut},
+		{"success beats infrastructure error", nil, false, nil, "FATAL ERROR: OUT OF MEMORY", mutator.StatusLived},
+		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
+		// The binary was built beforehand, so a compile diagnostic or a
+		// `[build failed]` in its output is a test's own text: no verdict
+		// on whether the mutant compiles.
+		{"a test printing a compile diagnostic stays killed", anyErr, false, nil,
+			"FAIL\ttestmod [build failed]\nworker-0.go:5:2: undefined: Foo\n", mutator.StatusKilled},
+		// Nor does that marker promote the generic wordings a failed build
+		// is trusted with: printed by a test that exits through log.Fatal,
+		// with no `--- FAIL: ` line, they are its own words.
+		{"a test printing a build marker and a generic phrase stays killed", anyErr, false, nil,
+			"FAIL\ttestmod [build failed]\nresource temporarily unavailable\n", mutator.StatusKilled},
 		{"normal test failure => killed", anyErr, false, nil,
-			"--- FAIL: TestAdd\n", "add_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
+			"--- FAIL: TestAdd\nadd_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
 		// Neither signal gomutants sends reaches here: the RSS monitor's is
 		// memKilled and the deadline's is DeadlineExceeded, both already
 		// TIMED OUT. A SIGKILL with no test output to explain it came from
 		// the kernel, a cgroup, or the CI runner.
 		{"unexplained signal killed => infra error", errors.New("signal: killed"), false, nil,
-			"", "", mutator.StatusInfraError},
+			"", mutator.StatusInfraError},
 		// ... unless a test reported the mutation first, in which case the
 		// process being reaped afterwards changes nothing.
 		{"reported failure beats an unexplained signal killed", errors.New("signal: killed"), false, nil,
-			"--- FAIL: TestAdd\n", "", mutator.StatusKilled},
-		// The tested code's own output lands on the same stdout as the test
+			"--- FAIL: TestAdd\n", mutator.StatusKilled},
+		// The tested code's own output lands on the same stream as the test
 		// framework's. A test that reported a failure detected the mutation,
 		// so a signature it printed itself must not launder the kill into a
 		// non-result — this kills the negation of the `--- FAIL: ` guard.
 		{"reported test failure beats infrastructure signature", anyErr, false, nil,
-			"--- FAIL: TestDiskFull\n    disk_test.go:9: got \"no space left on device\", want nil\n", "", mutator.StatusKilled},
-		// The shape issue #79 actually produces: the OOM-killer takes the test
-		// binary (the biggest RSS in the cgroup), not the `go` process
-		// supervising it, so `go test` survives to report the death on stdout
-		// and exits 1. runErr says nothing.
-		{"go test reports the binary's SIGKILL on stdout => infra error", anyErr, false, nil,
-			"signal: killed\nFAIL\ttestmod\t0.4s\nFAIL\n", "", mutator.StatusInfraError},
+			"--- FAIL: TestDiskFull\n    disk_test.go:9: got \"no space left on device\", want nil\n", mutator.StatusKilled},
+		// The shape issue #79 produced under `go test`: the OOM-killer took
+		// the test binary and `go test` reported its death on stdout, with
+		// runErr a plain exit status.
+		{"a SIGKILL reported on the output => infra error", anyErr, false, nil,
+			"signal: killed\nFAIL\ttestmod\t0.4s\nFAIL\n", mutator.StatusInfraError},
 		// Anchored to the line start, because the tested code writes to this
 		// stream too: quoted inside a test's own message it is just text.
 		{"a test quoting signal: killed mid-line stays killed", anyErr, false, nil,
-			"    x_test.go:9: exec failed: signal: killed\n", "", mutator.StatusKilled},
-		// A panic outside the test goroutine aborts the binary before `go test`
-		// can print a per-test failure line, so `--- FAIL: ` alone would read a
+			"    x_test.go:9: exec failed: signal: killed\n", mutator.StatusKilled},
+		// A panic outside the test goroutine aborts the binary before it can
+		// print a per-test failure line, so `--- FAIL: ` alone would read a
 		// detected mutation as a host problem.
 		{"goroutine panic quoting a host error stays killed", anyErr, false, nil,
-			"panic: open /tmp/x: too many open files\n\ngoroutine 35 [running]:\nFAIL\ttestmod\t0.3s\n", "", mutator.StatusKilled},
+			"panic: open /tmp/x: too many open files\n\ngoroutine 35 [running]:\nFAIL\ttestmod\t0.3s\n", mutator.StatusKilled},
 		// The runtime's own abort is not a panic and must still be readable as
 		// the host failure it is.
 		{"runtime fatal error is not vetoed as a panic", anyErr, false, nil,
-			"fatal error: out of memory\n\ngoroutine 1 [running]:\n", "", mutator.StatusInfraError},
+			"fatal error: out of memory\n\ngoroutine 1 [running]:\n", mutator.StatusInfraError},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.stdout, tc.stderr, false)
+			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.output, false)
 			if got != tc.want {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
@@ -1193,71 +1193,42 @@ func TestIsInfrastructureErrSeesThroughRewrittenMessages(t *testing.T) {
 	})
 }
 
+// TestClassifyTestOutcomeInfrastructureSignatures: every qualified
+// signature in a test binary's output, in any case, is a host failure.
 func TestClassifyTestOutcomeInfrastructureSignatures(t *testing.T) {
 	for _, signature := range testPhaseInfraSignatures {
-		signatureName := subtestName.Replace(signature)
-		for _, stream := range []struct {
-			name           string
-			stdout, stderr string
-		}{
-			{"stdout", "go test: " + strings.ToUpper(signature), ""},
-			{"stderr", "", "go test: " + strings.ToUpper(signature)},
-		} {
-			t.Run(signatureName+"/"+stream.name, func(t *testing.T) {
-				got := classifyTestOutcome(errors.New("exit status 1"), false, nil, stream.stdout, stream.stderr, false)
-				if got != mutator.StatusInfraError {
-					t.Errorf("got %v, want InfraError in %s", got, stream.name)
+		t.Run(subtestName.Replace(signature), func(t *testing.T) {
+			got := classifyTestOutcome(errors.New("exit status 1"), false, nil, "open /tmp/x: "+strings.ToUpper(signature), false)
+			if got != mutator.StatusInfraError {
+				t.Errorf("got %v, want InfraError", got)
+			}
+		})
+	}
+}
+
+// TestClassifyTestOutcomeIgnoresBuildPhaseSignatures: the generic wordings
+// a failed build is trusted with (see classifyBuildFailure) are a test's
+// own words in a test binary's output, with or without a build marker
+// beside them, which can only be a test's text too.
+func TestClassifyTestOutcomeIgnoresBuildPhaseSignatures(t *testing.T) {
+	for _, signature := range buildPhaseInfraSignatures {
+		for _, marker := range []string{"", "FAIL\ttestmod [build failed]\n", "FAIL\ttestmod [setup failed]\n"} {
+			t.Run(subtestName.Replace(signature+" "+marker), func(t *testing.T) {
+				if got := classifyTestOutcome(errors.New("exit status 1"), false, nil, marker+signature+"\n", false); got != mutator.StatusKilled {
+					t.Errorf("got %v, want Killed", got)
 				}
 			})
 		}
 	}
 }
 
-// TestClassifyTestOutcomeBuildPhaseSignatures covers the wider tier: before
-// the test binary runs there is no code-under-test output on the streams, so
-// wordings that would be ambiguous during a test run are unambiguous here.
-// The cases are the two real-world failures the qualified list alone reports
-// as KILLED, which is the bug this status exists to fix.
-func TestClassifyTestOutcomeBuildPhaseSignatures(t *testing.T) {
-	anyErr := errors.New("exit status 1")
-	tests := []struct {
-		name           string
-		stdout, stderr string
-		want           mutator.MutantStatus
-	}{
-		{"toolchain cannot fork the compiler (EAGAIN)",
-			"FAIL\ttestmod [build failed]\n",
-			"go: fork/exec /usr/local/go/pkg/tool/darwin_arm64/compile: resource temporarily unavailable\n",
-			mutator.StatusInfraError},
-		{"linker OOM, unprefixed wording",
-			"FAIL\ttestmod [build failed]\n",
-			"/usr/bin/ld: out of memory allocating 8388608 bytes\n",
-			mutator.StatusInfraError},
-		{"setup phase counts too",
-			"FAIL\ttestmod [setup failed]\n", "out of memory\n",
-			mutator.StatusInfraError},
-		// The same generic wording without a build/setup marker came from a
-		// running test binary and must not be trusted — this is the case the
-		// tier split exists to keep apart, and it kills the `buildPhase &&`
-		// conjunction on the wide-list branch.
-		{"same wording during a test run stays killed",
-			"", "resource temporarily unavailable\n", mutator.StatusKilled},
-		{"build failure with no signature stays killed",
-			"FAIL\ttestmod [build failed]\n", "some other build problem\n", mutator.StatusKilled},
-		// A reported test failure outranks the build-phase tier: some test
-		// detected the mutation, so this is a kill regardless. The markers
-		// are only text on stdout, and a suite that processes `go test`
-		// output prints them as fixture data — this kills a reordering that
-		// lets the wide list see test-authored text.
-		{"reported test failure outranks the build-phase tier",
-			"--- FAIL: TestX\nFAIL\ttestmod [build failed]\n", "out of memory\n",
-			mutator.StatusKilled},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := classifyTestOutcome(anyErr, false, nil, tc.stdout, tc.stderr, false)
-			if got != tc.want {
-				t.Errorf("got %v, want %v", got, tc.want)
+// TestClassifyBuildFailureSignatures: no test has run when a build fails,
+// so both signature lists, the generic wordings too, mean the host failed.
+func TestClassifyBuildFailureSignatures(t *testing.T) {
+	for _, signature := range append(slices.Clone(buildPhaseInfraSignatures), testPhaseInfraSignatures...) {
+		t.Run(subtestName.Replace(signature), func(t *testing.T) {
+			if got := classifyBuildFailure(errors.New("exit status 1"), false, "", "go: "+strings.ToUpper(signature)+"\n"); got != mutator.StatusInfraError {
+				t.Errorf("got %v, want InfraError", got)
 			}
 		})
 	}

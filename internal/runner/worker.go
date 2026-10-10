@@ -136,9 +136,9 @@ var testPhaseInfraSignatures = []string{
 // compiler) and `ld: out of memory allocating …` are host failures with no
 // other reading; both are invisible to the qualified list above.
 //
-// They are matched only in the build/setup phase, where every byte on the
-// captured streams was written by the Go toolchain because the code under
-// test has not run yet.
+// They are matched only in a failed build's output (see
+// classifyBuildFailure), every byte of which the Go toolchain wrote, as no
+// test has run yet, and in gomutants' own error values.
 var buildPhaseInfraSignatures = []string{
 	"out of memory",
 	"resource temporarily unavailable",
@@ -277,33 +277,21 @@ func matchesAnySignature(lower string, signatures []string) bool {
 	return false
 }
 
-// buildOrSetupFailed reports whether `go test` gave up before running any
-// test, which is also what tells us who wrote the captured output.
-func buildOrSetupFailed(stdout string) bool {
-	return strings.Contains(stdout, "[build failed]") || strings.Contains(stdout, "[setup failed]")
-}
-
-// infraFromOutput reports whether subprocess output carries a recognized host
-// failure. Which signatures count depends on the phase the output came from,
-// because the two phases have different authors:
+// infraFromOutput reports whether a test binary's output carries a
+// recognized host failure. The tested code writes to that stream too, so it
+// could have printed the phrase itself: only the qualified signatures count,
+// never the generic wordings a failed build's output is trusted with (see
+// classifyBuildFailure). Nothing in the output can promote it to that tier:
+// the build runs on its own, so a `[build failed]` here is text a test
+// printed — a suite that processes `go test` output (gomutants' own does)
+// prints it as fixture data.
 //
-//   - Build/setup: the test binary never ran, so every byte came from the Go
-//     toolchain and even the generic wordings are unambiguous.
-//   - Test run: `go test` merges the test binary's output into its own
-//     stdout, so the tested code could have printed the phrase itself. Only
-//     the qualified signatures count.
+// A reported test failure settles it first: a test detected the mutation,
+// which is a kill no matter what else the output holds. Checking the marker
+// before lowercasing also keeps the common killed path from paying for a
+// scan of up to 1 MiB of captured output.
 //
-// A reported test failure settles it before either tier: a test detected the
-// mutation, which is a kill no matter what else the output holds. That check
-// has to come first rather than only in the test-run branch, because the
-// build/setup markers are themselves just text on stdout — a project whose
-// tests process `go test` output (gomutants' own suite does) prints
-// `[build failed]` as fixture data, and reading that as "the toolchain wrote
-// this" would hand test-authored text to the wide list. Checking the marker
-// before lowercasing also keeps the common killed path from paying for a scan
-// of up to 2 MiB of captured output.
-//
-// truncated says stdout lost bytes to maxCapturedOutput, which makes the
+// truncated says the output lost bytes to maxCapturedOutput, which makes the
 // marker check unsound in the one direction that matters: a verbose suite
 // (`-v`, or a mutation that turns the code under test chatty) can push the
 // `--- FAIL: ` line past the cap while an infra-looking phrase the test
@@ -311,15 +299,9 @@ func buildOrSetupFailed(stdout string) bool {
 // into a non-result. Absence of the marker only means "no test failed" when
 // the whole stream was seen, so a truncated stream declines to classify and
 // the caller falls through to KILLED.
-func infraFromOutput(stdout, stderr string, truncated bool) bool {
-	if killVetoed(stdout, truncated) {
-		return false
-	}
-	lower := strings.ToLower(stdout + "\n" + stderr)
-	if buildOrSetupFailed(stdout) && matchesAnySignature(lower, buildPhaseInfraSignatures) {
-		return true
-	}
-	return matchesAnySignature(lower, testPhaseInfraSignatures)
+func infraFromOutput(output string, truncated bool) bool {
+	return !killVetoed(output, truncated) &&
+		matchesAnySignature(strings.ToLower(output), testPhaseInfraSignatures)
 }
 
 // isInfrastructureErr reports whether err is, or wraps, a recognized host
@@ -726,7 +708,7 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 		}
 		return w.startFailure(err), time.Since(start)
 	}
-	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), "", output.truncated), time.Since(start)
+	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), output.truncated), time.Since(start)
 }
 
 // pkgDir returns the directory pkg's test binary runs from: the mutated
@@ -982,28 +964,24 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 	return w.policy.For(w.testMap, m)
 }
 
-// classifyTestOutcome decides a mutant's terminal status from the raw
-// subprocess outcome. Pure function so the branching can be unit-tested
-// without staging actual test failures.
+// classifyTestOutcome decides a mutant's terminal status from a run of its
+// test binary: output is the binary's stdout and stderr as one stream (see
+// runBin). Pure function so the branching can be unit-tested without
+// staging actual test failures. The binary was built beforehand (see
+// Worker.buildBin), so nothing here is the toolchain's: a build's failures
+// are classifyBuildFailure's.
 //
 // Priority order:
 //  1. memKilled → TimedOut (RSS monitor SIGKILL'd the tree).
 //  2. runErr == nil → Lived (tests all passed with the mutant applied).
 //  3. testCtxErr == DeadlineExceeded → TimedOut.
-//  4. stderr carries a `file.go:N:N:` compile error AND stdout shows
-//     `[build failed]` / `[setup failed]` → NotViable.
-//  5. output carries a recognized infrastructure signature for the phase it
-//     came from, and was captured whole (see infraFromOutput) → InfraError.
-//     Step 4 running first is what makes the build-phase tier safe: a build
-//     that failed *with* a compile diagnostic is the mutation's doing and has
-//     already returned, so what reaches step 5 is a build that broke with
-//     nothing to say about the code.
-//  6. the `go` process or the test binary under it died on a SIGKILL
-//     gomutants did not send (see unexplainedKill) → InfraError. Steps 1 and
-//     3 have already taken both signals it does send, so this is an outside
-//     hand.
-//  7. Otherwise → Killed.
-func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout, stderr string, truncated bool) mutator.MutantStatus {
+//  4. output carries a recognized test-phase infrastructure signature, and
+//     was captured whole (see infraFromOutput) → InfraError.
+//  5. the test binary died on a SIGKILL gomutants did not send (see
+//     unexplainedKill) → InfraError. Steps 1 and 3 have already taken both
+//     signals it does send, so this is an outside hand.
+//  6. Otherwise → Killed.
+func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, output string, truncated bool) mutator.MutantStatus {
 	if memKilled {
 		return mutator.StatusTimedOut
 	}
@@ -1013,13 +991,10 @@ func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, stdout,
 	if testCtxErr == context.DeadlineExceeded {
 		return mutator.StatusTimedOut
 	}
-	if compileErrorRe.MatchString(stderr) && buildOrSetupFailed(stdout) {
-		return mutator.StatusNotViable
-	}
-	if infraFromOutput(stdout, stderr, truncated) {
+	if infraFromOutput(output, truncated) {
 		return mutator.StatusInfraError
 	}
-	if unexplainedKill(runErr, stdout) && !killVetoed(stdout, truncated) {
+	if unexplainedKill(runErr, output) && !killVetoed(output, truncated) {
 		return mutator.StatusInfraError
 	}
 	return mutator.StatusKilled
