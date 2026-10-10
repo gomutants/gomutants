@@ -182,17 +182,22 @@ func TestPoolCreateWorkersAppliesGOMAXPROCS(t *testing.T) {
 			t.Errorf("worker[%d].childGOMAXPROCS = %d, want %d (STATEMENT_REMOVE drops the assignment)",
 				i, w.childGOMAXPROCS, want)
 		}
+		// One read of the binaries' arguments serves every worker.
+		if w.binArgs != workers[0].binArgs {
+			t.Errorf("worker[%d].binArgs is its own cache, want the pool's shared one", i)
+		}
 	}
 }
 
 // TestPoolCreateWorkersPropagatesExecOpts kills STATEMENT_REMOVE on the
-// `w.testCPU = p.exec.TestCPU`, `w.tags = p.exec.Tags`, and
-// `w.testFlags = p.exec.TestFlags` assignments in createWorkers. With any
-// of them elided the worker keeps the zero value, so the configured
-// --test-cpu / --tags / --test-flags never reaches the per-mutant
-// `go test` even though the pool was given a value.
+// `w.testCPU = p.exec.TestCPU`, `w.tags = p.exec.Tags`,
+// `w.goroot = p.exec.GOROOT` and `w.testFlags = p.exec.TestFlags`
+// assignments in createWorkers. With any of them elided the worker keeps
+// the zero value, so the configured --test-cpu / --tags / --test-flags,
+// or the toolchain's GOROOT, never reaches the per-mutant runs even
+// though the pool was given a value.
 func TestPoolCreateWorkersPropagatesExecOpts(t *testing.T) {
-	p := NewPool(2, ExecOpts{TestCPU: 3, Tags: "integration", TestFlags: []string{"-short"}}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
+	p := NewPool(2, ExecOpts{TestCPU: 3, Tags: "integration", TestFlags: []string{"-short"}, GOROOT: "/goroot"}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
 	workers := p.createWorkers()
 	if len(workers) == 0 {
 		t.Fatal("expected workers; createWorkers returned none")
@@ -203,6 +208,9 @@ func TestPoolCreateWorkersPropagatesExecOpts(t *testing.T) {
 		}
 		if w.tags != "integration" {
 			t.Errorf("worker[%d].tags = %q, want %q (STATEMENT_REMOVE drops `w.tags = p.exec.Tags`)", i, w.tags, "integration")
+		}
+		if w.goroot != "/goroot" {
+			t.Errorf("worker[%d].goroot = %q, want /goroot (STATEMENT_REMOVE drops `w.goroot = p.exec.GOROOT`)", i, w.goroot)
 		}
 		// Length and element checked separately so a failure says which
 		// half broke: dropping the assignment leaves testFlags nil (len 0),

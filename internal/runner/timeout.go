@@ -14,11 +14,12 @@ import (
 //
 //   - Adaptive=false → every mutant gets Global. Behavior matches pre-
 //     adaptive gomutants exactly; used as the kill switch.
-//   - Adaptive=true  → per-mutant timeout =
-//     clamp((baseSum+rebuild)*Margin, Min, Global) where baseSum is the
-//     sum of the mutant's covering tests' durations from the coverage map
-//     and rebuild is what its `go test` spends rebuilding its test binary.
-//     A mutant without both gets Global.
+//   - Adaptive=true  → per-mutant timeout = clamp(baseSum*Margin, Min,
+//     Global) where baseSum is the sum of the mutant's covering tests'
+//     durations from the coverage map. A mutant without it gets Global.
+//
+// The deadline bounds running the mutant's tests, not building their test
+// binaries, which happens first, outside it (see Worker.runGroups).
 //
 // All clamps point in the safe direction: a missing measurement falls
 // back to a longer timeout, never a shorter one. Worst-case the user
@@ -51,20 +52,15 @@ type TimeoutPolicy struct {
 // Worker.Test), consulting `tm` for per-test timings.
 //
 // When adaptive, it is the sum of the selected per-test durations — the
-// actual tests this mutant will run via -run=^(TestA|TestB)$ — plus the
-// time the mutant's `go test` spends rebuilding its test binary with the
-// mutant in place, which the deadline covers too: its package's measured
-// rebuild (see rebuildCost).
+// actual tests this mutant will run via -test.run=^(TestA|TestB)$, in
+// whichever packages they are — scaled by Margin. It covers no build: the
+// tests' binaries are built with the mutant in place before the deadline
+// starts.
 //
 // A mutant without covering tests runs its whole package, which gets
 // Global: the map's timings don't describe that run, as a test that
 // failed or hung when run alone has none, and a mutant on a line no test
-// covers rarely hangs. So does a mutant whose rebuild isn't measured —
-// its package's wasn't, or a covering test is in another package, whose
-// rebuild with the mutant in place nothing measures. The floor alone can
-// be shorter than a link under load, and a deadline that runs out
-// mid-build turns the mutant TIMED_OUT, which drops it from the efficacy
-// denominator.
+// covers rarely hangs.
 //
 // The output is clamped: max(scaled, Min), then min(that, Global).
 // Both clamps fail safe — too-tight measurements widen to Min, and a
@@ -80,13 +76,8 @@ func (p TimeoutPolicy) For(tm *coverage.TestMap, m mutator.Mutant) time.Duration
 	// guarantees complete=true ⇒ base>0 (sums of strictly-positive
 	// recordDuration entries), so a single `!complete` guard handles every
 	// "no data" case.
-	refs := tm.TestRefsFor(m.CoverageFile, m.Line)
-	base, complete := tm.SumDurationsForRefs(refs)
+	base, complete := tm.SumDurationsForRefs(tm.TestRefsFor(m.CoverageFile, m.Line))
 	if !complete {
-		return p.Global
-	}
-	rebuild, measured := rebuildCost(tm, refs, m.Pkg)
-	if !measured {
 		return p.Global
 	}
 
@@ -94,22 +85,5 @@ func (p TimeoutPolicy) For(tm *coverage.TestMap, m mutator.Mutant) time.Duration
 	// CONDITIONALS_BOUNDARY mutation targets (the previous if-form had
 	// equivalent mutants on the equality cases). Same idiom as Worker.Test
 	// uses for its capped-buffer clamp.
-	return min(p.Global, max(p.Min, time.Duration(float64(base+rebuild)*p.Margin)))
-}
-
-// rebuildCost returns what the `go test` of a mutant in pkg spends
-// rebuilding its test binary when its covering tests (refs) are all in
-// pkg: pkg's measured rebuild (see coverage.TestMap.RebuildDuration).
-// measured is false when that isn't measured, or when a covering test is
-// in another package. A mutant there rebuilds pkg, every package between
-// pkg and the test's, and the test's own, while each package's measured
-// rebuild is of its own change alone: the sum of those measured would
-// leave out all but the last, and the deadline could run out mid-build.
-func rebuildCost(tm *coverage.TestMap, refs []coverage.TestRef, pkg string) (total time.Duration, measured bool) {
-	for _, r := range refs {
-		if r.Pkg != pkg {
-			return 0, false
-		}
-	}
-	return tm.RebuildDuration(pkg)
+	return min(p.Global, max(p.Min, time.Duration(float64(base)*p.Margin)))
 }
