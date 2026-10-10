@@ -545,7 +545,7 @@ The pattern is matched against the call's selector as written in the source:
 
 ```yaml
 workers: 10
-test-cpu: 0             # 0 = let go test use GOMAXPROCS
+test-cpu: 0             # 0 = let the tests use GOMAXPROCS
 timeout-coefficient: 10
 adaptive-timeout: true  # per-test adaptive sizing; set false for single global timeout
 timeout-margin: 3.0     # multiplier on per-test sums (only when adaptive)
@@ -652,7 +652,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--workers` | `-w` | NumCPU | Parallel workers |
-| `--test-cpu` | | 0 (omit) | Value passed to inner `go test -cpu` per mutant; 0 lets go test use `GOMAXPROCS` |
+| `--test-cpu` | | 0 (omit) | `-cpu` value for each mutant's test runs, passed to the test binary as `-test.cpu`; 0 lets the tests use `GOMAXPROCS` |
 | `--timeout-coefficient` | | 10 | Multiplier applied to baseline test time for the **global timeout ceiling** (also the per-mutant timeout when `--adaptive-timeout=false`) |
 | `--adaptive-timeout` | | true | Use the per-test durations recorded during the coverage build to size each mutant's timeout. Pass `=false` to fall back to the single global ceiling. |
 | `--timeout-margin` | | 3.0 | When adaptive: `per-mutant timeout = sum(selected test durations) × this`, clamped to `[--timeout-min, --timeout-coefficient × baseline]`. It bounds running the tests; building their binaries happens first, outside it. |
@@ -747,8 +747,9 @@ Four things to know:
   resolution. The one `go list` they reach is the map's `go list -test`
   under `--integration` or `--coverpkg`, which reads what each test binary
   links, and only their build flags reach it, so it sees the test files the
-  runs compile. The map compiles each test binary once with `go test -c`
-  and runs it directly, so gomutants splits your flags as `go test` would:
+  runs compile. The map and the per-mutant runs compile test binaries with
+  `go test -c` and run them directly, so gomutants splits your flags as
+  `go test` would:
   build flags such as `-race` or `-tags` go to the compile, the rest to
   the binary. This is why `GOFLAGS` is not a workaround. Go applies a GOFLAGS entry only "when the
   given flag is known by the current command" (`go help environment`), so
@@ -838,7 +839,7 @@ Performance optimizations layered on top:
 - **Per-mutant adaptive timeout.** Each mutant's deadline is `clamp(sum(selected test durations) × --timeout-margin, --timeout-min, global ceiling)`, and it bounds running those tests: the mutant's test binaries are built before it starts, so a slow compile or link can't turn a mutant its tests kill or survive into `TIMED OUT`. A 50ms unit test gets a 2s floor instead of waiting out a multi-minute whole-suite ceiling, so infinite-loop mutants on fast packages trip in seconds rather than minutes. A mutant no test covers runs its whole package under the global ceiling, as does each package in the re-check of a survivor: the map's timings don't describe those runs, and such mutants rarely hang. Each package the re-check runs gets the ceiling to itself, since the ceiling is sized from one `go test` of every package at once, and reuses a binary the routed run already built. With adaptive sizing on, the ceiling is never below `--timeout-min`. Disable with `--adaptive-timeout=false`.
 - **`GOMAXPROCS=NumCPU/workers` per child.** Without this, `--workers=10` on a 10-core box would have each child also assume 10 cores, oversubscribing 100×. With it, each child compiles + tests within its share.
 - **Sort pending mutants by `(Pkg, File, Offset)` before dispatch.** The first mutant in a package pays the cold compile; subsequent ones reuse the build cache for deps and stdlib. This sort alone was a 17% wall-clock reduction.
-- **`-vet=off` on the inner `go test`.** Vet runs in the user's CI on clean source; re-running it for every mutant is wasted work. Measured 17–39% per-mutant wall-clock reduction on representative packages.
+- **`-vet=off` on each mutant's `go test -c` build.** Vet runs in the user's CI on clean source; re-running it for every mutant is wasted work. Measured 17–39% per-mutant wall-clock reduction on representative packages.
 - **Incremental cache.** A verdict is reused only while everything that could change it is byte-identical to the prior run: the mutated file; every other non-test file in its package, plus that package's `//go:embed` inputs; every test file in its package; and, when the run instruments beyond the package under test (`--integration`, or an explicit `--coverpkg`) and another package's tests can reach the mutant — the coverage map places a covering test there, or that package's test binary links the mutant's package, so the survivor re-check runs it — that package's test and production sources too. Without such a scope a foreign package is left alone: the coverage map's test names carry no package, so a name two packages happen to share would otherwise drag an unrelated package's sources into the key. Invalidation is package-scoped on purpose — a mutant compiles as part of its whole package, and tests share their package's helpers and fixtures, so file-level invalidation would replay stale verdicts. A CI run that touches one file therefore pays for that file's package, not the repository. The memoized coverage profile is keyed the same way, embedded data included, so a fixture edit that changes which lines are covered re-runs `go test -coverprofile` instead of replaying a stale profile. The one gap left is a change in a package the mutant's package *imports*; closing it needs the forward import closure, whose churn would invalidate most of a repository whenever a widely imported package changes. `INFRA ERROR` is never written to or reused from the cache, so transient host failures are retried.
 
 ### JSON report
