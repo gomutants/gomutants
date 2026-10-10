@@ -5,7 +5,6 @@ package coverage
 import (
 	"context"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -176,66 +175,5 @@ func TestRunsSurviveLeftoverOutput(t *testing.T) {
 	}
 	if blocks, _, err := runCompiledTest(context.Background(), cp, "TestF", filepath.Join(t.TempDir(), "f.cov"), 0); err != nil || len(blocks) == 0 {
 		t.Errorf("runCompiledTest = (%d blocks, %v), want TestF's coverage", len(blocks), err)
-	}
-}
-
-// fakeGoFirstOnPath puts first on PATH a `go` that reports itself as
-// "fake" to `go version` and hands every other command to the real `go`,
-// so builds still work: a test that sees "fake" ran a `go` other than the
-// toolchain's.
-func fakeGoFirstOnPath(t *testing.T) {
-	t.Helper()
-	goBin, err := exec.LookPath("go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	dir := t.TempDir()
-	script := "#!/bin/sh\nif [ \"$1\" = version ]; then echo fake; exit 0; fi\nexec '" + goBin + "' \"$@\"\n"
-	if err := os.WriteFile(filepath.Join(dir, "go"), []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-}
-
-// goVersionModule's test fails unless the `go` it runs is a real one.
-var goVersionModule = map[string]string{
-	"go.mod": "module gover\n\ngo 1.26\n",
-	"g.go":   "package gover\n\nfunc F() int { return 1 }\n",
-	"g_test.go": `package gover
-
-import (
-	"os/exec"
-	"strings"
-	"testing"
-)
-
-func TestGo(t *testing.T) {
-	F()
-	out, err := exec.Command("go", "version").Output()
-	if err != nil || strings.TrimSpace(string(out)) == "fake" {
-		t.Fatalf("go version = (%q, %v), want the toolchain's", out, err)
-	}
-}
-`,
-}
-
-// TestRunsUseToolchainGo: a test that runs `go` gets the toolchain that
-// built it, as under `go test`, which puts GOROOT/bin first on PATH, not
-// whichever `go` is first there: one that differs fails the test when run
-// alone, dropping it from the map.
-func TestRunsUseToolchainGo(t *testing.T) {
-	fakeGoFirstOnPath(t)
-	goroot, err := GOROOT(context.Background(), t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	cp := compileFixture(t, writeModule(t, goVersionModule), "gover")
-	profile := filepath.Join(t.TempDir(), "g.cov")
-	if _, _, err := runCompiledTest(context.Background(), cp, "TestGo", profile, 0); err == nil {
-		t.Fatal("without GOROOT, TestGo passed: the fake go isn't first on PATH, so this test proves nothing")
-	}
-	cp.goroot = goroot
-	if _, _, err := runCompiledTest(context.Background(), cp, "TestGo", profile, 0); err != nil {
-		t.Errorf("runCompiledTest with GOROOT = %v, want TestGo to run the toolchain's go", err)
 	}
 }

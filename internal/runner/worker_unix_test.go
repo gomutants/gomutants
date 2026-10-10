@@ -609,6 +609,14 @@ func TestWorkerTestDeadlineKillsProcessGroup(t *testing.T) {
 	origDrain := proctree.DrainDelay
 	t.Cleanup(func() { proctree.DrainDelay = origDrain })
 	proctree.DrainDelay = 10 * time.Second
+	runPastDeadlineWithHeldOutput(t, "the group killed at the 300ms deadline")
+}
+
+// runPastDeadlineWithHeldOutput runs a mutant whose tests start a process
+// that holds the output open for 3s, against a 300ms deadline, and wants
+// TIMED OUT well before that process exits.
+func runPastDeadlineWithHeldOutput(t *testing.T, want string) {
+	t.Helper()
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Second)
 	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} })
@@ -617,7 +625,7 @@ func TestWorkerTestDeadlineKillsProcessGroup(t *testing.T) {
 		t.Errorf("runGroups = %v, want TIMED OUT", got)
 	}
 	if took := time.Since(start); took > 2*time.Second {
-		t.Errorf("runGroups took %v, want the group killed at the 300ms deadline", took)
+		t.Errorf("runGroups took %v, want %s", took, want)
 	}
 }
 
@@ -650,16 +658,7 @@ func TestWorkerTestDeadlineDrainsBounded(t *testing.T) {
 	t.Cleanup(func() { proctree.DrainDelay = origDrain })
 	proctree.DrainDelay = 200 * time.Millisecond
 	t.Cleanup(proctree.FailGroupKillForTesting())
-	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Second)
-	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
-		func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} })
-	start := time.Now()
-	if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, 300*time.Millisecond); got != mutator.StatusTimedOut {
-		t.Errorf("runGroups = %v, want TIMED OUT", got)
-	}
-	if took := time.Since(start); took > 2*time.Second {
-		t.Errorf("runGroups took %v, want the wait cut off 200ms past the 300ms deadline", took)
-	}
+	runPastDeadlineWithHeldOutput(t, "the wait cut off 200ms past the 300ms deadline")
 }
 
 // TestWorkerTestRunOutputIsNoBuild: a test binary's output is the tests'

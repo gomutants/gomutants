@@ -860,6 +860,19 @@ func TestTestBinaryEnv(t *testing.T) {
 	}
 }
 
+// TestTestBinaryCmdEnv: the map runs a test binary with the environment
+// `go test` gives it, so a test that runs `go` gets the toolchain that
+// built it rather than whichever `go` is first on PATH: one that differs
+// would fail the test when run alone, dropping it from the map.
+func TestTestBinaryCmdEnv(t *testing.T) {
+	goroot, dir := filepath.Join("g", "root"), filepath.Join("pkg", "dir")
+	cp := &compiledPkg{binPath: "bin", dir: dir, goroot: goroot}
+	got := testBinaryCmd(context.Background(), cp, nil).Env
+	if want := TestBinaryEnv(goroot, dir); !slices.Equal(got, want) {
+		t.Errorf("testBinaryCmd Env = %q, want %q", got, want)
+	}
+}
+
 // TestGOROOT: the toolchain's GOROOT holds its bin directory; a `go` that
 // can't run is an error.
 func TestGOROOT(t *testing.T) {
