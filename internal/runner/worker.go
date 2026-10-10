@@ -19,6 +19,7 @@ import (
 	"github.com/gomutants/gomutants/internal/coverage"
 	"github.com/gomutants/gomutants/internal/mutator"
 	"github.com/gomutants/gomutants/internal/patch"
+	"github.com/gomutants/gomutants/internal/proctree"
 )
 
 // maxSubprocRSSBytes caps per-mutant subprocess group memory. A mutation that
@@ -373,11 +374,6 @@ type overlay struct {
 	Replace map[string]string `json:"Replace"`
 }
 
-// pipeDrainDelay bounds how long a run of a test binary, or a build of
-// one, waits, once it has exited or been killed, for output pipes a
-// process it started still holds open. A var so tests can shorten it.
-var pipeDrainDelay = 5 * time.Second
-
 // buildTimeout bounds building a mutant's test binary (see
 // Worker.buildBin). It is no deadline sized from anything, only a stop
 // for a build that hangs without growing, which the RSS monitor can't
@@ -652,8 +648,7 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
 	defer cancel()
 	cmd, stdout, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin))
-	killGroupOnCancel(cmd)
-	cmd.WaitDelay = pipeDrainDelay
+	proctree.Bound(cmd)
 	runErr, memKilled, err := w.runMonitored(cmd)
 	if err != nil {
 		return "", w.startFailure(err)
@@ -699,7 +694,7 @@ func (w *Worker) removeBins() {
 // The binary gets no -test.timeout: it would start its own clock along
 // with the deadline's, and its timeout panic, winning the race, would
 // read as a kill. The deadline kills the binary's whole process group
-// instead (see killGroupOnCancel), as a process a test started would
+// instead (see proctree.Bound), as a process a test started would
 // otherwise hold the output open past it.
 //
 // Its stderr goes to the same buffer as its stdout, as `go test` merges
@@ -721,8 +716,7 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 	defer cancel()
 	cmd, output, _ := w.makeCmd(runCtx, bin, dir, runArgs(run.tests, binArgs))
 	cmd.Stderr = output
-	killGroupOnCancel(cmd)
-	cmd.WaitDelay = pipeDrainDelay
+	proctree.Bound(cmd)
 	runErr, memKilled, err := w.runMonitored(cmd)
 	if err != nil {
 		// A deadline that ran out by the start (the routed run's earlier
@@ -743,12 +737,7 @@ func (w *Worker) pkgDir(m mutator.Mutant, pkg string) (string, bool) {
 	if pkg == m.Pkg {
 		return filepath.Dir(m.File), true
 	}
-	for _, p := range w.testMap.Suites() {
-		if p.ImportPath == pkg {
-			return p.Dir, true
-		}
-	}
-	return "", false
+	return w.testMap.SuiteDir(pkg)
 }
 
 // startFailure classifies a command that failed to start: an

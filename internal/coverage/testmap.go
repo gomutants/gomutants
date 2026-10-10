@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gomutants/gomutants/internal/proctree"
 )
 
 // tagsBuildFlag is the `go` build-tags flag prefix; the configured tags
@@ -128,6 +130,22 @@ func (tm *TestMap) Suites() []Package {
 		return nil
 	}
 	return slices.Clone(tm.suites)
+}
+
+// SuiteDir returns the directory of pkg, one of the map's suites, and
+// whether the map holds it. Suites are sorted by import path, so the
+// lookup copies nothing.
+func (tm *TestMap) SuiteDir(pkg string) (string, bool) {
+	if tm == nil {
+		return "", false
+	}
+	i, ok := slices.BinarySearchFunc(tm.suites, pkg, func(p Package, pkg string) int {
+		return strings.Compare(p.ImportPath, pkg)
+	})
+	if !ok {
+		return "", false
+	}
+	return tm.suites[i].Dir, true
 }
 
 // Warnings returns what went wrong building the map that didn't fail it,
@@ -787,21 +805,15 @@ func withTestTimeout(ctx context.Context, timeout time.Duration) (context.Contex
 	return context.WithTimeout(ctx, timeout)
 }
 
-// pipeDrainDelay bounds how long a run of a test binary waits, once the
-// binary has exited or been killed, for output pipes a process it started
-// still holds open. A var so tests can shorten it.
-var pipeDrainDelay = 5 * time.Second
-
 // testBinaryCmd returns the command for one run of cp's binary from its
 // package directory. When ctx ends, the binary is killed along with every
-// process it started (see killTreeOnCancel), and pipeDrainDelay caps the
-// wait for output held open by one that escaped, so a run that hangs can't
+// process it started, and the wait for output held open by one that
+// escaped is capped (see proctree.Bound), so a run that hangs can't
 // outlast its timeout for long.
 func testBinaryCmd(ctx context.Context, cp *compiledPkg, args []string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, cp.binPath, args...)
 	cmd.Dir = cp.dir
-	killTreeOnCancel(cmd)
-	cmd.WaitDelay = pipeDrainDelay
+	proctree.Bound(cmd)
 	return cmd
 }
 

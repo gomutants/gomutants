@@ -19,6 +19,7 @@ import (
 
 	"github.com/gomutants/gomutants/internal/coverage"
 	"github.com/gomutants/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/proctree"
 )
 
 // TestPgroupRSSBytesSelf exercises pgroupRSSBytes against our own process
@@ -599,40 +600,15 @@ func TestWorkerTestRunFailures(t *testing.T) {
 	}
 }
 
-// TestKillGroupOnCancelFallsBack: when the group can't be signalled (on
-// macOS, just after Start, the child may not have joined it yet), the
-// cancel kills the process alone.
-func TestKillGroupOnCancelFallsBack(t *testing.T) {
-	orig := syscallKillFunc
-	t.Cleanup(func() { syscallKillFunc = orig })
-	syscallKillFunc = func(int, syscall.Signal) error { return syscall.ESRCH }
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "sleep", "30")
-	applyProcessGroup(cmd)
-	killGroupOnCancel(cmd)
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(500 * time.Millisecond):
-		_ = cmd.Process.Kill()
-		t.Fatal("the cancel left the process running")
-	}
-}
-
 // TestWorkerTestDeadlineKillsProcessGroup: a run cut off at its deadline
 // takes down every process its tests started, so one that holds the
 // output open can't keep the mutant waiting. With the binary alone
 // killed, the wait would last until the started process exits (3s), as
 // the drain delay is longer.
 func TestWorkerTestDeadlineKillsProcessGroup(t *testing.T) {
-	origDrain := pipeDrainDelay
-	t.Cleanup(func() { pipeDrainDelay = origDrain })
-	pipeDrainDelay = 10 * time.Second
+	origDrain := proctree.DrainDelay
+	t.Cleanup(func() { proctree.DrainDelay = origDrain })
+	proctree.DrainDelay = 10 * time.Second
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Second)
 	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} })
@@ -651,9 +627,9 @@ func TestWorkerTestDeadlineKillsProcessGroup(t *testing.T) {
 // INFRA ERROR: a host problem, re-run next time rather than cached. With
 // the build unbounded, or `go` alone killed, it would last 3s.
 func TestWorkerTestBuildDeadline(t *testing.T) {
-	origBuild, origDrain := buildTimeout, pipeDrainDelay
-	t.Cleanup(func() { buildTimeout, pipeDrainDelay = origBuild, origDrain })
-	buildTimeout, pipeDrainDelay = 300*time.Millisecond, 10*time.Second
+	origBuild, origDrain := buildTimeout, proctree.DrainDelay
+	t.Cleanup(func() { buildTimeout, proctree.DrainDelay = origBuild, origDrain })
+	buildTimeout, proctree.DrainDelay = 300*time.Millisecond, 10*time.Second
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Minute)
 	fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} },
 		func(string) []string { return []string{"true"} })
@@ -668,12 +644,12 @@ func TestWorkerTestBuildDeadline(t *testing.T) {
 
 // TestWorkerTestDeadlineDrainsBounded: when the group can't be killed, a
 // process the tests started that holds the output open keeps the mutant
-// waiting no longer than pipeDrainDelay past the deadline.
+// waiting no longer than proctree.DrainDelay past the deadline.
 func TestWorkerTestDeadlineDrainsBounded(t *testing.T) {
-	origDrain, origKill := pipeDrainDelay, syscallKillFunc
-	t.Cleanup(func() { pipeDrainDelay, syscallKillFunc = origDrain, origKill })
-	pipeDrainDelay = 200 * time.Millisecond
-	syscallKillFunc = func(int, syscall.Signal) error { return syscall.ESRCH }
+	origDrain := proctree.DrainDelay
+	t.Cleanup(func() { proctree.DrainDelay = origDrain })
+	proctree.DrainDelay = 200 * time.Millisecond
+	t.Cleanup(proctree.FailGroupKillForTesting())
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Second)
 	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} })

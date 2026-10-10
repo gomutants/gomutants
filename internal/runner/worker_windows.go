@@ -42,14 +42,6 @@ func applyProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 }
 
-// killGroupOnCancel leaves cmd as it is: Windows has no process group to
-// kill, so cancellation kills cmd alone, exec's default. The WaitDelay
-// runBin and buildBin set still bounds a wait on output held open by a
-// process it started.
-func killGroupOnCancel(*exec.Cmd) {
-	// Intentionally empty: see above.
-}
-
 // processGroup returns pid unchanged. Windows has no process-group ID
 // equivalent to POSIX pgid, so killPgroup operates directly on pid.
 func processGroup(pid int) int { return pid }

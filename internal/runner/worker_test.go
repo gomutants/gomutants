@@ -33,9 +33,6 @@ func TestPackageVarDefaults(t *testing.T) {
 	if got, want := maxCapturedOutput, 1<<20; got != want {
 		t.Errorf("maxCapturedOutput = %d, want %d (1 MiB)", got, want)
 	}
-	if got, want := pipeDrainDelay, 5*time.Second; got != want {
-		t.Errorf("pipeDrainDelay = %v, want %v", got, want)
-	}
 }
 
 func TestNewWorker(t *testing.T) {

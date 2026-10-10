@@ -820,6 +820,34 @@ func TestSuites(t *testing.T) {
 	}
 }
 
+// TestSuiteDir: a suite's directory by import path, wherever it sits in
+// the sorted suites; none for a package outside them or on a nil map.
+func TestSuiteDir(t *testing.T) {
+	if dir, ok := (*TestMap)(nil).SuiteDir("m/a"); dir != "" || ok {
+		t.Errorf("nil map: SuiteDir = (%q, %v), want none", dir, ok)
+	}
+	a := Package{ImportPath: "m/a", Dir: "/a"}
+	b := Package{ImportPath: "m/b", Dir: "/b"}
+	c := Package{ImportPath: "m/c", Dir: "/c"}
+	tm := NewTestMapForTesting(nil, nil).WithSuitesForTesting(false, nil, c, a, b)
+	cases := []struct {
+		pkg, want string
+		ok        bool
+	}{
+		{"m/a", "/a", true},
+		{"m/b", "/b", true},
+		{"m/c", "/c", true},
+		{"m/0", "", false},
+		{"m/ab", "", false},
+		{"m/d", "", false},
+	}
+	for _, tc := range cases {
+		if dir, ok := tm.SuiteDir(tc.pkg); dir != tc.want || ok != tc.ok {
+			t.Errorf("SuiteDir(%s) = (%q, %v), want (%q, %v)", tc.pkg, dir, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 // TestSuitePkgs pins which suites decide a mutant's verdict: its own
 // package's without cross-package coverage; with it, every package
 // (sorted) whose tests link the mutant's package or whose links are
@@ -1558,12 +1586,5 @@ func TestBuildTestMapReadsTestDepsOnlyWhenNeeded(t *testing.T) {
 		if calls != want {
 			t.Errorf("coverpkg=%q: testDeps called %d times, want %d", coverPkg, calls, want)
 		}
-	}
-}
-
-// TestPipeDrainDelay pins the documented default.
-func TestPipeDrainDelay(t *testing.T) {
-	if pipeDrainDelay != 5*time.Second {
-		t.Errorf("pipeDrainDelay = %v, want 5s", pipeDrainDelay)
 	}
 }

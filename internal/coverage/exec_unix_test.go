@@ -4,15 +4,15 @@ package coverage
 
 import (
 	"context"
-	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/gomutants/gomutants/internal/proctree"
 )
 
 // spawnModule's TestMain starts `sleep` with the test binary's stdout, so
@@ -86,9 +86,9 @@ func listHanging(t *testing.T, ownGroup bool) (time.Duration, int) {
 // the binary started too. Killing the binary alone left the sleep running,
 // holding the output pipe, so the listing waited for it.
 func TestListBinTestsKillsProcessTree(t *testing.T) {
-	orig := pipeDrainDelay
-	t.Cleanup(func() { pipeDrainDelay = orig })
-	pipeDrainDelay = time.Minute
+	orig := proctree.DrainDelay
+	t.Cleanup(func() { proctree.DrainDelay = orig })
+	proctree.DrainDelay = time.Minute
 
 	took, pid := listHanging(t, false)
 	if took > 10*time.Second {
@@ -105,42 +105,14 @@ func TestListBinTestsKillsProcessTree(t *testing.T) {
 
 // TestListBinTestsStopsWaitingForEscapedOutput: a process that left the
 // binary's group survives the kill and still holds the output pipe; the
-// listing stops waiting for it after pipeDrainDelay.
+// listing stops waiting for it after proctree.DrainDelay.
 func TestListBinTestsStopsWaitingForEscapedOutput(t *testing.T) {
-	orig := pipeDrainDelay
-	t.Cleanup(func() { pipeDrainDelay = orig })
-	pipeDrainDelay = 200 * time.Millisecond
+	orig := proctree.DrainDelay
+	t.Cleanup(func() { proctree.DrainDelay = orig })
+	proctree.DrainDelay = 200 * time.Millisecond
 
 	if took, _ := listHanging(t, true); took > 10*time.Second {
 		t.Errorf("listing took %s, want it to stop waiting soon after its timeout", took)
-	}
-}
-
-// TestKillTreeOnCancelFallsBackToProcess: when the group can't be
-// signalled — just after Start on macOS — cancellation still kills the
-// process itself.
-func TestKillTreeOnCancelFallsBackToProcess(t *testing.T) {
-	orig := syscallKillFunc
-	t.Cleanup(func() { syscallKillFunc = orig })
-	syscallKillFunc = func(int, syscall.Signal) error { return errors.New("no such group") }
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cmd := exec.CommandContext(ctx, "sleep", "60")
-	killTreeOnCancel(cmd)
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	cancel()
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Error("a killed sleep exited cleanly")
-		}
-	case <-time.After(10 * time.Second):
-		_ = cmd.Process.Kill()
-		t.Fatal("cancelling didn't kill the process")
 	}
 }
 
@@ -178,13 +150,13 @@ func TestG(t *testing.T) { F() }
 }
 
 // TestRunsSurviveLeftoverOutput: a binary that succeeds but leaves a
-// process holding its output open still lists fine once pipeDrainDelay
+// process holding its output open still lists fine once proctree.DrainDelay
 // gives up on that output — the binary's own is complete — and runs fine,
 // as a per-test run reads no output.
 func TestRunsSurviveLeftoverOutput(t *testing.T) {
-	orig := pipeDrainDelay
-	t.Cleanup(func() { pipeDrainDelay = orig })
-	pipeDrainDelay = 100 * time.Millisecond
+	orig := proctree.DrainDelay
+	t.Cleanup(func() { proctree.DrainDelay = orig })
+	proctree.DrainDelay = 100 * time.Millisecond
 	pidDir := t.TempDir()
 	t.Setenv("LEAK_PID_DIR", pidDir)
 	t.Cleanup(func() {
