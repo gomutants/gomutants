@@ -872,8 +872,8 @@ func TestGOROOT(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := GOROOT(ctx, t.TempDir()); err == nil {
-		t.Error("GOROOT with a cancelled context: want an error")
+	if _, err := GOROOT(ctx, t.TempDir()); !errors.Is(err, context.Canceled) {
+		t.Errorf("GOROOT with a cancelled context: err = %v, want one wrapping context.Canceled", err)
 	}
 }
 

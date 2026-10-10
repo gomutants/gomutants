@@ -855,12 +855,12 @@ func TestWorkerTestKilledLinkIsInfraError(t *testing.T) {
 // toolchain's.
 func fakeGoFirstOnPath(t *testing.T) {
 	t.Helper()
-	real, err := exec.LookPath("go")
+	goBin, err := exec.LookPath("go")
 	if err != nil {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	script := "#!/bin/sh\nif [ \"$1\" = version ]; then echo fake; exit 0; fi\nexec '" + real + "' \"$@\"\n"
+	script := "#!/bin/sh\nif [ \"$1\" = version ]; then echo fake; exit 0; fi\nexec '" + goBin + "' \"$@\"\n"
 	if err := os.WriteFile(filepath.Join(dir, "go"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
