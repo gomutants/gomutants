@@ -820,6 +820,63 @@ func TestSuites(t *testing.T) {
 	}
 }
 
+// TestTestBinaryEnv: a test binary's environment is gomutants' own with
+// GOROOT's bin directory first on PATH and PWD the run's directory, as
+// `go test` gives it. Go takes the last of a repeated variable, so the
+// entries that count are the last ones.
+func TestTestBinaryEnv(t *testing.T) {
+	last := func(env []string, key string) (string, int) {
+		val, n := "", 0
+		for _, kv := range env {
+			if v, ok := strings.CutPrefix(kv, key+"="); ok {
+				val, n = v, n+1
+			}
+		}
+		return val, n
+	}
+	goroot, dir := filepath.Join("g", "root"), filepath.Join("pkg", "dir")
+	bin := filepath.Join(goroot, "bin")
+	sep := string(os.PathListSeparator)
+
+	t.Setenv("PATH", "first"+sep+"second")
+	env := TestBinaryEnv(goroot, dir)
+	if got, _ := last(env, "PATH"); got != bin+sep+"first"+sep+"second" {
+		t.Errorf("PATH = %q, want GOROOT/bin before the inherited PATH", got)
+	}
+	if got, _ := last(env, "PWD"); got != dir {
+		t.Errorf("PWD = %q, want %q", got, dir)
+	}
+	if _, n := last(env, "PATH"); n != 2 {
+		t.Errorf("PATH set %d times, want the inherited one and ours", n)
+	}
+
+	if got, n := last(TestBinaryEnv("", dir), "PATH"); got != "first"+sep+"second" || n != 1 {
+		t.Errorf("no GOROOT: PATH = %q (set %d times), want it left alone", got, n)
+	}
+
+	t.Setenv("PATH", "")
+	if got, _ := last(TestBinaryEnv(goroot, dir), "PATH"); got != bin {
+		t.Errorf("empty PATH: PATH = %q, want GOROOT/bin alone", got)
+	}
+}
+
+// TestGOROOT: the toolchain's GOROOT holds its bin directory; a `go` that
+// can't run is an error.
+func TestGOROOT(t *testing.T) {
+	got, err := GOROOT(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(filepath.Join(got, "bin")); err != nil || !fi.IsDir() {
+		t.Errorf("GOROOT = %q, want a directory with a bin directory: %v", got, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := GOROOT(ctx, t.TempDir()); err == nil {
+		t.Error("GOROOT with a cancelled context: want an error")
+	}
+}
+
 // TestSuiteDir: a suite's directory by import path, wherever it sits in
 // the sorted suites; none for a package outside them or on a nil map.
 func TestSuiteDir(t *testing.T) {

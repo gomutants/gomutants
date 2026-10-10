@@ -435,6 +435,11 @@ type Worker struct {
 	// Set by the pool after construction, mirroring testCPU.
 	tags string
 
+	// goroot is the toolchain's GOROOT, whose bin directory every run of a
+	// test binary gets first on PATH, as under `go test` (see binEnv).
+	// Empty leaves PATH alone. Set by the pool after construction.
+	goroot string
+
 	// testFlags are the user's --test-flags. Their build flags go to every
 	// `go test -c` (see buildArgs), and the test-binary arguments `go test`
 	// makes of them to every run of a binary (see binFlags). Empty adds
@@ -698,6 +703,7 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 	defer cancel()
 	cmd, output, _ := w.makeCmd(runCtx, bin, dir, runArgs(run.tests, binArgs))
 	cmd.Stderr = output
+	cmd.Env = w.binEnv(dir)
 	proctree.Bound(cmd)
 	runErr, memKilled, err := w.runMonitored(cmd)
 	if err != nil {
@@ -806,16 +812,31 @@ func (w *Worker) makeCmd(ctx context.Context, name, dir string, args []string) (
 		// exec.go ~L1220). When we set Env explicitly the child inherits the
 		// parent's stale PWD, which breaks module-relative paths. Mirror the
 		// auto-PWD behavior plus our GOMAXPROCS cap.
-		cmd.Env = append(os.Environ(),
-			"PWD="+cmd.Dir,
-			fmt.Sprintf("GOMAXPROCS=%d", w.childGOMAXPROCS),
-		)
+		cmd.Env = append(os.Environ(), "PWD="+cmd.Dir, w.gomaxprocsEnv())
 	}
 	stdout := &cappedBuffer{}
 	stderr := &cappedBuffer{}
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	return cmd, stdout, stderr
+}
+
+// gomaxprocsEnv returns the environment entry that caps a child's
+// GOMAXPROCS at childGOMAXPROCS.
+func (w *Worker) gomaxprocsEnv() string {
+	return fmt.Sprintf("GOMAXPROCS=%d", w.childGOMAXPROCS)
+}
+
+// binEnv returns the environment a test binary runs in from dir: the one
+// `go test` gives it (see coverage.TestBinaryEnv), GOROOT/bin first on
+// PATH so a test that runs `go` gets the toolchain that built it, plus
+// the GOMAXPROCS cap, which under `go test` the binary inherited from it.
+func (w *Worker) binEnv(dir string) []string {
+	env := coverage.TestBinaryEnv(w.goroot, dir)
+	if w.childGOMAXPROCS > 0 {
+		env = append(env, w.gomaxprocsEnv())
+	}
+	return env
 }
 
 // buildArgs constructs the `go test -c` argv that builds pkg's test binary

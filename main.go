@@ -234,6 +234,7 @@ var (
 	cacheSaveFunc       = cache.Save
 	resolveCoverPkgFunc = discover.ResolvePackages
 	goVersionFunc       = runGoVersion
+	goRootFunc          = coverage.GOROOT
 )
 
 // phaseDurationDisplay rounds a duration to 100ms precision for display

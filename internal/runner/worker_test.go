@@ -655,6 +655,27 @@ func TestMakeCmdGOMAXPROCSEnv(t *testing.T) {
 	})
 }
 
+// TestBinEnv: a test binary runs in `go test`'s environment for it —
+// GOROOT/bin first on PATH, PWD its directory — plus the GOMAXPROCS cap
+// only when there is one.
+func TestBinEnv(t *testing.T) {
+	t.Setenv("PATH", "inherited")
+	want := "PATH=" + filepath.Join("/goroot", "bin") + string(os.PathListSeparator) + "inherited"
+	for _, procs := range []int{0, 3} {
+		w := &Worker{goroot: "/goroot", childGOMAXPROCS: procs}
+		env := w.binEnv("/pkg")
+		if !envContains(env, want) || !envContains(env, "PWD=/pkg") {
+			t.Errorf("childGOMAXPROCS=%d: env lacks %s or PWD=/pkg: %v", procs, want, env)
+		}
+		if got, wantCap := envContains(env, "GOMAXPROCS=3"), procs > 0; got != wantCap {
+			t.Errorf("childGOMAXPROCS=%d: GOMAXPROCS=3 in env = %v, want %v", procs, got, wantCap)
+		}
+		if extra := len(env) - len(coverage.TestBinaryEnv(w.goroot, "/pkg")); extra != min(procs, 1) {
+			t.Errorf("childGOMAXPROCS=%d: %d entries beyond go test's, want %d", procs, extra, min(procs, 1))
+		}
+	}
+}
+
 func envContains(env []string, want string) bool {
 	for _, e := range env {
 		if e == want {

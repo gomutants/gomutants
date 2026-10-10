@@ -1809,12 +1809,17 @@ func TestRunBuildTestMapGetsTestTimeout(t *testing.T) {
 	measureBaselineFunc = func(context.Context, string, []string, string, []string) (time.Duration, error) {
 		return 3 * time.Second, nil
 	}
-	origBuild := buildTestMapFunc
-	defer func() { buildTestMapFunc = origBuild }()
+	origBuild, origRoot := buildTestMapFunc, goRootFunc
+	defer func() { buildTestMapFunc, goRootFunc = origBuild, origRoot }()
 	var got coverage.BuildOptions
 	buildTestMapFunc = func(_ context.Context, _ string, _ []string, opts coverage.BuildOptions) (*coverage.TestMap, error) {
 		got = opts
 		return nil, errors.New("stop after capturing options")
+	}
+	var rootDir string
+	goRootFunc = func(_ context.Context, projectDir string) (string, error) {
+		rootDir = projectDir
+		return "/stub/goroot", nil
 	}
 
 	if _, err := captureOutput(t, func() error {
@@ -1833,6 +1838,30 @@ func TestRunBuildTestMapGetsTestTimeout(t *testing.T) {
 	}
 	if !slices.Equal(got.TestFlags, []string{"-cpu=1", "-short", "-count=1"}) {
 		t.Errorf("BuildTestMap TestFlags = %q, want --test-cpu's -cpu, the runner's -short, then --test-flags", got.TestFlags)
+	}
+	if got.GOROOT != "/stub/goroot" {
+		t.Errorf("BuildTestMap GOROOT = %q, want the one resolved for the project", got.GOROOT)
+	}
+	if wd, _ := os.Getwd(); rootDir != wd {
+		t.Errorf("GOROOT resolved from %q, want the project directory %q, whose go.mod picks the toolchain", rootDir, wd)
+	}
+}
+
+// TestRunGoRootError: a `go` that can't report its GOROOT stops the run
+// before any phase that would run it, with the cause named.
+func TestRunGoRootError(t *testing.T) {
+	dir := setupTinyProject(t)
+	t.Chdir(dir)
+	stubSlowPhases(t)
+	origRoot := goRootFunc
+	t.Cleanup(func() { goRootFunc = origRoot })
+	goRootFunc = func(context.Context, string) (string, error) {
+		return "", errors.New("inject go env failure")
+	}
+
+	err := run(context.Background(), []string{"--only", "ARITHMETIC_BASE", "-w", "1", "-o", filepath.Join(dir, "r.json"), "testmod"})
+	if err == nil || !strings.Contains(err.Error(), "resolving GOROOT: inject go env failure") {
+		t.Errorf("run = %v, want the GOROOT failure, wrapped", err)
 	}
 }
 

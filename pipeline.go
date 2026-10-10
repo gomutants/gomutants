@@ -31,6 +31,10 @@ type mutationRun struct {
 
 	projectDir string
 	goModule   string
+	// goroot is the GOROOT of the toolchain that builds projectDir's
+	// tests. Every run of a test binary gets its bin directory first on
+	// PATH, as under `go test` (see coverage.TestBinaryEnv).
+	goroot string
 	// term prints the header and phase lines; progress, created once the
 	// pending count is known, prints per-mutant results and the summary.
 	term     *report.Terminal
@@ -114,6 +118,13 @@ func (mr *mutationRun) setup(ctx context.Context) error {
 	mr.goModule, err = readModuleName(mr.projectDir)
 	if err != nil {
 		return err
+	}
+
+	// Asked from the project, so a go.mod toolchain line that switches
+	// toolchains names the one the tests are built with.
+	mr.goroot, err = goRootFunc(ctx, mr.projectDir)
+	if err != nil {
+		return fmt.Errorf("resolving GOROOT: %w", err)
 	}
 
 	// Load the cache early so the coverage phase can short-circuit on a
@@ -561,6 +572,7 @@ func (mr *mutationRun) buildTestMap(ctx context.Context) error {
 		TestTimeout: mr.testTimeout,
 		TestFlags:   coverageTestFlags(mr.cfg.TestFlagFields(), runner.ShortFlagFromEnv(), mr.cfg.TestCPU),
 		Lines:       pendingLines(mr.mutants),
+		GOROOT:      mr.goroot,
 	})
 	if err != nil {
 		// An interrupt stops the run here, as in every other phase; it
@@ -675,7 +687,7 @@ func (mr *mutationRun) runMutants(ctx context.Context) {
 	}
 	mr.profileBytes = nil
 
-	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields()}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
+	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields(), GOROOT: mr.goroot}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
 	// interval into the run, not on the very first mutant.
 	mr.lastCheckpoint = time.Now()

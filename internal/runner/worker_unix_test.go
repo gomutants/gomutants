@@ -758,13 +758,17 @@ func slowLinkGoflags(t *testing.T) string {
 // body as TestAdd's body, and returns a worker on it, its policy, and the
 // mutant that turns Add's + into -. TestAdd ran in 10ms when the map was
 // built, so the mutant's deadline is the policy's 1s floor.
-func addWorker(t *testing.T, body string) (*Worker, TimeoutPolicy, mutator.Mutant) {
+func addWorker(t *testing.T, body string, imports ...string) (*Worker, TimeoutPolicy, mutator.Mutant) {
 	t.Helper()
 	dir := t.TempDir()
 	// The comment keeps the mutant's build, link included, out of the
 	// build cache of an earlier run.
 	src := fmt.Sprintf("package testpkg\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n\n// %d\n", time.Now().UnixNano())
-	testSrc := "package testpkg\n\nimport (\n\t\"testing\"\n\t\"time\"\n)\n\nvar _ = time.Second\n\n" +
+	var extra string
+	for _, imp := range imports {
+		extra += "\t\"" + imp + "\"\n"
+	}
+	testSrc := "package testpkg\n\nimport (\n" + extra + "\t\"testing\"\n\t\"time\"\n)\n\nvar _ = time.Second\n\n" +
 		"func TestAdd(t *testing.T) {\n\t" + body + "\n}\n"
 	for name, content := range map[string]string{
 		"go.mod": "module testmod\n\ngo 1.26\n", "add.go": src, "add_test.go": testSrc,
@@ -842,5 +846,53 @@ func TestWorkerTestKilledLinkIsInfraError(t *testing.T) {
 	w, _, m := addWorker(t, "_ = Add(1, 2)")
 	if got := w.Test(context.Background(), m); got.Status != mutator.StatusInfraError {
 		t.Errorf("Status=%v, want %v: an outside kill of the linker is no verdict on the mutant", got.Status, mutator.StatusInfraError)
+	}
+}
+
+// fakeGoFirstOnPath puts first on PATH a `go` that reports itself as
+// "fake" to `go version` and hands every other command to the real `go`,
+// so builds still work: a test that sees "fake" ran a `go` other than the
+// toolchain's.
+func fakeGoFirstOnPath(t *testing.T) {
+	t.Helper()
+	real, err := exec.LookPath("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	script := "#!/bin/sh\nif [ \"$1\" = version ]; then echo fake; exit 0; fi\nexec '" + real + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "go"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestWorkerTestRunsToolchainGo: a test that runs `go` gets the toolchain
+// that built it, as under `go test`, which puts GOROOT/bin first on PATH,
+// not whichever `go` is first there. A different one fails a test the
+// mutant can't reach: a false KILLED the baseline, run by `go test`, never
+// shows.
+func TestWorkerTestRunsToolchainGo(t *testing.T) {
+	fakeGoFirstOnPath(t)
+	goroot, err := coverage.GOROOT(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := "_ = Add(1, 2)\n\tout, err := exec.Command(\"go\", \"version\").Output()\n" +
+		"\tif err != nil || strings.TrimSpace(string(out)) == \"fake\" {\n\t\tt.Fatalf(\"go version = (%q, %v)\", out, err)\n\t}"
+	for _, tc := range []struct {
+		goroot string
+		want   mutator.MutantStatus
+	}{
+		// Without GOROOT the fake go is found, which shows it is first on
+		// PATH, so the LIVED below is GOROOT's doing.
+		{"", mutator.StatusKilled},
+		{goroot, mutator.StatusLived},
+	} {
+		w, _, m := addWorker(t, body, "os/exec", "strings")
+		w.goroot = tc.goroot
+		if got := w.Test(context.Background(), m); got.Status != tc.want {
+			t.Errorf("goroot=%q: Status=%v, want %v", tc.goroot, got.Status, tc.want)
+		}
 	}
 }

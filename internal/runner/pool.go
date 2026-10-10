@@ -21,13 +21,15 @@ type ResultCallback func(m mutator.Mutant)
 
 // ExecOpts bundles the inner `go test` knobs forwarded to each worker:
 // TestCPU (0 omits -cpu, letting go test default to GOMAXPROCS), Tags
-// (empty omits -tags), and TestFlags (user-supplied flags appended
-// verbatim; nil appends nothing). Grouped into one struct so NewPool stays
-// within a sane parameter count.
+// (empty omits -tags), TestFlags (user-supplied flags appended verbatim;
+// nil appends nothing), and GOROOT (the toolchain's, put first on PATH for
+// every test binary as `go test` does; empty leaves PATH alone). Grouped
+// into one struct so NewPool stays within a sane parameter count.
 type ExecOpts struct {
 	TestCPU   int
 	Tags      string
 	TestFlags []string
+	GOROOT    string
 }
 
 // Pool coordinates parallel mutation testing.
@@ -193,6 +195,7 @@ func (p *Pool) createWorkers() []*Worker {
 		w.childGOMAXPROCS = cap
 		w.testCPU = p.exec.TestCPU
 		w.tags = p.exec.Tags
+		w.goroot = p.exec.GOROOT
 		w.testFlags = p.exec.TestFlags
 		w.binArgs = binArgs
 		workers = append(workers, w)

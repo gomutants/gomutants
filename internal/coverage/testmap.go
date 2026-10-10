@@ -184,6 +184,7 @@ type compiledPkg struct {
 	importPath string   // Package import path.
 	dir        string   // Package directory (for running the binary).
 	testArgs   []string // Arguments every run of the binary gets (see setTestArgs).
+	goroot     string   // GOROOT of the toolchain that built it (see TestBinaryEnv).
 }
 
 // BuildOptions configures BuildTestMap.
@@ -210,6 +211,10 @@ type BuildOptions struct {
 	// tested: only the groups of tests covering them are checked to pass
 	// together (see checkGroups). Nil checks every covered line's.
 	Lines map[string]bool
+	// GOROOT is the toolchain's (see GOROOT), whose bin directory every
+	// run of a test binary gets first on PATH, as under `go test` (see
+	// TestBinaryEnv); empty leaves PATH alone.
+	GOROOT string
 }
 
 // BuildTestMap compiles each package's test binary once, lists the tests
@@ -700,6 +705,7 @@ func compileTestBinary(ctx context.Context, projectDir string, opts BuildOptions
 		binPath:    binPath,
 		importPath: pkg.importPath,
 		dir:        pkg.dir,
+		goroot:     opts.GOROOT,
 	}, nil
 }
 
@@ -806,13 +812,15 @@ func withTestTimeout(ctx context.Context, timeout time.Duration) (context.Contex
 }
 
 // testBinaryCmd returns the command for one run of cp's binary from its
-// package directory. When ctx ends, the binary is killed along with every
+// package directory, in the environment `go test` gives it (see
+// TestBinaryEnv). When ctx ends, the binary is killed along with every
 // process it started, and the wait for output held open by one that
 // escaped is capped (see proctree.Bound), so a run that hangs can't
 // outlast its timeout for long.
 func testBinaryCmd(ctx context.Context, cp *compiledPkg, args []string) *exec.Cmd {
 	cmd := exec.CommandContext(ctx, cp.binPath, args...)
 	cmd.Dir = cp.dir
+	cmd.Env = TestBinaryEnv(cp.goroot, cp.dir)
 	proctree.Bound(cmd)
 	return cmd
 }
@@ -1112,6 +1120,35 @@ func TestBinaryArgs(ctx context.Context, projectDir, tags, pkg string, flags []s
 		return nil, fmt.Errorf("go test -n %s: %w\n%s", pkg, err, out)
 	}
 	return parseTestBinaryArgs(string(out))
+}
+
+// GOROOT returns the GOROOT of the toolchain `go` builds projectDir's tests
+// with. It is asked from projectDir, so a go.mod toolchain line or
+// GOTOOLCHAIN that switches toolchains names the one switched to.
+func GOROOT(ctx context.Context, projectDir string) (string, error) {
+	out, err := goCmd(ctx, projectDir, "env", "GOROOT").Output()
+	if err != nil {
+		return "", fmt.Errorf("go env GOROOT: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// TestBinaryEnv returns the environment `go test` runs a test binary in
+// from dir: gomutants' own, with goroot's bin directory first on PATH, so
+// a test that runs `go` gets the toolchain that built it rather than
+// whichever is first on PATH, and with PWD set to dir, which exec sets
+// only for a command without an Env of its own. An empty goroot leaves
+// PATH alone, as `go test` does.
+func TestBinaryEnv(goroot, dir string) []string {
+	env := os.Environ()
+	if goroot != "" {
+		path := filepath.Join(goroot, "bin")
+		if old := os.Getenv("PATH"); old != "" {
+			path += string(os.PathListSeparator) + old
+		}
+		env = append(env, "PATH="+path)
+	}
+	return append(env, "PWD="+dir)
 }
 
 // goTestOwnArg reports whether a test-binary argument is one `go test` adds
