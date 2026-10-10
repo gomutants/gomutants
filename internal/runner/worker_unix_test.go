@@ -662,6 +662,23 @@ func TestWorkerTestDeadlineDrainsBounded(t *testing.T) {
 	}
 }
 
+// TestWorkerTestRunOutputIsNoBuild: a test binary's output is the tests'
+// own, never the toolchain's, as the build runs on its own. A test that
+// prints `go test` output as fixture data, `[build failed]` included, and
+// then exits through log.Fatal, with no `--- FAIL: ` line, detected the
+// mutation: a generic phrase in its output must not read as the host
+// failing a build, which would drop the kill as INFRA ERROR.
+func TestWorkerTestRunOutputIsNoBuild(t *testing.T) {
+	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), time.Minute)
+	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
+		func(string) []string {
+			return []string{"sh", "-c", `printf 'FAIL\tm [build failed]\nresource temporarily unavailable\n'; exit 1`}
+		})
+	if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, time.Minute); got != mutator.StatusKilled {
+		t.Errorf("runGroups = %v, want KILLED: the output is the test's, not a build's", got)
+	}
+}
+
 // builtBin returns the binary a `go test -c -o <bin>` argv builds, and
 // whether args is one.
 func builtBin(args []string) (string, bool) {
