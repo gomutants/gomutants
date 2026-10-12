@@ -114,7 +114,7 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 	})
 
 	t.Run("failure warns once and reads 0", func(t *testing.T) {
-		groupRSSFunc = func(int) (int64, error) { return 0, errors.New(`exec: "ps": executable file not found in $PATH`) }
+		groupRSSFunc = func(int) (int64, error) { return 0, errors.New("fork/exec /bin/ps: no such file or directory") }
 		var first, second int64
 		out := captureStderr(t, func() {
 			first = pgroupRSSBytes(0)
@@ -126,7 +126,7 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 		if n := strings.Count(out, "RSS cap is off"); n != 1 {
 			t.Errorf("warned %d times, want once; stderr:\n%s", n, out)
 		}
-		if !strings.Contains(out, "executable file not found") {
+		if !strings.Contains(out, "no such file or directory") {
 			t.Errorf("warning doesn't name the cause; stderr:\n%s", out)
 		}
 	})

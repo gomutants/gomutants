@@ -8,9 +8,11 @@ import (
 	"strconv"
 )
 
-// psCommand is the ps binary psGroupRSS runs. Swappable so a test can make
-// the exec fail.
-var psCommand = "ps"
+// psCommand is the ps binary psGroupRSS runs, by absolute path so nothing
+// on PATH (the project under test can put its own dirs there) stands in
+// for it. ps is /bin/ps on macOS and the BSDs, and /bin links to /usr/bin
+// where it lives elsewhere. Swappable so a test can make the exec fail.
+var psCommand = "/bin/ps"
 
 // groupRSSFunc returns the summed RSS, in bytes, of every process in group
 // pgid. Swappable so tests can drive the RSS monitor without touching the
