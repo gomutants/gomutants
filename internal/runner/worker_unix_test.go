@@ -80,7 +80,7 @@ func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
 }
 
 // TestPgroupRSSBytesInvalidPgid kills the err-path return: passing an
-// invalid PGID makes `ps -g` emit either an error or empty output. The
+// invalid PGID leaves no matching `ps` rows, so the output is empty. The
 // original returns 0; a mutation that keeps the loop running still
 // returns 0 on empty output (no lines to parse), so this specifically
 // verifies the call doesn't panic or return garbage.
@@ -147,6 +147,35 @@ func TestPgroupRSSBytesParsing(t *testing.T) {
 			t.Errorf("got %d, want %d — malformed line should be skipped, sum should still total valid lines", got, want)
 		}
 	})
+}
+
+// TestPgroupRSSColumn pins the filter over `ps -A -o pgid=,rss=` output
+// that stands in for `ps -g` (issue #107). Kills:
+//   - CONDITIONALS_NEGATION / INVERT_LOGICAL on `len(f) == 2 &&
+//     bytes.Equal(...)`: other groups' rows leak in, or a short row panics.
+//   - STATEMENT_REMOVE on the '\n' append: two matching rows fuse into one
+//     number ("100200"), which pgroupRSSBytes would read as 100 MiB.
+func TestPgroupRSSColumn(t *testing.T) {
+	cases := []struct {
+		name  string
+		table string
+		pgid  int
+		want  string
+	}{
+		{"keeps only the group's rows", "  1 500\n 12 100\n 34 900\n 12 200\n", 12, "100\n200\n"},
+		{"pgid compared whole, not by prefix or suffix", "123 100\n 312 200\n  1 300\n", 12, ""},
+		{"column padding as ps prints it", "    12     4096\n", 12, "4096\n"},
+		{"rows with the wrong field count skipped", "12\n12 100 7\n12 50\n", 12, "50\n"},
+		{"no match is empty", "1 500\n", 12, ""},
+		{"empty table is empty", "", 12, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := string(pgroupRSSColumn([]byte(c.table), c.pgid)); got != c.want {
+				t.Errorf("pgroupRSSColumn(%q, %d) = %q, want %q", c.table, c.pgid, got, c.want)
+			}
+		})
+	}
 }
 
 // TestMakeCmdSetpgid kills STATEMENT_REMOVE on `cmd.SysProcAttr =

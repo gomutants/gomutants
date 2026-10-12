@@ -35,7 +35,7 @@ import (
 var maxSubprocRSSBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
 
 // monitorPollInterval is the cadence at which the RSS monitor probes
-// `ps -g`. var so tests can shrink it to make the kill path fire quickly.
+// `ps`. var so tests can shrink it to make the kill path fire quickly.
 var monitorPollInterval = 1 * time.Second
 
 // nonZeroSince returns time.Since(start) but guarantees a strictly positive

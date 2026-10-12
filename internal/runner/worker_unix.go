@@ -3,21 +3,49 @@
 package runner
 
 import (
+	"bytes"
 	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
 )
 
-// psOutputFunc returns ps's stdout for a given pgid. Swappable so tests
-// can drive pgroupRSSBytes without touching the real ps binary or the
-// host's process table.
+// psOutputFunc returns the RSS, in KB and one line per process, of every
+// process in group pgid. Swappable so tests can drive pgroupRSSBytes
+// without touching the real ps binary or the host's process table.
+//
+// The error is returned alongside the filtered output rather than checked
+// here: pgroupRSSBytes discards the output on any error, so a branch would
+// only add an equivalent mutant.
 var psOutputFunc = func(pgid int) ([]byte, error) {
-	return exec.Command("ps", "-o", "rss=", "-g", strconv.Itoa(pgid)).Output()
+	out, err := exec.Command("ps", "-A", "-o", "pgid=,rss=").Output()
+	return pgroupRSSColumn(out, pgid), err
+}
+
+// pgroupRSSColumn picks, from `ps -A -o pgid=,rss=` output, the RSS of each
+// process whose pgid is pgid, one per line.
+//
+// ps can't select a process group itself on every Unix. macOS reads `-g` as
+// a process group, but GNU ps reads a numeric `-g` list as session IDs, and
+// procps has no other pgid selector. A mutant's group (see
+// applyProcessGroup) has its own pgid but shares gomutants' session, so on
+// Linux `ps -g <pgid>` matched nothing, the monitor read 0, and a runaway
+// mutant was left to the kernel OOM-killer (issue #107). Listing every
+// process and filtering here works on both.
+func pgroupRSSColumn(table []byte, pgid int) []byte {
+	want := []byte(strconv.Itoa(pgid))
+	var col []byte
+	for _, line := range bytes.Split(table, []byte("\n")) {
+		f := bytes.Fields(line)
+		if len(f) == 2 && bytes.Equal(f[0], want) {
+			col = append(col, f[1]...)
+			col = append(col, '\n')
+		}
+	}
+	return col
 }
 
 // pgroupRSSBytes returns the summed RSS of all processes in the given PGID.
-// Uses `ps -g` (BSD/macOS flag) which is also supported on Linux GNU ps.
 //
 // The accumulator is structured as a single `if err == nil` add so the
 // continue-on-empty / continue-on-parse-error branches don't surface as
