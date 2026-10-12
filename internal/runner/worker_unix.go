@@ -3,66 +3,32 @@
 package runner
 
 import (
-	"bytes"
+	"fmt"
+	"os"
 	"os/exec"
-	"strconv"
-	"strings"
+	"sync/atomic"
 	"syscall"
 )
 
-// psOutputFunc returns the RSS, in KB and one line per process, of every
-// process in group pgid. Swappable so tests can drive pgroupRSSBytes
-// without touching the real ps binary or the host's process table.
-//
-// The error is returned alongside the filtered output rather than checked
-// here: pgroupRSSBytes discards the output on any error, so a branch would
-// only add an equivalent mutant.
-var psOutputFunc = func(pgid int) ([]byte, error) {
-	out, err := exec.Command("ps", "-A", "-o", "pgid=,rss=").Output()
-	return pgroupRSSColumn(out, pgid), err
-}
+// rssProbeWarned records that pgroupRSSBytes has reported a failed probe,
+// so a run with several workers polling every second warns once, not once
+// per poll.
+var rssProbeWarned atomic.Bool
 
-// pgroupRSSColumn picks, from `ps -A -o pgid=,rss=` output, the RSS of each
-// process whose pgid is pgid, one per line.
+// pgroupRSSBytes returns the summed RSS of all processes in the given PGID,
+// read by the platform's groupRSSFunc (/proc on Linux, ps elsewhere).
 //
-// ps can't select a process group itself on every Unix. macOS reads `-g` as
-// a process group, but GNU ps reads a numeric `-g` list as session IDs, and
-// procps has no other pgid selector. A mutant's group (see
-// applyProcessGroup) has its own pgid but shares gomutants' session, so on
-// Linux `ps -g <pgid>` matched nothing, the monitor read 0, and a runaway
-// mutant was left to the kernel OOM-killer (issue #107). Listing every
-// process and filtering here works on both.
-func pgroupRSSColumn(table []byte, pgid int) []byte {
-	want := []byte(strconv.Itoa(pgid))
-	var col []byte
-	for _, line := range bytes.Split(table, []byte("\n")) {
-		f := bytes.Fields(line)
-		if len(f) == 2 && bytes.Equal(f[0], want) {
-			col = append(col, f[1]...)
-			col = append(col, '\n')
-		}
-	}
-	return col
-}
-
-// pgroupRSSBytes returns the summed RSS of all processes in the given PGID.
-//
-// The accumulator is structured as a single `if err == nil` add so the
-// continue-on-empty / continue-on-parse-error branches don't surface as
-// equivalent mutants (in both, n stays 0 and total += 0 is a no-op).
+// A probe that fails reads as 0, which leaves the RSS cap unable to fire,
+// so the first failure is reported rather than swallowed: a missing ps
+// once disabled the cap with no trace but the kernel's OOM kills.
+// groupRSSFunc returns 0 with its error, so there is no separate early
+// return; it would only be an equivalent mutant.
 func pgroupRSSBytes(pgid int) int64 {
-	out, err := psOutputFunc(pgid)
-	if err != nil {
-		return 0
+	n, err := groupRSSFunc(pgid)
+	if err != nil && rssProbeWarned.CompareAndSwap(false, true) {
+		fmt.Fprintf(os.Stderr, "gomutants: can't read mutant memory, so the per-mutant RSS cap is off for this run: %v\n", err)
 	}
-	var total int64
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		n, err := strconv.ParseInt(strings.TrimSpace(line), 10, 64)
-		if err == nil {
-			total += n * 1024 // ps rss is KB
-		}
-	}
-	return total
+	return n
 }
 
 // syscallKillFunc is the indirection used by killPgroup; swappable so tests

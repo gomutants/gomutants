@@ -22,18 +22,11 @@ import (
 	"github.com/gomutants/gomutants/internal/proctree"
 )
 
-// TestPgroupRSSBytesSelf exercises pgroupRSSBytes against our own process
-// group. Kills:
-//   - CONDITIONALS_NEGATION on `err != nil` (line 32): mutated `err == nil`
-//     would short-circuit to return 0 on the success path.
-//   - STATEMENT_REMOVE on `line = strings.TrimSpace(line)` (line 37):
-//     without trimming, `ps` output lines (" 12345") fail strconv.ParseInt.
-//   - CONDITIONALS_NEGATION on `line == ""` (line 38): mutated `!=` skips
-//     every non-empty line, never reaching ParseInt.
-//   - CONDITIONALS_NEGATION on `err != nil` (line 42): mutated `==` skips
-//     successful parses, total stays 0.
-//   - ARITHMETIC_BASE on `n * 1024` (line 45): mutated `n / 1024` produces
-//     byte totals roughly 1e6× too small.
+// TestPgroupRSSBytesSelf runs the real probe (/proc on Linux, ps
+// elsewhere) against our own process group. Kills, in the platform's
+// groupRSSFunc, any mutant that loses the group's rows or its unit
+// conversion: a dropped match, a wrong field index, or `/` for the page or
+// KB multiply all collapse the total toward 0.
 //
 // We assert the returned value exceeds 1 MiB — real Go test processes use
 // tens of MiB, but all the mutations above collapse the result toward 0.
@@ -79,103 +72,64 @@ func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
 	}
 }
 
-// TestPgroupRSSBytesInvalidPgid kills the err-path return: passing an
-// invalid PGID leaves no matching `ps` rows, so the output is empty. The
-// original returns 0; a mutation that keeps the loop running still
-// returns 0 on empty output (no lines to parse), so this specifically
-// verifies the call doesn't panic or return garbage.
+// TestPgroupRSSBytesInvalidPgid probes a pgid no process has. The real
+// probe succeeds with no matching rows, so the result must be exactly 0,
+// and with no error there must be no warning.
 func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
-	// Very large pgid unlikely to exist.
-	bytes := pgroupRSSBytes(99999999)
-	if bytes < 0 {
-		t.Errorf("pgroupRSSBytes(invalid) = %d, want >= 0", bytes)
+	t.Cleanup(func() { rssProbeWarned.Store(false) })
+	var got int64
+	out := captureStderr(t, func() { got = pgroupRSSBytes(99999999) }) // unlikely to exist
+	if got != 0 {
+		t.Errorf("pgroupRSSBytes(invalid) = %d, want 0", got)
+	}
+	if out != "" {
+		t.Errorf("stderr = %q, want nothing — the probe didn't fail", out)
 	}
 }
 
-// TestPgroupRSSBytesParsing covers the parsing path with a stubbed
-// psOutputFunc. Real ps output may or may not have leading whitespace
-// depending on column width; injecting a known string lets us pin the
-// behavior. Kills:
-//   - BRANCH_IF on the err-return (psOutputFunc returns err with non-empty
-//     output; original returns 0, the elided body parses the output).
-//   - STATEMENT_REMOVE on the inner TrimSpace (now removed since the trim
-//     is inlined into ParseInt's argument; mutating the inlined call breaks
-//     parses on whitespace-prefixed lines).
-//   - REMOVE_SELF_ASSIGNMENTS on `total += n * 1024` (sum vs last-line).
-func TestPgroupRSSBytesParsing(t *testing.T) {
-	orig := psOutputFunc
-	defer func() { psOutputFunc = orig }()
+// TestPgroupRSSBytesProbeError pins how pgroupRSSBytes handles its probe.
+// A failed probe (no ps binary, no /proc) leaves the RSS cap unable to
+// fire, which once went unreported. Kills:
+//   - CONDITIONALS_NEGATION / BRANCH_IF on `err != nil`: no warning on
+//     failure, or one on success.
+//   - INVERT_LOGICAL on the `&&`: a successful probe warns.
+//   - the CompareAndSwap guard dropped: every failing poll warns again.
+func TestPgroupRSSBytesProbeError(t *testing.T) {
+	orig := groupRSSFunc
+	t.Cleanup(func() {
+		groupRSSFunc = orig
+		rssProbeWarned.Store(false)
+	})
 
-	t.Run("err returns 0 even with output", func(t *testing.T) {
-		psOutputFunc = func(int) ([]byte, error) {
-			return []byte("12345\n"), errors.New("inject")
+	t.Run("success passes the total through, silently", func(t *testing.T) {
+		groupRSSFunc = func(int) (int64, error) { return 7 * 1024, nil }
+		var got int64
+		out := captureStderr(t, func() { got = pgroupRSSBytes(0) })
+		if got != 7*1024 {
+			t.Errorf("got %d, want %d", got, 7*1024)
 		}
-		if got := pgroupRSSBytes(0); got != 0 {
-			t.Errorf("got %d, want 0 — BRANCH_IF on err-return body lets the parse through", got)
+		if out != "" {
+			t.Errorf("stderr = %q, want nothing on success", out)
 		}
 	})
 
-	t.Run("sums all lines", func(t *testing.T) {
-		psOutputFunc = func(int) ([]byte, error) {
-			return []byte("  100\n  200\n  50\n"), nil
-		}
-		got := pgroupRSSBytes(0)
-		want := int64((100 + 200 + 50) * 1024)
-		if got != want {
-			t.Errorf("got %d, want %d — REMOVE_SELF_ASSIGNMENTS on `total += n*1024` (or untrimmed-line parse failure) collapses the sum", got, want)
-		}
-	})
-
-	t.Run("trims leading whitespace", func(t *testing.T) {
-		psOutputFunc = func(int) ([]byte, error) {
-			return []byte("    7\n"), nil
-		}
-		got := pgroupRSSBytes(0)
-		want := int64(7 * 1024)
-		if got != want {
-			t.Errorf("got %d, want %d — without TrimSpace, ParseInt rejects whitespace-prefixed lines", got, want)
-		}
-	})
-
-	t.Run("skips malformed lines", func(t *testing.T) {
-		psOutputFunc = func(int) ([]byte, error) {
-			return []byte("100\nnotanumber\n200\n"), nil
-		}
-		got := pgroupRSSBytes(0)
-		want := int64((100 + 200) * 1024)
-		if got != want {
-			t.Errorf("got %d, want %d — malformed line should be skipped, sum should still total valid lines", got, want)
-		}
-	})
-}
-
-// TestPgroupRSSColumn pins the filter over `ps -A -o pgid=,rss=` output
-// that stands in for `ps -g` (issue #107). Kills:
-//   - CONDITIONALS_NEGATION / INVERT_LOGICAL on `len(f) == 2 &&
-//     bytes.Equal(...)`: other groups' rows leak in, or a short row panics.
-//   - STATEMENT_REMOVE on the '\n' append: two matching rows fuse into one
-//     number ("100200"), which pgroupRSSBytes would read as 100 MiB.
-func TestPgroupRSSColumn(t *testing.T) {
-	cases := []struct {
-		name  string
-		table string
-		pgid  int
-		want  string
-	}{
-		{"keeps only the group's rows", "  1 500\n 12 100\n 34 900\n 12 200\n", 12, "100\n200\n"},
-		{"pgid compared whole, not by prefix or suffix", "123 100\n 312 200\n  1 300\n", 12, ""},
-		{"column padding as ps prints it", "    12     4096\n", 12, "4096\n"},
-		{"rows with the wrong field count skipped", "12\n12 100 7\n12 50\n", 12, "50\n"},
-		{"no match is empty", "1 500\n", 12, ""},
-		{"empty table is empty", "", 12, ""},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := string(pgroupRSSColumn([]byte(c.table), c.pgid)); got != c.want {
-				t.Errorf("pgroupRSSColumn(%q, %d) = %q, want %q", c.table, c.pgid, got, c.want)
-			}
+	t.Run("failure warns once and reads 0", func(t *testing.T) {
+		groupRSSFunc = func(int) (int64, error) { return 0, errors.New(`exec: "ps": executable file not found in $PATH`) }
+		var first, second int64
+		out := captureStderr(t, func() {
+			first = pgroupRSSBytes(0)
+			second = pgroupRSSBytes(0)
 		})
-	}
+		if first != 0 || second != 0 {
+			t.Errorf("got %d, %d, want 0, 0", first, second)
+		}
+		if n := strings.Count(out, "RSS cap is off"); n != 1 {
+			t.Errorf("warned %d times, want once; stderr:\n%s", n, out)
+		}
+		if !strings.Contains(out, "executable file not found") {
+			t.Errorf("warning doesn't name the cause; stderr:\n%s", out)
+		}
+	})
 }
 
 // TestMakeCmdSetpgid kills STATEMENT_REMOVE on `cmd.SysProcAttr =
@@ -210,19 +164,19 @@ func TestWorkerTestGetpgidFallback(t *testing.T) {
 
 	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
-	origPS := psOutputFunc
+	origRSS := groupRSSFunc
 	origKill := syscallKillFunc
 	origGetpgid := syscallGetpgidFunc
 	defer func() {
 		maxSubprocRSSBytes = origCap
 		monitorPollInterval = origPoll
-		psOutputFunc = origPS
+		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 		syscallGetpgidFunc = origGetpgid
 	}()
 	maxSubprocRSSBytes = 1024
 	monitorPollInterval = 50 * time.Millisecond
-	psOutputFunc = func(int) ([]byte, error) { return []byte("999999\n"), nil }
+	groupRSSFunc = func(int) (int64, error) { return 999999 * 1024, nil }
 
 	// Force the Getpgid path to fail so the fallback body must execute.
 	syscallGetpgidFunc = func(int) (int, error) {
@@ -296,20 +250,20 @@ func TestKillPgroupSendsNegativePgid(t *testing.T) {
 func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
-	origPS := psOutputFunc
+	origRSS := groupRSSFunc
 	origKill := syscallKillFunc
 	defer func() {
 		maxSubprocRSSBytes = origCap
 		monitorPollInterval = origPoll
-		psOutputFunc = origPS
+		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 	}()
 	maxSubprocRSSBytes = 1024 // 1 KB — well below any real process
 	monitorPollInterval = 50 * time.Millisecond
 
-	psOutputFunc = func(int) ([]byte, error) {
+	groupRSSFunc = func(int) (int64, error) {
 		// Way above the tiny cap so the kill path always fires.
-		return []byte("999999\n"), nil
+		return 999999 * 1024, nil
 	}
 	var killCalls atomic.Int32
 	syscallKillFunc = func(pid int, sig syscall.Signal) error {
@@ -331,9 +285,9 @@ func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 }
 
 // TestWorkerTestRSSExactlyAtCapDoesNotKill kills CONDITIONALS_BOUNDARY on
-// `pgroupRSSBytes(pgid) > maxSubprocRSSBytes`. With ps reporting exactly
-// the cap, the original `>` evaluates to false and no kill fires; the
-// boundary mutant `>=` would trigger the kill on the equality.
+// `pgroupRSSBytes(pgid) > maxSubprocRSSBytes`. With the probe reporting
+// exactly the cap, the original `>` evaluates to false and no kill fires;
+// the boundary mutant `>=` would trigger the kill on the equality.
 func TestWorkerTestRSSExactlyAtCapDoesNotKill(t *testing.T) {
 	dir := setupTestProject(t)
 	srcPath := filepath.Join(dir, "add.go")
@@ -343,20 +297,19 @@ func TestWorkerTestRSSExactlyAtCapDoesNotKill(t *testing.T) {
 
 	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
-	origPS := psOutputFunc
+	origRSS := groupRSSFunc
 	origKill := syscallKillFunc
 	defer func() {
 		maxSubprocRSSBytes = origCap
 		monitorPollInterval = origPoll
-		psOutputFunc = origPS
+		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 	}()
 	maxSubprocRSSBytes = 1024
 	monitorPollInterval = 50 * time.Millisecond
 
-	// ps RSS column is in KB, multiplied by 1024 inside pgroupRSSBytes.
-	// "1\n" ⇒ total = 1024 bytes, exactly equal to cap.
-	psOutputFunc = func(int) ([]byte, error) { return []byte("1\n"), nil }
+	// Exactly equal to the cap.
+	groupRSSFunc = func(int) (int64, error) { return 1024, nil }
 	var killCalls atomic.Int32
 	syscallKillFunc = func(int, syscall.Signal) error {
 		killCalls.Add(1)
@@ -388,7 +341,7 @@ func TestWorkerTestRSSExactlyAtCapDoesNotKill(t *testing.T) {
 // TestWorkerTestMonitorGoroutineExits kills STATEMENT_REMOVE on
 // `close(monitorDone)`. With RSS well below the cap the kill path never
 // fires, so the goroutine relies on `<-monitorDone` to exit. Without the
-// close, it keeps polling ps after Worker.Test returns.
+// close, it keeps polling the probe after Worker.Test returns.
 func TestWorkerTestMonitorGoroutineExits(t *testing.T) {
 	dir := setupTestProject(t)
 	srcPath := filepath.Join(dir, "add.go")
@@ -397,17 +350,17 @@ func TestWorkerTestMonitorGoroutineExits(t *testing.T) {
 	plusIdx := strings.IndexByte(string(src), '+')
 
 	origPoll := monitorPollInterval
-	origPS := psOutputFunc
+	origRSS := groupRSSFunc
 	defer func() {
 		monitorPollInterval = origPoll
-		psOutputFunc = origPS
+		groupRSSFunc = origRSS
 	}()
 	monitorPollInterval = 50 * time.Millisecond
 
-	var psCalls atomic.Int32
-	psOutputFunc = func(int) ([]byte, error) {
-		psCalls.Add(1)
-		return []byte("0\n"), nil // far below cap; no kill
+	var probeCalls atomic.Int32
+	groupRSSFunc = func(int) (int64, error) {
+		probeCalls.Add(1)
+		return 0, nil // far below cap; no kill
 	}
 
 	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 30 * time.Second}, cache, dir, nil)
@@ -422,10 +375,10 @@ func TestWorkerTestMonitorGoroutineExits(t *testing.T) {
 	}
 	w.Test(context.Background(), m)
 
-	atReturn := psCalls.Load()
+	atReturn := probeCalls.Load()
 	time.Sleep(4 * monitorPollInterval)
-	if growth := psCalls.Load() - atReturn; growth > 1 {
-		t.Errorf("ps polled %d more times after Test returned — STATEMENT_REMOVE on close(monitorDone) leaks the goroutine", growth)
+	if growth := probeCalls.Load() - atReturn; growth > 1 {
+		t.Errorf("probe polled %d more times after Test returned — STATEMENT_REMOVE on close(monitorDone) leaks the goroutine", growth)
 	}
 }
 

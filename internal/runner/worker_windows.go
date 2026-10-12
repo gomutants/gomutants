@@ -9,7 +9,8 @@ import (
 )
 
 // pgroupRSSBytes is a best-effort no-op on Windows. The Unix RSS monitor
-// queries `ps -A -o pgid=,rss=`, which has no portable Windows equivalent.
+// reads /proc on Linux and `ps -A -o pgid=,rss=` elsewhere; neither has a
+// portable Windows equivalent.
 // Returning 0 means the `pgroupRSSBytes(pgid) > maxSubprocRSSBytes` check
 // in Worker.Test never fires, so runaway mutants on Windows are bounded
 // only by the per-mutant context timeout. A future port could use job
