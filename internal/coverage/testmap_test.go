@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -821,6 +820,104 @@ func TestSuites(t *testing.T) {
 	}
 }
 
+// TestTestBinaryEnv: a test binary's environment is gomutants' own with
+// GOROOT's bin directory first on PATH and PWD the run's directory, as
+// `go test` gives it. Go takes the last of a repeated variable, so the
+// entries that count are the last ones.
+func TestTestBinaryEnv(t *testing.T) {
+	last := func(env []string, key string) (string, int) {
+		val, n := "", 0
+		for _, kv := range env {
+			if v, ok := strings.CutPrefix(kv, key+"="); ok {
+				val, n = v, n+1
+			}
+		}
+		return val, n
+	}
+	goroot, dir := filepath.Join("g", "root"), filepath.Join("pkg", "dir")
+	bin := filepath.Join(goroot, "bin")
+	sep := string(os.PathListSeparator)
+
+	t.Setenv("PATH", "first"+sep+"second")
+	env := TestBinaryEnv(goroot, dir)
+	if got, _ := last(env, "PATH"); got != bin+sep+"first"+sep+"second" {
+		t.Errorf("PATH = %q, want GOROOT/bin before the inherited PATH", got)
+	}
+	if got, _ := last(env, "PWD"); got != dir {
+		t.Errorf("PWD = %q, want %q", got, dir)
+	}
+	if _, n := last(env, "PATH"); n != 2 {
+		t.Errorf("PATH set %d times, want the inherited one and ours", n)
+	}
+
+	if got, n := last(TestBinaryEnv("", dir), "PATH"); got != "first"+sep+"second" || n != 1 {
+		t.Errorf("no GOROOT: PATH = %q (set %d times), want it left alone", got, n)
+	}
+
+	t.Setenv("PATH", "")
+	if got, _ := last(TestBinaryEnv(goroot, dir), "PATH"); got != bin {
+		t.Errorf("empty PATH: PATH = %q, want GOROOT/bin alone", got)
+	}
+}
+
+// TestTestBinaryCmdEnv: the map runs a test binary with the environment
+// `go test` gives it, so a test that runs `go` gets the toolchain that
+// built it rather than whichever `go` is first on PATH: one that differs
+// would fail the test when run alone, dropping it from the map.
+func TestTestBinaryCmdEnv(t *testing.T) {
+	goroot, dir := filepath.Join("g", "root"), filepath.Join("pkg", "dir")
+	cp := &compiledPkg{binPath: "bin", dir: dir, goroot: goroot}
+	got := testBinaryCmd(context.Background(), cp, nil).Env
+	if want := TestBinaryEnv(goroot, dir); !slices.Equal(got, want) {
+		t.Errorf("testBinaryCmd Env = %q, want %q", got, want)
+	}
+}
+
+// TestGOROOT: the toolchain's GOROOT holds its bin directory; a `go` that
+// can't run is an error.
+func TestGOROOT(t *testing.T) {
+	got, err := GOROOT(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi, err := os.Stat(filepath.Join(got, "bin")); err != nil || !fi.IsDir() {
+		t.Errorf("GOROOT = %q, want a directory with a bin directory: %v", got, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := GOROOT(ctx, t.TempDir()); !errors.Is(err, context.Canceled) {
+		t.Errorf("GOROOT with a cancelled context: err = %v, want one wrapping context.Canceled", err)
+	}
+}
+
+// TestSuiteDir: a suite's directory by import path, wherever it sits in
+// the sorted suites; none for a package outside them or on a nil map.
+func TestSuiteDir(t *testing.T) {
+	if dir, ok := (*TestMap)(nil).SuiteDir("m/a"); dir != "" || ok {
+		t.Errorf("nil map: SuiteDir = (%q, %v), want none", dir, ok)
+	}
+	a := Package{ImportPath: "m/a", Dir: "/a"}
+	b := Package{ImportPath: "m/b", Dir: "/b"}
+	c := Package{ImportPath: "m/c", Dir: "/c"}
+	tm := NewTestMapForTesting(nil, nil).WithSuitesForTesting(false, nil, c, a, b)
+	cases := []struct {
+		pkg, want string
+		ok        bool
+	}{
+		{"m/a", "/a", true},
+		{"m/b", "/b", true},
+		{"m/c", "/c", true},
+		{"m/0", "", false},
+		{"m/ab", "", false},
+		{"m/d", "", false},
+	}
+	for _, tc := range cases {
+		if dir, ok := tm.SuiteDir(tc.pkg); dir != tc.want || ok != tc.ok {
+			t.Errorf("SuiteDir(%s) = (%q, %v), want (%q, %v)", tc.pkg, dir, ok, tc.want, tc.ok)
+		}
+	}
+}
+
 // TestSuitePkgs pins which suites decide a mutant's verdict: its own
 // package's without cross-package coverage; with it, every package
 // (sorted) whose tests link the mutant's package or whose links are
@@ -927,7 +1024,7 @@ func TestProcessWorkSkipsStalledPackages(t *testing.T) {
 // stubBuildTestMapDeps swaps BuildTestMap's go-tool seams for stubs: every
 // resolved package compiles, listTests returns `tests`, each compiled test
 // run bumps the returned counter, every group of tests passes together,
-// and neither the test deps nor rebuilds can be read. Restored on cleanup.
+// and the test deps can't be read. Restored on cleanup.
 func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPkg) *int32 {
 	t.Helper()
 	origCompile := compileTestBinaryFunc
@@ -935,7 +1032,6 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 	origList := listTestsFunc
 	origRun := runCompiledTestFunc
 	origDeps := testDepsFunc
-	origRebuild := measureRebuildFunc
 	origGroup := groupPassesFunc
 	t.Cleanup(func() {
 		groupPassesFunc = origGroup
@@ -944,13 +1040,9 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 		listTestsFunc = origList
 		runCompiledTestFunc = origRun
 		testDepsFunc = origDeps
-		measureRebuildFunc = origRebuild
 	})
 	testDepsFunc = func(context.Context, string, BuildOptions, []string) (map[string]map[string]bool, error) {
 		return nil, errors.New("deps not stubbed")
-	}
-	measureRebuildFunc = func(context.Context, string, BuildOptions, *compiledPkg) (time.Duration, error) {
-		return 0, errors.New("rebuild not stubbed")
 	}
 	groupPassesFunc = func(context.Context, *compiledPkg, []string, time.Duration) bool {
 		return true
@@ -1459,8 +1551,8 @@ func TestBuildFlags(t *testing.T) {
 		{[]string{"xrace", "-race"}, []string{"-race"}},
 	}
 	for _, c := range cases {
-		if got := buildFlags(c.in); !slices.Equal(got, c.want) {
-			t.Errorf("buildFlags(%q) = %q, want %q", c.in, got, c.want)
+		if got := BuildFlags(c.in); !slices.Equal(got, c.want) {
+			t.Errorf("BuildFlags(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
@@ -1533,26 +1625,6 @@ func TestProcessWorkForwardsTinyDurations(t *testing.T) {
 	}
 }
 
-// TestRebuildDuration: a nil map has no measurement, and the test helper
-// replaces the measurements wholesale, leaving the map it is called on as
-// it was.
-func TestRebuildDuration(t *testing.T) {
-	if d, ok := (*TestMap)(nil).RebuildDuration("p"); d != 0 || ok {
-		t.Errorf("nil map: RebuildDuration = (%v, %v), want (0, false)", d, ok)
-	}
-	base := NewTestMapForTesting(map[[2]string]time.Duration{{"p", "TestA"}: time.Millisecond}, nil)
-	got := base.WithRebuildsForTesting(map[string]time.Duration{"q": time.Second})
-	if d, ok := got.RebuildDuration("q"); d != time.Second || !ok {
-		t.Errorf("RebuildDuration(q) = (%v, %v), want (1s, true)", d, ok)
-	}
-	if _, ok := got.RebuildDuration("p"); ok {
-		t.Error("RebuildDuration(p) measured, want the helper's map to replace the fixture's")
-	}
-	if _, ok := base.RebuildDuration("p"); !ok {
-		t.Error("the helper changed the map it was called on")
-	}
-}
-
 // TestStalledPkgs: a package is stalled once added, others aren't, and a
 // nil set records nothing.
 func TestStalledPkgs(t *testing.T) {
@@ -1584,47 +1656,5 @@ func TestBuildTestMapReadsTestDepsOnlyWhenNeeded(t *testing.T) {
 		if calls != want {
 			t.Errorf("coverpkg=%q: testDeps called %d times, want %d", coverPkg, calls, want)
 		}
-	}
-}
-
-// TestMeasureRebuildsSkipsFailures: a package whose rebuild can't be
-// measured gets no measurement, rather than a zero one.
-func TestMeasureRebuildsSkipsFailures(t *testing.T) {
-	orig := measureRebuildFunc
-	t.Cleanup(func() { measureRebuildFunc = orig })
-	measureRebuildFunc = func(_ context.Context, _ string, _ BuildOptions, cp *compiledPkg) (time.Duration, error) {
-		if cp.importPath == "bad" {
-			return 0, errors.New("boom")
-		}
-		return time.Second, nil
-	}
-	var got map[string]time.Duration
-	// One worker for two packages: each measurement must free its slot.
-	runWithDeadline(t, 30*time.Second, func() {
-		got = measureRebuilds(context.Background(), "", BuildOptions{Workers: 1}, map[string]*compiledPkg{"good": {importPath: "good"}, "bad": {importPath: "bad"}})
-	})
-	if want := map[string]time.Duration{"good": time.Second}; !maps.Equal(got, want) {
-		t.Errorf("measureRebuilds = %v, want %v", got, want)
-	}
-}
-
-// TestNewTestMapForTestingRebuilds: every package a fixture names, by its
-// timings or its coverage, rebuilds in no time.
-func TestNewTestMapForTestingRebuilds(t *testing.T) {
-	tm := NewTestMapForTesting(map[[2]string]time.Duration{{"p", "TestA"}: time.Millisecond}, map[string][]TestRef{"f.go:1": {{Pkg: "q", Name: "TestB"}}})
-	for _, pkg := range []string{"p", "q"} {
-		if d, ok := tm.RebuildDuration(pkg); d != 0 || !ok {
-			t.Errorf("RebuildDuration(%s) = (%v, %v), want (0, true)", pkg, d, ok)
-		}
-	}
-	if _, ok := tm.RebuildDuration("r"); ok {
-		t.Error("RebuildDuration(r) measured, want a package the fixture doesn't name unmeasured")
-	}
-}
-
-// TestPipeDrainDelay pins the documented default.
-func TestPipeDrainDelay(t *testing.T) {
-	if pipeDrainDelay != 5*time.Second {
-		t.Errorf("pipeDrainDelay = %v, want 5s", pipeDrainDelay)
 	}
 }

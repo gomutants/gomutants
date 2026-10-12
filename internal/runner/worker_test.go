@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -628,20 +629,20 @@ func TestShortFlagFromEnv(t *testing.T) {
 	}
 }
 
-// TestMakeTestCmdGOMAXPROCSEnv kills BRANCH_IF, CONDITIONALS_BOUNDARY,
+// TestMakeCmdGOMAXPROCSEnv kills BRANCH_IF, CONDITIONALS_BOUNDARY,
 // CONDITIONALS_NEGATION, and STATEMENT_REMOVE on the
 // `if w.childGOMAXPROCS > 0 { cmd.Env = append(...) }` block.
-func TestMakeTestCmdGOMAXPROCSEnv(t *testing.T) {
+func TestMakeCmdGOMAXPROCSEnv(t *testing.T) {
 	t.Run("zero leaves Env nil", func(t *testing.T) {
 		w := &Worker{projectDir: ".", policy: TimeoutPolicy{Global: time.Second}, childGOMAXPROCS: 0}
-		cmd, _, _ := w.makeTestCmd(context.Background(), []string{"version"})
+		cmd, _, _ := w.makeCmd(context.Background(), "go", w.projectDir, []string{"version"})
 		if cmd.Env != nil {
 			t.Errorf("Env=%v; want nil — CONDITIONALS_BOUNDARY `> 0` → `>= 0` would set env even at zero", cmd.Env)
 		}
 	})
 	t.Run("non-zero sets GOMAXPROCS", func(t *testing.T) {
 		w := &Worker{projectDir: "/proj", policy: TimeoutPolicy{Global: time.Second}, childGOMAXPROCS: 3}
-		cmd, _, _ := w.makeTestCmd(context.Background(), []string{"version"})
+		cmd, _, _ := w.makeCmd(context.Background(), "go", w.projectDir, []string{"version"})
 		if cmd.Env == nil {
 			t.Fatal("Env is nil; want GOMAXPROCS override — BRANCH_IF on the body or STATEMENT_REMOVE on the assignment drops it")
 		}
@@ -652,6 +653,27 @@ func TestMakeTestCmdGOMAXPROCSEnv(t *testing.T) {
 			t.Errorf("Env missing PWD=/proj: %v", cmd.Env)
 		}
 	})
+}
+
+// TestBinEnv: a test binary runs in `go test`'s environment for it —
+// GOROOT/bin first on PATH, PWD its directory — plus the GOMAXPROCS cap
+// only when there is one.
+func TestBinEnv(t *testing.T) {
+	t.Setenv("PATH", "inherited")
+	want := "PATH=" + filepath.Join("/goroot", "bin") + string(os.PathListSeparator) + "inherited"
+	for _, procs := range []int{0, 3} {
+		w := &Worker{goroot: "/goroot", childGOMAXPROCS: procs}
+		env := w.binEnv("/pkg")
+		if !envContains(env, want) || !envContains(env, "PWD=/pkg") {
+			t.Errorf("childGOMAXPROCS=%d: env lacks %s or PWD=/pkg: %v", procs, want, env)
+		}
+		if got, wantCap := envContains(env, "GOMAXPROCS=3"), procs > 0; got != wantCap {
+			t.Errorf("childGOMAXPROCS=%d: GOMAXPROCS=3 in env = %v, want %v", procs, got, wantCap)
+		}
+		if extra := len(env) - len(coverage.TestBinaryEnv(w.goroot, "/pkg")); extra != min(procs, 1) {
+			t.Errorf("childGOMAXPROCS=%d: %d entries beyond go test's, want %d", procs, extra, min(procs, 1))
+		}
+	}
 }
 
 func envContains(env []string, want string) bool {
@@ -713,7 +735,7 @@ func TestWorkerTestStartFailureClassifiesNotViable(t *testing.T) {
 }
 
 func TestWorkerTestStartFailureClassifiesInfrastructureErrors(t *testing.T) {
-	w := &Worker{id: 7, projectDir: "."}
+	w := &Worker{id: 7, projectDir: ".", binDir: t.TempDir()}
 	for _, injection := range infraInjections() {
 		t.Run(injection.name, func(t *testing.T) {
 			origStart := startCommandFunc
@@ -722,7 +744,7 @@ func TestWorkerTestStartFailureClassifiesInfrastructureErrors(t *testing.T) {
 
 			var got mutator.MutantStatus
 			captured := captureStderr(t, func() {
-				got = w.runMutantTest(context.Background(), nil)
+				_, got = w.buildBin(context.Background(), "p")
 			})
 			if got != mutator.StatusInfraError {
 				t.Errorf("Status=%v, want InfraError", got)
@@ -890,247 +912,78 @@ func TestWorkerTestParentCtxCancel(t *testing.T) {
 	}
 }
 
-// TestBuildTestArgsShortFlag kills CONDITIONALS_NEGATION / BRANCH_IF on
-// the GOMUTANTS_TEST_SHORT gate: passing short=true must add "-short" to
-// the command line; short=false must omit it. We assert both directions.
-func TestBuildTestArgsShortFlag(t *testing.T) {
-	w := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	m := mutator.Mutant{Pkg: "mymod"}
-
-	withShort := onlyInvocation(t, w, m, true, time.Second)
-	if !containsStr(withShort, "-short") {
-		t.Errorf("short=true: args %v missing -short", withShort)
+// TestBinFlags pins the `go test` flags a mutant's test binaries are run
+// as (their binary arguments are read from them; see binArgsCache), and
+// kills the mutations on each gate:
+//   - BRANCH_IF / CONDITIONALS_NEGATION on `if short`: -short must appear
+//     exactly when short is set.
+//   - BRANCH_IF / CONDITIONALS_BOUNDARY on `if w.testCPU > 0`: -cpu=N must
+//     appear exactly when testCPU is positive, matching gremlins in
+//     leaving `go test` to default to GOMAXPROCS otherwise.
+//   - STATEMENT_REMOVE on the append of w.testFlags: the user's flags must
+//     appear, last, in the order given, so a user value for a flag we
+//     also pass wins under Go's last-occurrence rule.
+func TestBinFlags(t *testing.T) {
+	cases := []struct {
+		name string
+		w    *Worker
+		shrt bool
+		want []string
+	}{
+		{"defaults", &Worker{}, false, []string{"-failfast"}},
+		{"short", &Worker{}, true, []string{"-failfast", "-short"}},
+		{"test cpu", &Worker{testCPU: 2}, false, []string{"-failfast", "-cpu=2"}},
+		{"one test cpu", &Worker{testCPU: 1}, false, []string{"-failfast", "-cpu=1"}},
+		{"everything", &Worker{testCPU: 2, testFlags: []string{"-rapid.checks=20", "-race"}}, true,
+			[]string{"-failfast", "-cpu=2", "-short", "-rapid.checks=20", "-race"}},
 	}
-	withoutShort := onlyInvocation(t, w, m, false, time.Second)
-	if containsStr(withoutShort, "-short") {
-		t.Errorf("short=false: args %v should not contain -short", withoutShort)
-	}
-}
-
-// TestBuildTestArgsTestCPU kills BRANCH_IF / CONDITIONALS_BOUNDARY on the
-// `if w.testCPU > 0` gate. With testCPU=2 the args must include `-cpu=2`;
-// with testCPU=0 the `-cpu=` arg must be absent (let go test default to
-// GOMAXPROCS, matching gremlins).
-func TestBuildTestArgsTestCPU(t *testing.T) {
-	m := mutator.Mutant{Pkg: "mymod"}
-
-	wOn := &Worker{testCPU: 2, policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOn := onlyInvocation(t, wOn, m, false, time.Second)
-	if !containsStr(argsOn, "-cpu=2") {
-		t.Errorf("testCPU=2: args %v missing -cpu=2", argsOn)
-	}
-
-	wOff := &Worker{testCPU: 0, policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOff := onlyInvocation(t, wOff, m, false, time.Second)
-	if anyHasPrefix(argsOff, "-cpu=") {
-		t.Errorf("testCPU=0: args %v should not contain -cpu=", argsOff)
-	}
-}
-
-// TestBuildTestArgsTags kills BRANCH_IF / CONDITIONALS_NEGATION on the
-// `if w.tags != ""` gate. With tags set the args must include the
-// `-tags=<value>` forwarded to the inner go test; with tags empty the
-// `-tags=` arg must be absent.
-func TestBuildTestArgsTags(t *testing.T) {
-	m := mutator.Mutant{Pkg: "mymod"}
-
-	wOn := &Worker{tags: "integration,debug", policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOn := onlyInvocation(t, wOn, m, false, time.Second)
-	if !containsStr(argsOn, "-tags=integration,debug") {
-		t.Errorf("tags set: args %v missing -tags=integration,debug", argsOn)
-	}
-
-	wOff := &Worker{tags: "", policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOff := onlyInvocation(t, wOff, m, false, time.Second)
-	if anyHasPrefix(argsOff, "-tags=") {
-		t.Errorf("tags empty: args %v should not contain -tags=", argsOff)
-	}
-}
-
-// TestBuildTestArgsTestFlags kills STATEMENT_REMOVE on the
-// `append(args, w.testFlags...)` line and pins the ordering contract:
-// user flags land after every flag we set ourselves (so a user value for
-// a flag we also pass wins under Go's last-occurrence rule) *and* after
-// the package argument.
-//
-// Trailing the package is issue #75. The first flag `go test` does not
-// recognize marks the package list as already seen, so a package name
-// after it is forwarded to the test binary as a positional argument and
-// `go test` falls back to `.`. With `-rapid.checks=20` ahead of the
-// package, the working directory gets tested, the run exits 0, and every
-// mutant is recorded LIVED. Go reads the last occurrence of a repeated
-// flag regardless of where the package sits, so the override rule the
-// original ordering protected survives the move.
-func TestBuildTestArgsTestFlags(t *testing.T) {
-	m := mutator.Mutant{Pkg: "mymod"}
-
-	wOn := &Worker{
-		testFlags:   []string{"-rapid.checks=20", "-race"},
-		policy:      TimeoutPolicy{Global: time.Second},
-		overlayPath: "/tmp/o.json",
-	}
-	args := onlyInvocation(t, wOn, m, true, time.Second)
-	for _, want := range []string{"-rapid.checks=20", "-race"} {
-		if !containsStr(args, want) {
-			t.Errorf("testFlags set: args %v missing %q", args, want)
-		}
-	}
-	// Order: after -short (the last flag baseTestArgs sets), so a prepend
-	// that put them ahead of -timeout/-overlay is caught.
-	shortIdx := indexOfStr(args, "-short")
-	flagIdx := indexOfStr(args, "-rapid.checks=20")
-	if shortIdx < 0 || flagIdx < shortIdx {
-		t.Errorf("user flags must follow -short; -short at %d, -rapid.checks at %d in %v", shortIdx, flagIdx, args)
-	}
-	// And after the package: anything else lets a test-binary flag eat it.
-	pkgIdx := indexOfStr(args, "mymod")
-	if pkgIdx < 0 || flagIdx < pkgIdx {
-		t.Errorf("user flags must follow the package argument; mymod at %d, -rapid.checks at %d in %v", pkgIdx, flagIdx, args)
-	}
-	// User flags stay contiguous at the tail, in the order given.
-	if got := args[len(args)-2:]; got[0] != "-rapid.checks=20" || got[1] != "-race" {
-		t.Errorf("user flags must trail in order, got %v in %v", got, args)
-	}
-
-	wOff := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	argsOff := onlyInvocation(t, wOff, m, false, time.Second)
-	if containsStr(argsOff, "-rapid.checks=20") {
-		t.Errorf("testFlags unset: args %v must not gain user flags", argsOff)
-	}
-}
-
-// TestBuildTestArgsRunFilterPrecedesPackage pins the other half of the
-// issue #75 ordering: the `-run` filter sits ahead of the package
-// argument, so nothing in --test-flags can come between them.
-//
-// `-run` is not at risk from an unrecognized user flag on its own — the
-// go command keeps claiming its own flags past one it does not know, and
-// only positional arguments after that point are demoted. It *is* at risk
-// from a user `-args`, which ends the go command's claiming outright and
-// would forward `-run` to the test binary, where the flag is spelled
-// `-test.run` and the bare name is rejected. Keeping the filter ahead of
-// the package puts it ahead of every user field, so neither case reaches
-// it.
-func TestBuildTestArgsRunFilterPrecedesPackage(t *testing.T) {
-	w := &Worker{
-		testFlags:   []string{"-custom.iterations=5"},
-		policy:      TimeoutPolicy{Global: time.Second},
-		overlayPath: "/tmp/o.json",
-		testMap: coverage.NewTestMapForTesting(nil, map[string][]coverage.TestRef{
-			"add.go:3": {{Pkg: "mymod", Name: "TestAdd"}},
-		}),
-	}
-	m := mutator.Mutant{Pkg: "mymod", CoverageFile: "add.go", Line: 3}
-	args := onlyInvocation(t, w, m, false, time.Second)
-
-	runIdx := indexOfPrefix(args, "-run=")
-	pkgIdx := indexOfStr(args, "mymod")
-	userIdx := indexOfStr(args, "-custom.iterations=5")
-	if runIdx < 0 {
-		t.Fatalf("no -run filter in %v — test map routing did not apply", args)
-	}
-	if runIdx >= pkgIdx || pkgIdx >= userIdx {
-		t.Errorf("want -run < package < user flags, got -run at %d, mymod at %d, user flag at %d in %v",
-			runIdx, pkgIdx, userIdx, args)
-	}
-}
-
-// TestTestInvocationsTestFlags pins that the cross-package (integration)
-// builder forwards user flags too — it composes baseTestArgs per covering
-// package, so a regression there would silently drop the flags on exactly
-// the runs that are most expensive.
-func TestTestInvocationsTestFlags(t *testing.T) {
-	w := &Worker{
-		testFlags:   []string{"-short"},
-		policy:      TimeoutPolicy{Global: time.Second},
-		overlayPath: "/tmp/o.json",
-	}
-	invs := w.routedInvocations(mutator.Mutant{Pkg: "mymod"}, false, time.Second)
-	if len(invs) != 1 {
-		t.Fatalf("want 1 invocation with no testMap, got %d: %v", len(invs), invs)
-	}
-	if !containsStr(invs[0], "-short") {
-		t.Errorf("invocation %v missing forwarded -short", invs[0])
-	}
-}
-
-// TestTestInvocationsTestFlagsTrailPackage extends the issue #75 ordering
-// to the cross-package builder, which appends user flags on its own rather
-// than inheriting them from baseTestArgs. Each routed invocation carries a
-// package argument, so each one can swallow it independently.
-func TestTestInvocationsTestFlagsTrailPackage(t *testing.T) {
-	w := &Worker{
-		testFlags:   []string{"-custom.iterations=5"},
-		policy:      TimeoutPolicy{Global: time.Second},
-		overlayPath: "/tmp/o.json",
-		testMap: coverage.NewTestMapForTesting(nil, map[string][]coverage.TestRef{
-			"add.go:3": {
-				{Pkg: "mymod", Name: "TestAdd"},
-				{Pkg: "mymod/other", Name: "TestIntegration"},
-			},
-		}),
-	}
-	m := mutator.Mutant{Pkg: "mymod", CoverageFile: "add.go", Line: 3}
-	invs := w.routedInvocations(m, false, time.Second)
-	if len(invs) != 2 {
-		t.Fatalf("want one invocation per covering package, got %d: %v", len(invs), invs)
-	}
-	// Zip against the packages the router is expected to emit, in order, so
-	// the package argument is identified by name rather than inferred from
-	// the user flag's position — a regression that moved the flags would
-	// otherwise be checked against whatever element happened to precede them.
-	wantPkgs := []string{"mymod", "mymod/other"}
-	for i, args := range invs {
-		if args[len(args)-1] != "-custom.iterations=5" {
-			t.Errorf("user flag must trail, got last arg %q in %v", args[len(args)-1], args)
-		}
-		if got := args[len(args)-2]; got != wantPkgs[i] {
-			t.Errorf("want package %q immediately before the user flags, got %q in %v",
-				wantPkgs[i], got, args)
-		}
-		runIdx, pkgIdx := indexOfPrefix(args, "-run="), indexOfStr(args, wantPkgs[i])
-		if runIdx < 0 || runIdx >= pkgIdx {
-			t.Errorf("want -run before the package argument, got -run at %d, %s at %d in %v",
-				runIdx, wantPkgs[i], pkgIdx, args)
+	for _, tc := range cases {
+		if got := tc.w.binFlags(tc.shrt); !slices.Equal(got, tc.want) {
+			t.Errorf("%s: binFlags = %q, want %q", tc.name, got, tc.want)
 		}
 	}
 }
 
-// TestBuildTestArgsPackageArgLast kills STATEMENT_REMOVE on
-// `args = append(args, m.Pkg)`: removing that line leaves the command
-// without a package target. With no user flags set the package is the
-// final arg, so asserting on the tail catches both the removal and any
-// reordering. (TestBuildTestArgsTestFlags covers where the package lands
-// once --test-flags push it off the end.)
-func TestBuildTestArgsPackageArgLast(t *testing.T) {
-	w := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	m := mutator.Mutant{Pkg: "example.com/mod/sub"}
-	args := onlyInvocation(t, w, m, false, time.Second)
-	if len(args) == 0 || args[len(args)-1] != "example.com/mod/sub" {
-		t.Errorf("last arg = %q, want package import path; full args: %v",
-			args[len(args)-1], args)
+// TestBuildArgs pins the `go test -c` argv that builds a mutant's test
+// binary. Only the build flags among --test-flags reach it: `go test -c`
+// rejects a flag it doesn't know, such as -rapid.checks=20, which reaches
+// the binary through binFlags instead. They trail the package (issue #75:
+// a flag `go test` doesn't recognize ahead of the package would demote it
+// to a positional argument). -tags appears exactly when tags are set,
+// which kills BRANCH_IF / CONDITIONALS_NEGATION on `if w.tags != ""`.
+func TestBuildArgs(t *testing.T) {
+	w := &Worker{overlayPath: "/tmp/o.json", tags: "integration,debug", testFlags: []string{"-rapid.checks=20", "-race", "-short"}}
+	want := []string{"test", "-c", "-o", "/tmp/w.test", "-vet=off", "-overlay=/tmp/o.json", "-tags=integration,debug", "example.com/mod/sub", "-race"}
+	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test"); !slices.Equal(got, want) {
+		t.Errorf("buildArgs = %q, want %q", got, want)
 	}
-	// Also: -timeout, -overlay, -failfast, -count=1, -vet=off must all be present.
-	for _, want := range []string{"-failfast", "-count=1", "-vet=off"} {
-		if !containsStr(args, want) {
-			t.Errorf("args missing %q: %v", want, args)
-		}
-	}
-	if !anyHasPrefix(args, "-overlay=") {
-		t.Errorf("args missing -overlay=…: %v", args)
-	}
-	if !anyHasPrefix(args, "-timeout=") {
-		t.Errorf("args missing -timeout=…: %v", args)
+	w = &Worker{overlayPath: "/tmp/o.json"}
+	want = []string{"test", "-c", "-o", "/tmp/w.test", "-vet=off", "-overlay=/tmp/o.json", "example.com/mod/sub"}
+	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test"); !slices.Equal(got, want) {
+		t.Errorf("buildArgs without tags or flags = %q, want %q", got, want)
 	}
 }
 
-// TestBuildTestArgsWithTestMap kills CONDITIONALS_NEGATION / BRANCH_IF on
-// `if w.testMap != nil`. With a non-nil map that actually contains the
-// mutant's (file, line), the command line must include `-run=<regex>`.
-// With no map, no -run should appear. Under either mutation, the -run
-// flag would be either missing (when it should appear) or leak (via a
-// nil-deref panic in the negation case).
-func TestBuildTestArgsWithTestMap(t *testing.T) {
+// TestRunArgs: a run filtered to some tests passes the binary its
+// -test.run filter ahead of the arguments every run gets, as a positional
+// argument among those (after a user's -args) ends the binary's flag
+// parsing; a run of the whole package passes no filter.
+func TestRunArgs(t *testing.T) {
+	binArgs := []string{"-test.paniconexit0", "-test.failfast=true", "-args", "-custom"}
+	want := append([]string{"-test.run=^(TestA|TestB)$"}, binArgs...)
+	if got := runArgs([]string{"TestA", "TestB"}, binArgs); !slices.Equal(got, want) {
+		t.Errorf("runArgs(filtered) = %q, want %q", got, want)
+	}
+	if got := runArgs(nil, binArgs); !slices.Equal(got, binArgs) {
+		t.Errorf("runArgs(whole package) = %q, want %q", got, binArgs)
+	}
+}
+
+// TestRoutedRunWithTestMap kills CONDITIONALS_NEGATION / BRANCH_IF on the
+// routing through a real coverage map. With a map that contains the
+// mutant's (file, line), the run must be filtered to its covering tests;
+// with no map, or none for that position, the whole package runs.
+func TestRoutedRunWithTestMap(t *testing.T) {
 	dir := t.TempDir()
 	mustWrite := func(name, body string) {
 		t.Helper()
@@ -1147,30 +1000,19 @@ func TestBuildTestArgsWithTestMap(t *testing.T) {
 		t.Fatalf("BuildTestMap: %v", err)
 	}
 
-	wWith := &Worker{testMap: tm, policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	wWithout := &Worker{policy: TimeoutPolicy{Global: time.Second}, overlayPath: "/tmp/o.json"}
-	m := mutator.Mutant{
-		CoverageFile: "testmod/add.go",
-		Line:         3,
-		Pkg:          "testmod",
+	m := mutator.Mutant{CoverageFile: "testmod/add.go", Line: 3, Pkg: "testmod"}
+	if got := onlyRun(t, &Worker{testMap: tm}, m); !slices.Equal(got.tests, []string{"TestAdd"}) {
+		t.Errorf("map with an entry: tests = %q, want [TestAdd]", got.tests)
 	}
-	// With map: -run=<pattern> must appear.
-	argsWith := onlyInvocation(t, wWith, m, false, time.Second)
-	if !anyHasPrefix(argsWith, "-run=") {
-		t.Errorf("testMap non-nil with matching entry: expected -run= in %v", argsWith)
+	if got := onlyRun(t, &Worker{}, m); got.tests != nil {
+		t.Errorf("no map: tests = %q, want nil (the whole package)", got.tests)
 	}
-	// Without map: -run= must not appear.
-	argsWithout := onlyInvocation(t, wWithout, m, false, time.Second)
-	if anyHasPrefix(argsWithout, "-run=") {
-		t.Errorf("testMap nil: -run= must be absent, got %v", argsWithout)
-	}
-	// With map but no matches for this (file, line): -run= must not appear.
-	// Kills CONDITIONALS_BOUNDARY on `len(tests) > 0` — mutated `>= 0` would
-	// always enter the branch and append -run= with an empty pattern.
-	mMiss := mutator.Mutant{CoverageFile: "unknown/file.go", Line: 9999, Pkg: "testmod"}
-	argsMiss := onlyInvocation(t, wWith, mMiss, false, time.Second)
-	if anyHasPrefix(argsMiss, "-run=") {
-		t.Errorf("testMap non-nil but no matches: -run= must be absent (len(tests)>0 guard), got %v", argsMiss)
+	// Kills CONDITIONALS_BOUNDARY on `len(groups) == 0`-style guards: a
+	// position the map doesn't hold must fall back to the whole package,
+	// not an empty filter.
+	miss := mutator.Mutant{CoverageFile: "unknown/file.go", Line: 9999, Pkg: "testmod"}
+	if got := onlyRun(t, &Worker{testMap: tm}, miss); got.tests != nil {
+		t.Errorf("map without an entry: tests = %q, want nil (the whole package)", got.tests)
 	}
 }
 
@@ -1186,71 +1028,162 @@ func TestClassifyTestOutcome(t *testing.T) {
 		runErr     error
 		memKilled  bool
 		testCtxErr error
-		stdout     string
-		stderr     string
+		output     string
 		want       mutator.MutantStatus
 	}{
-		{"memkilled beats infrastructure error", anyErr, true, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", "", mutator.StatusTimedOut},
+		{"memkilled beats infrastructure error", anyErr, true, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
 		// memKilled with otherwise-clean outcome: if the BRANCH_IF on the
 		// memKilled early return is elided, execution falls through to
 		// `runErr == nil → Lived`. Asserting TimedOut here kills that
 		// mutation.
-		{"memkilled alone still wins", nil, true, nil, "", "", mutator.StatusTimedOut},
-		{"success beats infrastructure error", nil, false, nil, "FATAL ERROR: OUT OF MEMORY", "", mutator.StatusLived},
-		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "", "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
-		{"compile failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [build failed]\nFATAL ERROR: OUT OF MEMORY\n", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
-		{"setup failure => not viable", anyErr, false, nil,
-			"FAIL\ttestmod [setup failed]\n", "worker-0.go:5:2: cannot use\nFATAL ERROR: OUT OF MEMORY\n", mutator.StatusNotViable},
-		{"stderr compile regex but no [build failed] in stdout => killed", anyErr, false, nil,
-			"--- FAIL: TestX\nadd_test.go:7: wrong\n", "worker-0.go:5:2: undefined\n", mutator.StatusKilled},
-		{"[build failed] in stdout but no compile regex in stderr => killed", anyErr, false, nil,
-			"FAIL [build failed]\n", "", mutator.StatusKilled},
+		{"memkilled alone still wins", nil, true, nil, "", mutator.StatusTimedOut},
+		{"success beats infrastructure error", nil, false, nil, "FATAL ERROR: OUT OF MEMORY", mutator.StatusLived},
+		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
+		// The binary was built beforehand, so a compile diagnostic or a
+		// `[build failed]` in its output is a test's own text: no verdict
+		// on whether the mutant compiles.
+		{"a test printing a compile diagnostic stays killed", anyErr, false, nil,
+			"FAIL\ttestmod [build failed]\nworker-0.go:5:2: undefined: Foo\n", mutator.StatusKilled},
+		// Nor does that marker promote the generic wordings a failed build
+		// is trusted with: printed by a test that exits through log.Fatal,
+		// with no `--- FAIL: ` line, they are its own words.
+		{"a test printing a build marker and a generic phrase stays killed", anyErr, false, nil,
+			"FAIL\ttestmod [build failed]\nresource temporarily unavailable\n", mutator.StatusKilled},
 		{"normal test failure => killed", anyErr, false, nil,
-			"--- FAIL: TestAdd\n", "add_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
+			"--- FAIL: TestAdd\nadd_test.go:7: Add(1,2) != 3\n", mutator.StatusKilled},
 		// Neither signal gomutants sends reaches here: the RSS monitor's is
 		// memKilled and the deadline's is DeadlineExceeded, both already
 		// TIMED OUT. A SIGKILL with no test output to explain it came from
 		// the kernel, a cgroup, or the CI runner.
 		{"unexplained signal killed => infra error", errors.New("signal: killed"), false, nil,
-			"", "", mutator.StatusInfraError},
+			"", mutator.StatusInfraError},
 		// ... unless a test reported the mutation first, in which case the
 		// process being reaped afterwards changes nothing.
 		{"reported failure beats an unexplained signal killed", errors.New("signal: killed"), false, nil,
-			"--- FAIL: TestAdd\n", "", mutator.StatusKilled},
-		// The tested code's own output lands on the same stdout as the test
+			"--- FAIL: TestAdd\n", mutator.StatusKilled},
+		// The tested code's own output lands on the same stream as the test
 		// framework's. A test that reported a failure detected the mutation,
 		// so a signature it printed itself must not launder the kill into a
 		// non-result — this kills the negation of the `--- FAIL: ` guard.
 		{"reported test failure beats infrastructure signature", anyErr, false, nil,
-			"--- FAIL: TestDiskFull\n    disk_test.go:9: got \"no space left on device\", want nil\n", "", mutator.StatusKilled},
-		// The shape issue #79 actually produces: the OOM-killer takes the test
-		// binary (the biggest RSS in the cgroup), not the `go` process
-		// supervising it, so `go test` survives to report the death on stdout
-		// and exits 1. runErr says nothing.
-		{"go test reports the binary's SIGKILL on stdout => infra error", anyErr, false, nil,
-			"signal: killed\nFAIL\ttestmod\t0.4s\nFAIL\n", "", mutator.StatusInfraError},
+			"--- FAIL: TestDiskFull\n    disk_test.go:9: got \"no space left on device\", want nil\n", mutator.StatusKilled},
+		// The shape issue #79 produced under `go test`: the OOM-killer took
+		// the test binary and `go test` reported its death on stdout, with
+		// runErr a plain exit status.
+		{"a SIGKILL reported on the output => infra error", anyErr, false, nil,
+			"signal: killed\nFAIL\ttestmod\t0.4s\nFAIL\n", mutator.StatusInfraError},
 		// Anchored to the line start, because the tested code writes to this
 		// stream too: quoted inside a test's own message it is just text.
 		{"a test quoting signal: killed mid-line stays killed", anyErr, false, nil,
-			"    x_test.go:9: exec failed: signal: killed\n", "", mutator.StatusKilled},
-		// A panic outside the test goroutine aborts the binary before `go test`
-		// can print a per-test failure line, so `--- FAIL: ` alone would read a
+			"    x_test.go:9: exec failed: signal: killed\n", mutator.StatusKilled},
+		// A panic outside the test goroutine aborts the binary before it can
+		// print a per-test failure line, so `--- FAIL: ` alone would read a
 		// detected mutation as a host problem.
 		{"goroutine panic quoting a host error stays killed", anyErr, false, nil,
-			"panic: open /tmp/x: too many open files\n\ngoroutine 35 [running]:\nFAIL\ttestmod\t0.3s\n", "", mutator.StatusKilled},
+			"panic: open /tmp/x: too many open files\n\ngoroutine 35 [running]:\nFAIL\ttestmod\t0.3s\n", mutator.StatusKilled},
 		// The runtime's own abort is not a panic and must still be readable as
 		// the host failure it is.
 		{"runtime fatal error is not vetoed as a panic", anyErr, false, nil,
-			"fatal error: out of memory\n\ngoroutine 1 [running]:\n", "", mutator.StatusInfraError},
+			"fatal error: out of memory\n\ngoroutine 1 [running]:\n", mutator.StatusInfraError},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.stdout, tc.stderr, false)
+			got := classifyTestOutcome(tc.runErr, tc.memKilled, tc.testCtxErr, tc.output, false)
 			if got != tc.want {
 				t.Errorf("got %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestClassifyBuildFailure covers every branch of the build classifier.
+// The build's output is all the toolchain's, so unlike a test run's it
+// needs no `[build failed]` marker to trust a compile diagnostic, and the
+// generic build-phase signatures count.
+func TestClassifyBuildFailure(t *testing.T) {
+	anyErr := errors.New("exit status 1")
+	tests := []struct {
+		name           string
+		runErr         error
+		memKilled      bool
+		stdout, stderr string
+		want           mutator.MutantStatus
+	}{
+		{"memkilled beats a compile error", anyErr, true, "", "worker-0.go:5:2: undefined: Foo\n", mutator.StatusTimedOut},
+		{"compile error => not viable", anyErr, false, "", "# testmod\nworker-0.go:5:2: undefined: Foo\n", mutator.StatusNotViable},
+		{"compile error beats an infra signature", anyErr, false, "", "worker-0.go:5:2: out of memory\n", mutator.StatusNotViable},
+		{"generic build-phase signature => infra error", anyErr, false, "", "go: fork/exec compile: resource temporarily unavailable\n", mutator.StatusInfraError},
+		{"test-phase signature => infra error", anyErr, false, "no space left on device\n", "", mutator.StatusInfraError},
+		{"unexplained signal killed => infra error", errors.New("signal: killed"), false, "", "", mutator.StatusInfraError},
+		{"killed linker on stderr => infra error", anyErr, false, "", "testmod.test: /usr/local/go/pkg/tool/linux_amd64/link: signal: killed\n", mutator.StatusInfraError},
+		{"killed compiler on stderr => infra error", anyErr, false, "", "testmod: /usr/local/go/pkg/tool/linux_amd64/compile: signal: killed\n", mutator.StatusInfraError},
+		{"anything else => killed", anyErr, false, "", "go: something unexpected\n", mutator.StatusKilled},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classifyBuildFailure(tc.runErr, tc.memKilled, tc.stdout, tc.stderr); got != tc.want {
+				t.Errorf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBinArgsCache: the arguments are read once, for the package of the
+// first call, and a failed read isn't kept, so a later call reads again.
+func TestBinArgsCache(t *testing.T) {
+	orig := testBinaryArgsFunc
+	t.Cleanup(func() { testBinaryArgsFunc = orig })
+	var pkgs []string
+	fail := true
+	testBinaryArgsFunc = func(_ context.Context, _, _, pkg string, _ []string) ([]string, error) {
+		pkgs = append(pkgs, pkg)
+		if fail {
+			return nil, errors.New("boom")
+		}
+		return []string{"-test.paniconexit0"}, nil
+	}
+	c := &binArgsCache{}
+	if _, err := c.get(context.Background(), ".", "", "m/a", nil); err == nil {
+		t.Fatal("first get: want the read's error")
+	}
+	fail = false
+	for _, pkg := range []string{"m/b", "m/c"} {
+		got, err := c.get(context.Background(), ".", "", pkg, nil)
+		if err != nil || !slices.Equal(got, []string{"-test.paniconexit0"}) {
+			t.Errorf("get(%s) = (%q, %v), want the read arguments", pkg, got, err)
+		}
+	}
+	if want := []string{"m/a", "m/b"}; !slices.Equal(pkgs, want) {
+		t.Errorf("reads for %v, want %v: one failed, then one kept", pkgs, want)
+	}
+}
+
+// TestWorkerTestBinaryStderrIsMerged: a test binary reports a panic on
+// stderr, which `go test` merged into the stdout the classifier reads for
+// a test's own failure markers. A goroutine that prints a host error and
+// panics is a kill (see panicMarker); with stderr read apart, the printed
+// phrase alone would turn it into an infrastructure error.
+func TestWorkerTestBinaryStderrIsMerged(t *testing.T) {
+	dir := t.TempDir()
+	src := "package testpkg\n\nfunc Add(a, b int) int {\n\treturn a + b\n}\n"
+	testSrc := "package testpkg\n\nimport (\n\t\"fmt\"\n\t\"testing\"\n\t\"time\"\n)\n\n" +
+		"func TestAdd(t *testing.T) {\n\tif Add(1, 2) != 3 {\n" +
+		"\t\tgo func() {\n\t\t\tfmt.Println(\"open /tmp/x: too many open files\")\n\t\t\tpanic(\"giving up\")\n\t\t}()\n" +
+		"\t\ttime.Sleep(time.Second)\n\t}\n}\n"
+	for name, body := range map[string]string{"go.mod": "module testmod\n\ngo 1.26\n", "add.go": src, "add_test.go": testSrc} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file := filepath.Join(dir, "add.go")
+	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 30 * time.Second}, map[string][]byte{file: []byte(src)}, dir, nil)
+	if err != nil {
+		t.Fatalf("NewWorker: %v", err)
+	}
+	plus := strings.Index(src, "+")
+	m := mutator.Mutant{ID: 1, File: file, Pkg: "testmod", StartOffset: plus, EndOffset: plus + 1, Replacement: "-", Status: mutator.StatusPending}
+	if got := w.Test(context.Background(), m); got.Status != mutator.StatusKilled {
+		t.Errorf("Status=%v, want KILLED by the goroutine's panic", got.Status)
 	}
 }
 
@@ -1281,115 +1214,45 @@ func TestIsInfrastructureErrSeesThroughRewrittenMessages(t *testing.T) {
 	})
 }
 
+// TestClassifyTestOutcomeInfrastructureSignatures: every qualified
+// signature in a test binary's output, in any case, is a host failure.
 func TestClassifyTestOutcomeInfrastructureSignatures(t *testing.T) {
 	for _, signature := range testPhaseInfraSignatures {
-		signatureName := subtestName.Replace(signature)
-		for _, stream := range []struct {
-			name           string
-			stdout, stderr string
-		}{
-			{"stdout", "go test: " + strings.ToUpper(signature), ""},
-			{"stderr", "", "go test: " + strings.ToUpper(signature)},
-		} {
-			t.Run(signatureName+"/"+stream.name, func(t *testing.T) {
-				got := classifyTestOutcome(errors.New("exit status 1"), false, nil, stream.stdout, stream.stderr, false)
-				if got != mutator.StatusInfraError {
-					t.Errorf("got %v, want InfraError in %s", got, stream.name)
+		t.Run(subtestName.Replace(signature), func(t *testing.T) {
+			got := classifyTestOutcome(errors.New("exit status 1"), false, nil, "open /tmp/x: "+strings.ToUpper(signature), false)
+			if got != mutator.StatusInfraError {
+				t.Errorf("got %v, want InfraError", got)
+			}
+		})
+	}
+}
+
+// TestClassifyTestOutcomeIgnoresBuildPhaseSignatures: the generic wordings
+// a failed build is trusted with (see classifyBuildFailure) are a test's
+// own words in a test binary's output, with or without a build marker
+// beside them, which can only be a test's text too.
+func TestClassifyTestOutcomeIgnoresBuildPhaseSignatures(t *testing.T) {
+	for _, signature := range buildPhaseInfraSignatures {
+		for _, marker := range []string{"", "FAIL\ttestmod [build failed]\n", "FAIL\ttestmod [setup failed]\n"} {
+			t.Run(subtestName.Replace(signature+" "+marker), func(t *testing.T) {
+				if got := classifyTestOutcome(errors.New("exit status 1"), false, nil, marker+signature+"\n", false); got != mutator.StatusKilled {
+					t.Errorf("got %v, want Killed", got)
 				}
 			})
 		}
 	}
 }
 
-// TestClassifyTestOutcomeBuildPhaseSignatures covers the wider tier: before
-// the test binary runs there is no code-under-test output on the streams, so
-// wordings that would be ambiguous during a test run are unambiguous here.
-// The cases are the two real-world failures the qualified list alone reports
-// as KILLED, which is the bug this status exists to fix.
-func TestClassifyTestOutcomeBuildPhaseSignatures(t *testing.T) {
-	anyErr := errors.New("exit status 1")
-	tests := []struct {
-		name           string
-		stdout, stderr string
-		want           mutator.MutantStatus
-	}{
-		{"toolchain cannot fork the compiler (EAGAIN)",
-			"FAIL\ttestmod [build failed]\n",
-			"go: fork/exec /usr/local/go/pkg/tool/darwin_arm64/compile: resource temporarily unavailable\n",
-			mutator.StatusInfraError},
-		{"linker OOM, unprefixed wording",
-			"FAIL\ttestmod [build failed]\n",
-			"/usr/bin/ld: out of memory allocating 8388608 bytes\n",
-			mutator.StatusInfraError},
-		{"setup phase counts too",
-			"FAIL\ttestmod [setup failed]\n", "out of memory\n",
-			mutator.StatusInfraError},
-		// The same generic wording without a build/setup marker came from a
-		// running test binary and must not be trusted — this is the case the
-		// tier split exists to keep apart, and it kills the `buildPhase &&`
-		// conjunction on the wide-list branch.
-		{"same wording during a test run stays killed",
-			"", "resource temporarily unavailable\n", mutator.StatusKilled},
-		{"build failure with no signature stays killed",
-			"FAIL\ttestmod [build failed]\n", "some other build problem\n", mutator.StatusKilled},
-		// A reported test failure outranks the build-phase tier: some test
-		// detected the mutation, so this is a kill regardless. The markers
-		// are only text on stdout, and a suite that processes `go test`
-		// output prints them as fixture data — this kills a reordering that
-		// lets the wide list see test-authored text.
-		{"reported test failure outranks the build-phase tier",
-			"--- FAIL: TestX\nFAIL\ttestmod [build failed]\n", "out of memory\n",
-			mutator.StatusKilled},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			got := classifyTestOutcome(anyErr, false, nil, tc.stdout, tc.stderr, false)
-			if got != tc.want {
-				t.Errorf("got %v, want %v", got, tc.want)
+// TestClassifyBuildFailureSignatures: no test has run when a build fails,
+// so both signature lists, the generic wordings too, mean the host failed.
+func TestClassifyBuildFailureSignatures(t *testing.T) {
+	for _, signature := range append(slices.Clone(buildPhaseInfraSignatures), testPhaseInfraSignatures...) {
+		t.Run(subtestName.Replace(signature), func(t *testing.T) {
+			if got := classifyBuildFailure(errors.New("exit status 1"), false, "", "go: "+strings.ToUpper(signature)+"\n"); got != mutator.StatusInfraError {
+				t.Errorf("got %v, want InfraError", got)
 			}
 		})
 	}
-}
-
-// Test helpers.
-func containsStr(xs []string, target string) bool {
-	for _, x := range xs {
-		if x == target {
-			return true
-		}
-	}
-	return false
-}
-
-// indexOfStr returns the position of target in xs, or -1. Used where a
-// test asserts relative argv ordering, not just membership.
-func indexOfStr(xs []string, target string) int {
-	for i, x := range xs {
-		if x == target {
-			return i
-		}
-	}
-	return -1
-}
-
-// indexOfPrefix is indexOfStr for args whose value isn't known to the
-// caller, such as the generated `-run=^(TestAdd)$` filter.
-func indexOfPrefix(xs []string, prefix string) int {
-	for i, x := range xs {
-		if strings.HasPrefix(x, prefix) {
-			return i
-		}
-	}
-	return -1
-}
-
-func anyHasPrefix(xs []string, prefix string) bool {
-	for _, x := range xs {
-		if strings.HasPrefix(x, prefix) {
-			return true
-		}
-	}
-	return false
 }
 
 func TestCompileErrorRegex(t *testing.T) {
@@ -1409,13 +1272,13 @@ func TestCompileErrorRegex(t *testing.T) {
 	}
 }
 
-// onlyInvocation returns the single `go test` invocation routed for m,
-// failing the test if routing produced any other number.
-func onlyInvocation(t *testing.T, w *Worker, m mutator.Mutant, short bool, timeout time.Duration) []string {
+// onlyRun returns the single per-package run routed for m, failing the
+// test if routing produced any other number.
+func onlyRun(t *testing.T, w *Worker, m mutator.Mutant) pkgRun {
 	t.Helper()
-	invs := w.routedInvocations(m, short, timeout)
-	if len(invs) != 1 {
-		t.Fatalf("got %d invocations, want 1: %v", len(invs), invs)
+	runs := w.routedInvocations(m)
+	if len(runs) != 1 {
+		t.Fatalf("got %d runs, want 1: %v", len(runs), runs)
 	}
-	return invs[0]
+	return runs[0]
 }

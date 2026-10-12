@@ -1,7 +1,6 @@
 package coverage
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -603,146 +602,6 @@ func TestResolvePackagesCoverage(t *testing.T) {
 	}
 }
 
-// TestResolvePackagesProbeFile: a rebuild probe changes a package's first
-// production file, or its first test file when it has none.
-func TestResolvePackagesProbeFile(t *testing.T) {
-	dir := writeModule(t, map[string]string{
-		"go.mod":            "module probemod\n\ngo 1.26\n",
-		"p/b.go":            "package p\n",
-		"p/a.go":            "package p\n",
-		"p/a_test.go":       "package p\n",
-		"e2e/x_test.go":     "package e2e_test\n",
-		"inner/i.go":        "package inner\n",
-		"inner/i_test.go":   "package inner\n",
-		"onlyx/x_test.go":   "package onlyx\n",
-		"onlyext/z_test.go": "package onlyext_test\n",
-	})
-	pkgs, err := resolvePackages(context.Background(), dir, []string{"./..."}, "")
-	if err != nil {
-		t.Fatalf("resolvePackages: %v", err)
-	}
-	got := map[string]string{}
-	for _, p := range pkgs {
-		rel, _ := filepath.Rel(dir, p.probeFile)
-		got[p.importPath] = filepath.ToSlash(rel)
-	}
-	want := map[string]string{"probemod/p": "p/a.go", "probemod/e2e": "e2e/x_test.go", "probemod/inner": "inner/i.go", "probemod/onlyext": "onlyext/z_test.go", "probemod/onlyx": "onlyx/x_test.go"}
-	if !maps.Equal(got, want) {
-		t.Errorf("probe files = %v, want %v", got, want)
-	}
-}
-
-// TestMeasureRebuild times a real rebuild of a package whose test binary
-// is already cached. The package's own sources are untouched: the changed
-// copy, with the probe's comment appended, goes next to the test binary
-// through an overlay, and the probe's own binary is removed. Both files
-// are written readable, as go reads them.
-func TestMeasureRebuild(t *testing.T) {
-	dir := setupTestProject(t)
-	binDir := t.TempDir()
-	pkgs, err := resolvePackages(context.Background(), dir, []string{"testmod"}, "")
-	if err != nil || len(pkgs) != 1 {
-		t.Fatalf("resolvePackages = (%v, %v)", pkgs, err)
-	}
-	probe := pkgs[0].probeFile
-	before, err := os.ReadFile(probe)
-	if err != nil {
-		t.Fatal(err)
-	}
-	orig := writeFileFunc
-	t.Cleanup(func() { writeFileFunc = orig })
-	var perms []os.FileMode
-	writeFileFunc = func(name string, data []byte, perm os.FileMode) error {
-		perms = append(perms, perm)
-		return orig(name, data, perm)
-	}
-	cp := &compiledPkg{importPath: "testmod", dir: dir, binPath: filepath.Join(binDir, "testmod.test"), probeFile: probe}
-
-	d, err := measureRebuild(context.Background(), dir, BuildOptions{TestFlags: []string{"-short", "-trimpath"}}, cp)
-	if err != nil || d <= 0 {
-		t.Fatalf("measureRebuild = (%v, %v), want a positive duration", d, err)
-	}
-	if after, _ := os.ReadFile(probe); !bytes.Equal(after, before) {
-		t.Error("measureRebuild changed the package's source file")
-	}
-	changed, err := os.ReadFile(filepath.Join(binDir, filepath.Base(probe)))
-	if err != nil || !bytes.HasPrefix(changed, before) || !bytes.Contains(changed[len(before):], []byte("// gomutants rebuild probe ")) {
-		t.Errorf("changed copy = (%q, %v), want the source with the probe's comment appended", changed, err)
-	}
-	entries, err := os.ReadDir(binDir)
-	var left []string
-	for _, e := range entries {
-		left = append(left, e.Name())
-	}
-	if want := []string{filepath.Base(probe), "overlay.json"}; err != nil || !slices.Equal(left, want) {
-		t.Errorf("binary directory holds (%v, %v), want only %v: the probe's binary is left behind", left, err, want)
-	}
-	if want := []os.FileMode{0o644, 0o644}; !slices.Equal(perms, want) {
-		t.Errorf("write modes = %v, want %v", perms, want)
-	}
-}
-
-// TestMeasureRebuildErrors: every step that can fail fails the
-// measurement with no duration — reading the file to change, writing the
-// changed file and overlay, and the build itself.
-func TestMeasureRebuildErrors(t *testing.T) {
-	dir := setupTestProject(t)
-	pkgs, err := resolvePackages(context.Background(), dir, []string{"testmod"}, "")
-	if err != nil || len(pkgs) != 1 {
-		t.Fatalf("resolvePackages = (%v, %v)", pkgs, err)
-	}
-	probe := pkgs[0].probeFile
-	bin := func(d string) string { return filepath.Join(d, "testmod.test") }
-	missingDir := filepath.Join(t.TempDir(), "missing")
-
-	cases := []struct {
-		name string
-		cp   *compiledPkg
-	}{
-		{"no file to change", &compiledPkg{importPath: "testmod", binPath: bin(t.TempDir())}},
-		{"unreadable file", &compiledPkg{importPath: "testmod", binPath: bin(t.TempDir()), probeFile: filepath.Join(missingDir, "x.go")}},
-		{"unwritable directory", &compiledPkg{importPath: "testmod", binPath: bin(missingDir), probeFile: probe}},
-		{"build fails", &compiledPkg{importPath: "testmod/does/not/exist", binPath: bin(t.TempDir()), probeFile: probe}},
-	}
-	for _, c := range cases {
-		if d, err := measureRebuild(context.Background(), dir, BuildOptions{}, c.cp); err == nil || d != 0 {
-			t.Errorf("%s: measureRebuild = (%v, %v), want (0, an error)", c.name, d, err)
-		}
-	}
-
-	// A failed build's error wraps go's exit and carries what it printed.
-	_, err = measureRebuild(context.Background(), dir, BuildOptions{}, cases[3].cp)
-	var exitErr *exec.ExitError
-	if _, stderr, _ := strings.Cut(fmt.Sprint(err), "\n"); !errors.As(err, &exitErr) || !strings.Contains(stderr, "testmod/does/not/exist") {
-		t.Errorf("build fails: err = %v, want go's exit error and its output", err)
-	}
-
-	orig := writeFileFunc
-	t.Cleanup(func() { writeFileFunc = orig })
-	boom := errors.New("boom")
-	writeFileFunc = func(string, []byte, os.FileMode) error { return boom }
-	good := &compiledPkg{importPath: "testmod", binPath: bin(t.TempDir()), probeFile: probe}
-	if d, err := measureRebuild(context.Background(), dir, BuildOptions{}, good); !errors.Is(err, boom) || d != 0 {
-		t.Errorf("write fails: measureRebuild = (%v, %v), want (0, the write's error)", d, err)
-	}
-}
-
-// TestMeasureRebuildForwardsTags: a package whose only file is
-// tag-gated builds only when the tags reach the probe, given either as
-// --tags or among the test flags.
-func TestMeasureRebuildForwardsTags(t *testing.T) {
-	dir := setupTaggedProject(t)
-	cp := &compiledPkg{importPath: "testmod/only", binPath: filepath.Join(t.TempDir(), "only.test"), probeFile: filepath.Join(dir, "only", "only.go")}
-	if _, err := measureRebuild(context.Background(), dir, BuildOptions{}, cp); err == nil {
-		t.Error("no tags: want the build to fail")
-	}
-	for _, opts := range []BuildOptions{{Tags: "mytag"}, {TestFlags: []string{"-tags=mytag"}}} {
-		if _, err := measureRebuild(context.Background(), dir, opts, cp); err != nil {
-			t.Errorf("%+v: measureRebuild: %v", opts, err)
-		}
-	}
-}
-
 // TestCompileTestBinaryNoScratchDir: a test binary's directory that can't
 // be made fails the compile with the error.
 func TestCompileTestBinaryNoScratchDir(t *testing.T) {
@@ -769,9 +628,8 @@ func TestTestDepsError(t *testing.T) {
 	}
 }
 
-// TestBuildTestMapMeasuresRebuild: a real build measures each package's
-// rebuild, and a test that always skips maps nothing.
-func TestBuildTestMapMeasuresRebuild(t *testing.T) {
+// TestBuildTestMapSkippedTest: a test that always skips maps nothing.
+func TestBuildTestMapSkippedTest(t *testing.T) {
 	dir := writeModule(t, map[string]string{
 		"go.mod":      "module skipmod\n\ngo 1.26\n",
 		"lib.go":      "package skipmod\n\nfunc F() int { return 1 }\n",
@@ -783,9 +641,6 @@ func TestBuildTestMapMeasuresRebuild(t *testing.T) {
 	}
 	if got := tm.TestsFor("skipmod/lib.go", 3); !slices.Equal(got, []string{"TestF"}) {
 		t.Errorf("TestsFor(lib.go:3) = %v, want only TestF", got)
-	}
-	if _, ok := tm.RebuildDuration("skipmod"); !ok {
-		t.Error("RebuildDuration(skipmod) unmeasured, want the probe's measurement")
 	}
 }
 
@@ -1411,13 +1266,13 @@ func TestRunCompiledTestArgsComeFirst(t *testing.T) {
 // test's own bookkeeping arguments dropped.
 func TestTestBinaryArgs(t *testing.T) {
 	dir := setupTestProject(t)
-	got, err := testBinaryArgs(context.Background(), dir, "", "testmod", []string{"-short", "-cpu", "2", "-race", "-args", "-foo"})
+	got, err := TestBinaryArgs(context.Background(), dir, "", "testmod", []string{"-short", "-cpu", "2", "-race", "-args", "-foo"})
 	if err != nil {
-		t.Fatalf("testBinaryArgs: %v", err)
+		t.Fatalf("TestBinaryArgs: %v", err)
 	}
 	want := []string{"-test.paniconexit0", "-test.short=true", "-test.cpu=2", "-foo"}
 	if !slices.Equal(got, want) {
-		t.Errorf("testBinaryArgs = %q, want %q", got, want)
+		t.Errorf("TestBinaryArgs = %q, want %q", got, want)
 	}
 }
 
@@ -1430,12 +1285,12 @@ func TestTestBinaryArgsForwardsTags(t *testing.T) {
 		"g.go":      "//go:build mytag\n\npackage gated\n",
 		"g_test.go": "//go:build mytag\n\npackage gated\n\nimport \"testing\"\n\nfunc TestG(t *testing.T) {}\n",
 	})
-	_, err := testBinaryArgs(context.Background(), dir, "", "gated", []string{"-short"})
+	_, err := TestBinaryArgs(context.Background(), dir, "", "gated", []string{"-short"})
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) || !strings.Contains(err.Error(), "build constraints exclude all Go files") {
 		t.Errorf("no tags: err = %v, want go's exit error and its build-constraint message", err)
 	}
-	if got, err := testBinaryArgs(context.Background(), dir, "mytag", "gated", []string{"-short"}); err != nil || !slices.Contains(got, "-test.short=true") {
+	if got, err := TestBinaryArgs(context.Background(), dir, "mytag", "gated", []string{"-short"}); err != nil || !slices.Contains(got, "-test.short=true") {
 		t.Errorf("tags=mytag: (%q, %v), want -test.short=true", got, err)
 	}
 }
@@ -1505,31 +1360,5 @@ func TestBuildTestMapKeepsCollidingBinariesApart(t *testing.T) {
 		if got := tm.TestRefsFor(file, 3); !slices.Equal(got, []TestRef{want}) {
 			t.Errorf("TestRefsFor(%s:3) = %+v, want [%+v]", file, got, want)
 		}
-	}
-}
-
-// TestBuildTestMapMapsPackageNamedProbe: a package named probe builds its
-// coverage binary as probe.test, the name the rebuild probe once gave its
-// own binary. The probe overwrote the package's binary, then removed it,
-// and listing its tests failed: the package mapped nothing, and alone in
-// scope failed the whole map.
-func TestBuildTestMapMapsPackageNamedProbe(t *testing.T) {
-	dir := writeModule(t, map[string]string{
-		"go.mod":          "module m\n\ngo 1.26\n",
-		"probe/p.go":      "package probe\n\nfunc P() int { return 1 }\n",
-		"probe/p_test.go": "package probe\n\nimport \"testing\"\n\nfunc TestP(t *testing.T) { P() }\n",
-	})
-	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
-	if err != nil {
-		t.Fatalf("BuildTestMap: %v", err)
-	}
-	if got, want := tm.TestRefsFor("m/probe/p.go", 3), []TestRef{{Pkg: "m/probe", Name: "TestP"}}; !slices.Equal(got, want) {
-		t.Errorf("TestRefsFor(p.go:3) = %+v, want %+v", got, want)
-	}
-	if _, ok := tm.RebuildDuration("m/probe"); !ok {
-		t.Error("RebuildDuration(m/probe) unmeasured, want the probe's measurement")
-	}
-	if w := tm.Warnings(); len(w) != 0 {
-		t.Errorf("Warnings = %q, want none", w)
 	}
 }
