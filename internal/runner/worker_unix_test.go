@@ -52,6 +52,33 @@ func TestPgroupRSSBytesSelf(t *testing.T) {
 	}
 }
 
+// TestPgroupRSSBytesNewProcessGroup probes a process group shaped like a
+// mutant's: a child started with Setpgid (see applyProcessGroup), so its
+// pgid is its own pid while its session stays ours. TestPgroupRSSBytesSelf
+// can't tell a process-group lookup from a session lookup when the two ids
+// coincide, as they do under a shell without job control; here they never
+// do. GNU ps reads a numeric `-g` as a session list, so on Linux the
+// lookup matched nothing and the RSS monitor never tripped (issue #107).
+func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	applyProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("Getpgid: %v", err)
+	}
+	if got := pgroupRSSBytes(pgid); got <= 0 {
+		t.Errorf("pgroupRSSBytes(child pgid=%d) = %d, want > 0", pgid, got)
+	}
+}
+
 // TestPgroupRSSBytesInvalidPgid kills the err-path return: passing an
 // invalid PGID makes `ps -g` emit either an error or empty output. The
 // original returns 0; a mutation that keeps the loop running still
