@@ -86,16 +86,31 @@ func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
 // (at most 2^22) and on macOS (99999).
 const deadPgid = 99999999
 
-// resetRSSProbe clears the probe's shared health now and after the test,
+// cleanRSSProbe clears the probe's shared health now and after the test,
 // so another test's failures can't count toward this one's outage.
-func resetRSSProbe(t *testing.T) {
+func cleanRSSProbe(t *testing.T) {
 	t.Helper()
-	reset := func() {
-		rssProbe.fails.Store(0)
-		rssProbe.down.Store(false)
+	resetRSSProbe()
+	t.Cleanup(resetRSSProbe)
+}
+
+// TestPoolRunResetsRSSProbe starts a run while an earlier run's outage is
+// still recorded: three failures would be needed to report it, but this
+// run must report its own outage from scratch, and one never reported in
+// it must not read as already reported. Kills STATEMENT_REMOVE on the
+// resetRSSProbe call in Pool.Run and on each of its Stores, and INTEGER_*
+// on the 0.
+func TestPoolRunResetsRSSProbe(t *testing.T) {
+	cleanRSSProbe(t)
+	rssProbe.fails.Store(2)
+	rssProbe.down.Store(true)
+
+	// No mutants: Run returns before starting a worker, after the reset.
+	NewPool(1, ExecOpts{}, TimeoutPolicy{}, t.TempDir(), nil, t.TempDir(), nil).Run(context.Background(), nil, nil)
+
+	if fails, down := rssProbe.fails.Load(), rssProbe.down.Load(); fails != 0 || down {
+		t.Errorf("after Pool.Run: fails=%d down=%v, want 0 false — the earlier run's outage carried over", fails, down)
 	}
-	reset()
-	t.Cleanup(reset)
 }
 
 // probeThroughOutage polls pgid one more time than an outage takes to
@@ -115,7 +130,7 @@ func probeThroughOutage(t *testing.T, pgid int) (stderr string, got []int64) {
 // probe lists no row for it, and the group is gone rather than hidden, so
 // the result must be exactly 0 with no warning, however often it's polled.
 func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
-	resetRSSProbe(t)
+	cleanRSSProbe(t)
 	out, got := probeThroughOutage(t, deadPgid)
 	if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
 		t.Errorf("pgroupRSSBytes(invalid) = %v, want all 0", got)
@@ -139,7 +154,7 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 	t.Cleanup(func() { groupRSSFunc = orig })
 
 	t.Run("success passes the total through, silently", func(t *testing.T) {
-		resetRSSProbe(t)
+		cleanRSSProbe(t)
 		groupRSSFunc = func(int) (int64, error) { return 7 * 1024, nil }
 		var got int64
 		out := captureStderr(t, func() { got = pgroupRSSBytes(0) })
@@ -152,7 +167,7 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 	})
 
 	t.Run("failure warns once and reads 0", func(t *testing.T) {
-		resetRSSProbe(t)
+		cleanRSSProbe(t)
 		// A partial total alongside the error, and a group that is gone:
 		// neither may matter once the probe itself has failed.
 		groupRSSFunc = func(int) (int64, error) {
@@ -185,7 +200,7 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 func TestPgroupRSSBytesOutage(t *testing.T) {
 	orig := groupRSSFunc
 	t.Cleanup(func() { groupRSSFunc = orig })
-	resetRSSProbe(t)
+	cleanRSSProbe(t)
 
 	const (
 		ok   = "ok"
@@ -248,7 +263,7 @@ func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 	}
 
 	t.Run("live group warns once", func(t *testing.T) {
-		resetRSSProbe(t)
+		cleanRSSProbe(t)
 		cmd := exec.Command("sleep", "60")
 		applyProcessGroup(cmd)
 		if err := cmd.Start(); err != nil {
@@ -287,7 +302,7 @@ func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 	// test binary it started: the leader's pid is gone but the group is not,
 	// so the check must address the group (-pgid), not the pid.
 	t.Run("group whose leader exited still counts as alive", func(t *testing.T) {
-		resetRSSProbe(t)
+		cleanRSSProbe(t)
 		cmd := exec.Command("sh", "-c", "sleep 60 &")
 		applyProcessGroup(cmd)
 		if err := cmd.Start(); err != nil {
@@ -306,7 +321,7 @@ func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 	})
 
 	t.Run("exited group is silent", func(t *testing.T) {
-		resetRSSProbe(t)
+		cleanRSSProbe(t)
 		out, got := probeThroughOutage(t, deadPgid)
 		if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
 			t.Errorf("got %v, want all 0", got)

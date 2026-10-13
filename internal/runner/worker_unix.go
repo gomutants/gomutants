@@ -25,6 +25,14 @@ var rssProbe struct {
 	down  atomic.Bool  // an outage was reported and hasn't ended
 }
 
+// resetRSSProbe starts a run with a healthy probe: an outage is a property
+// of one run, and one carried over from an earlier run in the same process
+// would stay down, unreported, in this one.
+func resetRSSProbe() {
+	rssProbe.fails.Store(0)
+	rssProbe.down.Store(false)
+}
+
 // errGroupNotListed is what a groupRSSFunc returns when its scan lists no
 // process of the group. That is no failure by itself, since the group may
 // have exited since the monitor's tick, so pgroupRSSBytes checks whether the

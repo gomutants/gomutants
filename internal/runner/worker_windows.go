@@ -18,6 +18,10 @@ import (
 // the contract.
 func pgroupRSSBytes(_ int) int64 { return 0 }
 
+// resetRSSProbe is a no-op on Windows: there is no probe, so no outage to
+// carry from one run to the next.
+func resetRSSProbe() {}
+
 // killPgroup terminates the child process by PID. On Windows there is no
 // portable concept of a POSIX process group; applyProcessGroup puts the
 // child in its own CREATE_NEW_PROCESS_GROUP, but Kill only signals the
