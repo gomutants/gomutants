@@ -34,8 +34,9 @@ import (
 // the per-mutant context timeout is the backstop there.
 var maxSubprocRSSBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
 
-// monitorPollInterval is the cadence at which the RSS monitor probes
-// `ps -g`. var so tests can shrink it to make the kill path fire quickly.
+// monitorPollInterval is the cadence at which the RSS monitor probes the
+// group's memory. var so tests can shrink it to make the kill path fire
+// quickly.
 var monitorPollInterval = 1 * time.Second
 
 // nonZeroSince returns time.Since(start) but guarantees a strictly positive
@@ -760,11 +761,15 @@ func (w *Worker) runMonitored(cmd *exec.Cmd) (runErr error, memKilled bool, star
 	monitorDone := make(chan struct{})
 	monitorExited := make(chan struct{})
 	go func() {
-		// 1s cadence: 5 workers × 1 poll/s = 5 ps/sec aggregate (was 25 at
-		// 200ms). The 2 GiB cap is loose enough that a 800 ms-later kill is
-		// still safe — even on M-series RAM bandwidth a runaway alloc takes
-		// ≥1s to add 2 GiB resident. testTimeout (10× baseline) is the
-		// outer backstop.
+		// Polls every monitorPollInterval (1s). Every worker's monitor reads
+		// one shared scan of the whole process table (/proc on Linux, `ps
+		// -A` elsewhere), at most half an interval old; see cachedGroupRSS.
+		// The cap is only checked at a poll, so a mutant can overshoot it
+		// by whatever it allocates within one interval: an unthrottled loop
+		// added 2 GiB in ~0.4s (PR #116). Under a memory limit below the
+		// cap plus that burst, the kernel's OOM killer can win the race and
+		// the mutant is reported INFRA ERROR, not TIMED OUT. testTimeout
+		// (10× baseline) is the outer backstop.
 		defer close(monitorExited)
 		t := time.NewTicker(monitorPollInterval)
 		defer t.Stop()
@@ -785,7 +790,7 @@ func (w *Worker) runMonitored(cmd *exec.Cmd) (runErr error, memKilled bool, star
 	err := cmd.Wait()
 	close(monitorDone)
 	// Wait for the monitor goroutine to fully exit before returning. Without
-	// this barrier its still-pending reads of psOutputFunc / syscallKillFunc
+	// this barrier its still-pending reads of groupRSSFunc / syscallKillFunc
 	// race with the next test's swap of those package-level vars (caught by
 	// `go test -race`).
 	<-monitorExited

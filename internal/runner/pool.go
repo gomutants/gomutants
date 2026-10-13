@@ -72,6 +72,10 @@ func NewPool(workers int, exec ExecOpts, policy TimeoutPolicy, tmpDir string, sr
 // Run tests all pending mutants in parallel, calling onResult for each
 // completion. Mutant statuses are updated in place on the input slice.
 func (p *Pool) Run(ctx context.Context, mutants []mutator.Mutant, onResult ResultCallback) {
+	// A run starts with a healthy RSS probe. Every monitor of an earlier Run
+	// has exited by now, so nothing can race this.
+	resetRSSProbe()
+
 	// Filter to only pending mutants.
 	var pending []int
 	for i, m := range mutants {

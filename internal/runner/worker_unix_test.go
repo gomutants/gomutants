@@ -6,12 +6,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -22,18 +24,11 @@ import (
 	"github.com/gomutants/gomutants/internal/proctree"
 )
 
-// TestPgroupRSSBytesSelf exercises pgroupRSSBytes against our own process
-// group. Kills:
-//   - CONDITIONALS_NEGATION on `err != nil` (line 32): mutated `err == nil`
-//     would short-circuit to return 0 on the success path.
-//   - STATEMENT_REMOVE on `line = strings.TrimSpace(line)` (line 37):
-//     without trimming, `ps` output lines (" 12345") fail strconv.ParseInt.
-//   - CONDITIONALS_NEGATION on `line == ""` (line 38): mutated `!=` skips
-//     every non-empty line, never reaching ParseInt.
-//   - CONDITIONALS_NEGATION on `err != nil` (line 42): mutated `==` skips
-//     successful parses, total stays 0.
-//   - ARITHMETIC_BASE on `n * 1024` (line 45): mutated `n / 1024` produces
-//     byte totals roughly 1e6× too small.
+// TestPgroupRSSBytesSelf runs the real probe (/proc on Linux, ps
+// elsewhere) against our own process group. Kills, in the platform's
+// groupRSSFunc, any mutant that loses the group's rows or its unit
+// conversion: a dropped match, a wrong field index, or `/` for the page or
+// KB multiply all collapse the total toward 0.
 //
 // We assert the returned value exceeds 1 MiB — real Go test processes use
 // tens of MiB, but all the mutations above collapse the result toward 0.
@@ -52,72 +47,439 @@ func TestPgroupRSSBytesSelf(t *testing.T) {
 	}
 }
 
-// TestPgroupRSSBytesInvalidPgid kills the err-path return: passing an
-// invalid PGID makes `ps -g` emit either an error or empty output. The
-// original returns 0; a mutation that keeps the loop running still
-// returns 0 on empty output (no lines to parse), so this specifically
-// verifies the call doesn't panic or return garbage.
-func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
-	// Very large pgid unlikely to exist.
-	bytes := pgroupRSSBytes(99999999)
-	if bytes < 0 {
-		t.Errorf("pgroupRSSBytes(invalid) = %d, want >= 0", bytes)
+// TestPgroupRSSBytesNewProcessGroup probes a process group shaped like a
+// mutant's: a child started with Setpgid (see applyProcessGroup), so its
+// pgid is its own pid while its session stays ours. TestPgroupRSSBytesSelf
+// can't tell a process-group lookup from a session lookup when the two ids
+// coincide, as they do under a shell without job control; here they never
+// do. GNU ps reads a numeric `-g` as a session list, so on Linux the
+// lookup matched nothing and the RSS monitor never tripped (issue #107).
+//
+// The probe is polled, not read once: a sleep sampled the instant Start
+// returns has barely faulted in a page (VmRSS ~12 kB), and Linux's stat rss
+// can still read 0 then, about 1 run in 500 under load. A lookup that
+// can't find the group reads 0 for the whole deadline.
+func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
+	cmd := exec.Command("sleep", "60")
+	applyProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start sleep: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("Getpgid: %v", err)
+	}
+	got := pgroupRSSBytes(pgid)
+	for deadline := time.Now().Add(2 * time.Second); got <= 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		got = pgroupRSSBytes(pgid)
+	}
+	if got <= 0 {
+		t.Errorf("pgroupRSSBytes(child pgid=%d) = %d for 2s, want > 0", pgid, got)
 	}
 }
 
-// TestPgroupRSSBytesParsing covers the parsing path with a stubbed
-// psOutputFunc. Real ps output may or may not have leading whitespace
-// depending on column width; injecting a known string lets us pin the
-// behavior. Kills:
-//   - BRANCH_IF on the err-return (psOutputFunc returns err with non-empty
-//     output; original returns 0, the elided body parses the output).
-//   - STATEMENT_REMOVE on the inner TrimSpace (now removed since the trim
-//     is inlined into ParseInt's argument; mutating the inlined call breaks
-//     parses on whitespace-prefixed lines).
-//   - REMOVE_SELF_ASSIGNMENTS on `total += n * 1024` (sum vs last-line).
-func TestPgroupRSSBytesParsing(t *testing.T) {
-	orig := psOutputFunc
-	defer func() { psOutputFunc = orig }()
+// deadPgid is a pgid no process can have: it is above pid_max on Linux
+// (at most 2^22) and on macOS (99999).
+const deadPgid = 99999999
 
-	t.Run("err returns 0 even with output", func(t *testing.T) {
-		psOutputFunc = func(int) ([]byte, error) {
-			return []byte("12345\n"), errors.New("inject")
+// cleanRSSProbe clears the probe's shared health now and after the test,
+// so another test's failures can't count toward this one's outage.
+func cleanRSSProbe(t *testing.T) {
+	t.Helper()
+	resetRSSProbe()
+	t.Cleanup(resetRSSProbe)
+}
+
+// TestPoolRunResetsRSSProbe starts a run while an earlier run's outage is
+// still recorded: three failures would be needed to report it, but this
+// run must report its own outage from scratch, and one never reported in
+// it must not read as already reported. Kills STATEMENT_REMOVE on the
+// resetRSSProbe call in Pool.Run and on each of its Stores, and INTEGER_*
+// on the 0.
+func TestPoolRunResetsRSSProbe(t *testing.T) {
+	cleanRSSProbe(t)
+	rssProbe.fails.Store(2)
+	rssProbe.down.Store(true)
+
+	// No mutants: Run returns before starting a worker, after the reset.
+	NewPool(1, ExecOpts{}, TimeoutPolicy{}, t.TempDir(), nil, t.TempDir(), nil).Run(context.Background(), nil, nil)
+
+	if fails, down := rssProbe.fails.Load(), rssProbe.down.Load(); fails != 0 || down {
+		t.Errorf("after Pool.Run: fails=%d down=%v, want 0 false — the earlier run's outage carried over", fails, down)
+	}
+}
+
+// probeThroughOutage polls pgid one more time than an outage takes to
+// report, so a test can assert both that it was reported and that it was
+// reported once. It returns the stderr and every poll's result.
+func probeThroughOutage(t *testing.T, pgid int) (stderr string, got []int64) {
+	t.Helper()
+	stderr = captureStderr(t, func() {
+		for range rssProbeOutageAfter + 1 {
+			got = append(got, pgroupRSSBytes(pgid))
 		}
-		if got := pgroupRSSBytes(0); got != 0 {
-			t.Errorf("got %d, want 0 — BRANCH_IF on err-return body lets the parse through", got)
+	})
+	return stderr, got
+}
+
+// scanStub stands in for the process-table scan under cachedGroupRSS: it
+// counts scans and returns a scripted table or error, after an optional
+// delay.
+type scanStub struct {
+	scans atomic.Int32
+	table rssTable
+	err   error
+	delay time.Duration
+}
+
+// stubScan installs a scanStub that returns table, starting from a clean
+// probe and snapshot, and restores the real scan after the test.
+func stubScan(t *testing.T, table rssTable) *scanStub {
+	t.Helper()
+	cleanRSSProbe(t)
+	s := &scanStub{table: table}
+	orig := rssScanFunc
+	t.Cleanup(func() { rssScanFunc = orig })
+	rssScanFunc = func() (rssTable, error) {
+		s.scans.Add(1)
+		time.Sleep(s.delay)
+		if s.err != nil {
+			return nil, s.err
+		}
+		return maps.Clone(s.table), nil
+	}
+	return s
+}
+
+// lookup asserts that cachedGroupRSS reads want for pgid.
+func (s *scanStub) lookup(t *testing.T, pgid int, want int64) {
+	t.Helper()
+	if got, err := cachedGroupRSS(pgid); err != nil || got != want {
+		t.Fatalf("cachedGroupRSS(%d) = (%d, %v), want (%d, nil)", pgid, got, err, want)
+	}
+}
+
+// wantScans asserts how many scans have run.
+func (s *scanStub) wantScans(t *testing.T, want int32) {
+	t.Helper()
+	if got := s.scans.Load(); got != want {
+		t.Fatalf("%d scans, want %d", got, want)
+	}
+}
+
+// ageSnapshot moves the snapshot back by fraction of a poll interval.
+func ageSnapshot(fraction float64) {
+	rssSnapshot.at = rssSnapshot.at.Add(-time.Duration(fraction * float64(monitorPollInterval)))
+}
+
+// TestCachedGroupRSSSharesAScan pins the snapshot's max age: one 0.4 of an
+// interval old is reused, one 0.75 old is not. Kills CONDITIONALS_NEGATION,
+// ARITHMETIC_BASE and INTEGER_* on `> monitorPollInterval/2`.
+func TestCachedGroupRSSSharesAScan(t *testing.T) {
+	s := stubScan(t, rssTable{7: 100})
+	s.lookup(t, 7, 100)
+	s.lookup(t, 7, 100)
+	s.wantScans(t, 1)
+	ageSnapshot(0.4)
+	s.lookup(t, 7, 100)
+	s.wantScans(t, 1)
+	ageSnapshot(0.35) // 0.75 of an interval in all
+	s.lookup(t, 7, 100)
+	s.wantScans(t, 2)
+}
+
+// TestCachedGroupRSSListedAtZero: a group whose processes all read 0 (a
+// zombie leader) is listed, not missing.
+func TestCachedGroupRSSListedAtZero(t *testing.T) {
+	s := stubScan(t, rssTable{10: 0})
+	s.lookup(t, 10, 0)
+}
+
+// TestCachedGroupRSSRescansForANewGroup: a group missing from a scan that
+// started before the call may have started since, so it gets a fresh scan.
+// Kills the rescan dropped, or its `Before` negated.
+func TestCachedGroupRSSRescansForANewGroup(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	s.lookup(t, 7, 1)
+	s.table = rssTable{7: 1, 8: 2} // group 8 started after the scan
+	s.lookup(t, 8, 2)
+	s.wantScans(t, 2)
+}
+
+// TestCachedGroupRSSUnlisted: a group missing from a scan made for this
+// call is unlisted, at 0, with no second scan. Kills INTEGER_* on the 0.
+func TestCachedGroupRSSUnlisted(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	if n, err := cachedGroupRSS(9); !errors.Is(err, errGroupNotListed) || n != 0 {
+		t.Fatalf("cachedGroupRSS(9) = (%d, %v), want (0, errGroupNotListed)", n, err)
+	}
+	s.wantScans(t, 1)
+}
+
+// TestCachedGroupRSSFailedScanNotKept: a scan's own error comes back from
+// both rescans, and the next call scans again rather than reading a kept
+// failure, which several workers would count as an outage. Kills either
+// rescan's error check dropped, and rescanRSS keeping a failed scan.
+func TestCachedGroupRSSFailedScanNotKept(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	s.lookup(t, 7, 1)
+	boom := errors.New("fork/exec /bin/ps: resource temporarily unavailable")
+	s.err = boom
+	// A fresh snapshot without group 8: the rescan for the miss fails.
+	if n, err := cachedGroupRSS(8); !errors.Is(err, boom) || n != 0 {
+		t.Fatalf("miss, failing rescan: (%d, %v), want (0, %v)", n, err, boom)
+	}
+	// A stale snapshot: the rescan for its age fails.
+	ageSnapshot(0.75)
+	if n, err := cachedGroupRSS(7); !errors.Is(err, boom) || n != 0 {
+		t.Fatalf("stale snapshot, failing rescan: (%d, %v), want (0, %v)", n, err, boom)
+	}
+	s.err = nil
+	s.lookup(t, 7, 1)
+	s.wantScans(t, 4)
+}
+
+// TestCachedGroupRSSResetDropsSnapshot kills the snapshot clear in
+// resetRSSProbe dropped.
+func TestCachedGroupRSSResetDropsSnapshot(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	s.lookup(t, 7, 1)
+	resetRSSProbe()
+	s.lookup(t, 7, 1)
+	s.wantScans(t, 2)
+}
+
+// TestCachedGroupRSSConcurrentPollers: pollers that arrive mid-scan wait
+// for it rather than scanning again. Kills the mutex dropped.
+func TestCachedGroupRSSConcurrentPollers(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	s.delay = 20 * time.Millisecond
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			if n, err := cachedGroupRSS(7); err != nil || n != 1 {
+				t.Errorf("cachedGroupRSS(7) = (%d, %v), want (1, nil)", n, err)
+			}
+		})
+	}
+	wg.Wait()
+	s.wantScans(t, 1)
+}
+
+// TestCachedGroupRSSRealScanUnlisted runs the platform's real scan for a
+// group nobody has.
+func TestCachedGroupRSSRealScanUnlisted(t *testing.T) {
+	cleanRSSProbe(t)
+	if _, err := cachedGroupRSS(deadPgid); !errors.Is(err, errGroupNotListed) {
+		t.Errorf("cachedGroupRSS(deadPgid) err = %v, want errGroupNotListed", err)
+	}
+}
+
+// wantAllZero asserts that every poll read 0.
+func wantAllZero(t *testing.T, got []int64) {
+	t.Helper()
+	if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
+		t.Errorf("got %v, want all 0", got)
+	}
+}
+
+// wantWarnedOnce asserts that stderr holds exactly one "cap is off"
+// warning, and that it names cause.
+func wantWarnedOnce(t *testing.T, stderr, cause string) {
+	t.Helper()
+	if n := strings.Count(stderr, "RSS cap is off"); n != 1 {
+		t.Errorf("warned %d times, want once; stderr:\n%s", n, stderr)
+	}
+	if !strings.Contains(stderr, cause) {
+		t.Errorf("warning doesn't name the cause %q; stderr:\n%s", cause, stderr)
+	}
+}
+
+// startGroup starts argv in its own process group, as makeCmd starts a
+// mutant, and returns it with its pgid. The group is killed after the test.
+func startGroup(t *testing.T, argv ...string) (*exec.Cmd, int) {
+	t.Helper()
+	cmd := exec.Command(argv[0], argv[1:]...)
+	applyProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start %s: %v", argv[0], err)
+	}
+	pgid := cmd.Process.Pid // with Setpgid the child leads its own group
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Wait()
+	})
+	return cmd, pgid
+}
+
+// TestPgroupRSSBytesInvalidPgid probes a pgid no process has. The real
+// probe lists no row for it, and the group is gone rather than hidden, so
+// the result must be exactly 0 with no warning, however often it's polled.
+func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
+	cleanRSSProbe(t)
+	out, got := probeThroughOutage(t, deadPgid)
+	wantAllZero(t, got)
+	if out != "" {
+		t.Errorf("stderr = %q, want nothing — the group doesn't exist, the probe didn't fail", out)
+	}
+}
+
+// TestPgroupRSSBytesProbeError pins how pgroupRSSBytes handles its probe.
+// A failed probe (no ps binary, no /proc) leaves the RSS cap unable to
+// fire, which once went unreported. Kills:
+//   - CONDITIONALS_NEGATION / BRANCH_IF on `err == nil`: no warning on
+//     failure, or one on success.
+//   - INVERT_LOGICAL on the `&&` of the not-listed check: a plain failure
+//     on a group that is gone stays silent.
+//   - an error path that returns the probe's n: a partial total reaches
+//     the cap check.
+func TestPgroupRSSBytesProbeError(t *testing.T) {
+	orig := groupRSSFunc
+	t.Cleanup(func() { groupRSSFunc = orig })
+
+	t.Run("success passes the total through, silently", func(t *testing.T) {
+		cleanRSSProbe(t)
+		groupRSSFunc = func(int) (int64, error) { return 7 * 1024, nil }
+		var got int64
+		out := captureStderr(t, func() { got = pgroupRSSBytes(0) })
+		if got != 7*1024 {
+			t.Errorf("got %d, want %d", got, 7*1024)
+		}
+		if out != "" {
+			t.Errorf("stderr = %q, want nothing on success", out)
 		}
 	})
 
-	t.Run("sums all lines", func(t *testing.T) {
-		psOutputFunc = func(int) ([]byte, error) {
-			return []byte("  100\n  200\n  50\n"), nil
+	t.Run("failure warns once and reads 0", func(t *testing.T) {
+		cleanRSSProbe(t)
+		// A partial total alongside the error, and a group that is gone:
+		// neither may matter once the probe itself has failed.
+		groupRSSFunc = func(int) (int64, error) {
+			return 5 * 1024, errors.New("fork/exec /bin/ps: no such file or directory")
 		}
-		got := pgroupRSSBytes(0)
-		want := int64((100 + 200 + 50) * 1024)
-		if got != want {
-			t.Errorf("got %d, want %d — REMOVE_SELF_ASSIGNMENTS on `total += n*1024` (or untrimmed-line parse failure) collapses the sum", got, want)
+		out, got := probeThroughOutage(t, deadPgid)
+		wantAllZero(t, got)
+		wantWarnedOnce(t, out, "no such file or directory")
+	})
+}
+
+// TestPgroupRSSBytesOutage scripts the probe's health poll by poll and pins
+// what each poll prints: an outage is reported once it is
+// rssProbeOutageAfter failures long, once per outage, and its end once; a
+// group that exited between tick and scan neither ends an outage nor adds
+// to one. Kills:
+//   - CONDITIONALS_BOUNDARY / INTEGER_* on `>= rssProbeOutageAfter`: the
+//     report moves off the third failure in a row.
+//   - STATEMENT_REMOVE on `fails.Store(0)`: failures either side of a
+//     success add up to an outage.
+//   - either CompareAndSwap guard dropped or negated: an outage reported
+//     per poll, its end reported per success, or one or the other never.
+func TestPgroupRSSBytesOutage(t *testing.T) {
+	orig := groupRSSFunc
+	t.Cleanup(func() { groupRSSFunc = orig })
+	cleanRSSProbe(t)
+
+	const (
+		ok   = "ok"
+		fail = "fail"
+		gone = "gone" // unlisted, and deadPgid has no live group
+	)
+	var next string
+	groupRSSFunc = func(int) (int64, error) {
+		switch next {
+		case ok:
+			return 1024, nil
+		case fail:
+			return 0, errors.New("fork/exec /bin/ps: resource temporarily unavailable")
+		default:
+			return 0, errGroupNotListed
+		}
+	}
+
+	const (
+		silent = ""
+		off    = "RSS cap is off"
+		backOn = "RSS cap is back on"
+	)
+	steps := []struct{ probe, prints string }{
+		{fail, silent},
+		{fail, silent},
+		{gone, silent}, // not a third failure
+		{ok, silent},   // no outage to end; the count starts over
+		{fail, silent},
+		{fail, silent},
+		{gone, silent},
+		{fail, off}, // third failure in a row: gone didn't reset the count
+		{fail, silent},
+		{ok, backOn},
+		{ok, silent},
+		{fail, silent},
+		{fail, silent},
+		{fail, off}, // a new outage is reported too
+	}
+	for i, s := range steps {
+		next = s.probe
+		out := captureStderr(t, func() { pgroupRSSBytes(deadPgid) })
+		if s.prints == silent && out != "" || s.prints != silent && !strings.Contains(out, s.prints) {
+			t.Fatalf("step %d (%s) printed %q, want %q", i+1, s.probe, out, s.prints)
+		}
+	}
+}
+
+// TestPgroupRSSBytesGroupNotListed pins the probe that runs but lists no
+// row for the group, the shape issue #107 hid behind: a live group the
+// probe can't see must warn, while one that has exited must not. Kills
+// CONDITIONALS_NEGATION / BRANCH_IF on the errors.Is and on `!groupAlive`,
+// and in groupAlive `!=` flipped to `==`, INVERT_NEGATIVES on -pgid, and
+// INTEGER_INCREMENT on the 0 signal.
+func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
+	orig := groupRSSFunc
+	t.Cleanup(func() { groupRSSFunc = orig })
+	groupRSSFunc = func(int) (int64, error) {
+		return 0, fmt.Errorf("/proc: %w", errGroupNotListed)
+	}
+
+	t.Run("live group warns once", func(t *testing.T) {
+		cleanRSSProbe(t)
+		cmd, pgid := startGroup(t, "sleep", "60")
+		out, got := probeThroughOutage(t, pgid)
+		wantAllZero(t, got)
+		wantWarnedOnce(t, out, errGroupNotListed.Error())
+
+		// The liveness check must only probe: any real signal it sent
+		// (signal 1, SIGHUP) would end sleep before our SIGKILL does.
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); !ok || ws.Signal() != syscall.SIGKILL {
+			t.Errorf("sleep ended with %v, want SIGKILL — the liveness check signalled the group", cmd.ProcessState)
 		}
 	})
 
-	t.Run("trims leading whitespace", func(t *testing.T) {
-		psOutputFunc = func(int) ([]byte, error) {
-			return []byte("    7\n"), nil
+	// A mutant's group outlives its leader when `go test` exits before the
+	// test binary it started: the leader's pid is gone but the group is not,
+	// so the check must address the group (-pgid), not the pid.
+	t.Run("group whose leader exited still counts as alive", func(t *testing.T) {
+		cleanRSSProbe(t)
+		cmd, pgid := startGroup(t, "sh", "-c", "sleep 60 &")
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("sh: %v", err)
 		}
-		got := pgroupRSSBytes(0)
-		want := int64(7 * 1024)
-		if got != want {
-			t.Errorf("got %d, want %d — without TrimSpace, ParseInt rejects whitespace-prefixed lines", got, want)
-		}
+		out, _ := probeThroughOutage(t, pgid)
+		wantWarnedOnce(t, out, errGroupNotListed.Error())
 	})
 
-	t.Run("skips malformed lines", func(t *testing.T) {
-		psOutputFunc = func(int) ([]byte, error) {
-			return []byte("100\nnotanumber\n200\n"), nil
-		}
-		got := pgroupRSSBytes(0)
-		want := int64((100 + 200) * 1024)
-		if got != want {
-			t.Errorf("got %d, want %d — malformed line should be skipped, sum should still total valid lines", got, want)
+	t.Run("exited group is silent", func(t *testing.T) {
+		cleanRSSProbe(t)
+		out, got := probeThroughOutage(t, deadPgid)
+		wantAllZero(t, got)
+		if out != "" {
+			t.Errorf("stderr = %q, want nothing — the group exited, the probe didn't fail", out)
 		}
 	})
 }
@@ -154,19 +516,19 @@ func TestWorkerTestGetpgidFallback(t *testing.T) {
 
 	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
-	origPS := psOutputFunc
+	origRSS := groupRSSFunc
 	origKill := syscallKillFunc
 	origGetpgid := syscallGetpgidFunc
 	defer func() {
 		maxSubprocRSSBytes = origCap
 		monitorPollInterval = origPoll
-		psOutputFunc = origPS
+		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 		syscallGetpgidFunc = origGetpgid
 	}()
 	maxSubprocRSSBytes = 1024
 	monitorPollInterval = 50 * time.Millisecond
-	psOutputFunc = func(int) ([]byte, error) { return []byte("999999\n"), nil }
+	groupRSSFunc = func(int) (int64, error) { return 999999 * 1024, nil }
 
 	// Force the Getpgid path to fail so the fallback body must execute.
 	syscallGetpgidFunc = func(int) (int, error) {
@@ -240,20 +602,20 @@ func TestKillPgroupSendsNegativePgid(t *testing.T) {
 func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
-	origPS := psOutputFunc
+	origRSS := groupRSSFunc
 	origKill := syscallKillFunc
 	defer func() {
 		maxSubprocRSSBytes = origCap
 		monitorPollInterval = origPoll
-		psOutputFunc = origPS
+		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 	}()
 	maxSubprocRSSBytes = 1024 // 1 KB — well below any real process
 	monitorPollInterval = 50 * time.Millisecond
 
-	psOutputFunc = func(int) ([]byte, error) {
+	groupRSSFunc = func(int) (int64, error) {
 		// Way above the tiny cap so the kill path always fires.
-		return []byte("999999\n"), nil
+		return 999999 * 1024, nil
 	}
 	var killCalls atomic.Int32
 	syscallKillFunc = func(pid int, sig syscall.Signal) error {
@@ -275,9 +637,9 @@ func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 }
 
 // TestWorkerTestRSSExactlyAtCapDoesNotKill kills CONDITIONALS_BOUNDARY on
-// `pgroupRSSBytes(pgid) > maxSubprocRSSBytes`. With ps reporting exactly
-// the cap, the original `>` evaluates to false and no kill fires; the
-// boundary mutant `>=` would trigger the kill on the equality.
+// `pgroupRSSBytes(pgid) > maxSubprocRSSBytes`. With the probe reporting
+// exactly the cap, the original `>` evaluates to false and no kill fires;
+// the boundary mutant `>=` would trigger the kill on the equality.
 func TestWorkerTestRSSExactlyAtCapDoesNotKill(t *testing.T) {
 	dir := setupTestProject(t)
 	srcPath := filepath.Join(dir, "add.go")
@@ -287,20 +649,19 @@ func TestWorkerTestRSSExactlyAtCapDoesNotKill(t *testing.T) {
 
 	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
-	origPS := psOutputFunc
+	origRSS := groupRSSFunc
 	origKill := syscallKillFunc
 	defer func() {
 		maxSubprocRSSBytes = origCap
 		monitorPollInterval = origPoll
-		psOutputFunc = origPS
+		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 	}()
 	maxSubprocRSSBytes = 1024
 	monitorPollInterval = 50 * time.Millisecond
 
-	// ps RSS column is in KB, multiplied by 1024 inside pgroupRSSBytes.
-	// "1\n" ⇒ total = 1024 bytes, exactly equal to cap.
-	psOutputFunc = func(int) ([]byte, error) { return []byte("1\n"), nil }
+	// Exactly equal to the cap.
+	groupRSSFunc = func(int) (int64, error) { return 1024, nil }
 	var killCalls atomic.Int32
 	syscallKillFunc = func(int, syscall.Signal) error {
 		killCalls.Add(1)
@@ -332,7 +693,7 @@ func TestWorkerTestRSSExactlyAtCapDoesNotKill(t *testing.T) {
 // TestWorkerTestMonitorGoroutineExits kills STATEMENT_REMOVE on
 // `close(monitorDone)`. With RSS well below the cap the kill path never
 // fires, so the goroutine relies on `<-monitorDone` to exit. Without the
-// close, it keeps polling ps after Worker.Test returns.
+// close, it keeps polling the probe after Worker.Test returns.
 func TestWorkerTestMonitorGoroutineExits(t *testing.T) {
 	dir := setupTestProject(t)
 	srcPath := filepath.Join(dir, "add.go")
@@ -341,17 +702,17 @@ func TestWorkerTestMonitorGoroutineExits(t *testing.T) {
 	plusIdx := strings.IndexByte(string(src), '+')
 
 	origPoll := monitorPollInterval
-	origPS := psOutputFunc
+	origRSS := groupRSSFunc
 	defer func() {
 		monitorPollInterval = origPoll
-		psOutputFunc = origPS
+		groupRSSFunc = origRSS
 	}()
 	monitorPollInterval = 50 * time.Millisecond
 
-	var psCalls atomic.Int32
-	psOutputFunc = func(int) ([]byte, error) {
-		psCalls.Add(1)
-		return []byte("0\n"), nil // far below cap; no kill
+	var probeCalls atomic.Int32
+	groupRSSFunc = func(int) (int64, error) {
+		probeCalls.Add(1)
+		return 0, nil // far below cap; no kill
 	}
 
 	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 30 * time.Second}, cache, dir, nil)
@@ -366,10 +727,10 @@ func TestWorkerTestMonitorGoroutineExits(t *testing.T) {
 	}
 	w.Test(context.Background(), m)
 
-	atReturn := psCalls.Load()
+	atReturn := probeCalls.Load()
 	time.Sleep(4 * monitorPollInterval)
-	if growth := psCalls.Load() - atReturn; growth > 1 {
-		t.Errorf("ps polled %d more times after Test returned — STATEMENT_REMOVE on close(monitorDone) leaks the goroutine", growth)
+	if growth := probeCalls.Load() - atReturn; growth > 1 {
+		t.Errorf("probe polled %d more times after Test returned — STATEMENT_REMOVE on close(monitorDone) leaks the goroutine", growth)
 	}
 }
 
