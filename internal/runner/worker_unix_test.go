@@ -76,16 +76,39 @@ func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
 // (at most 2^22) and on macOS (99999).
 const deadPgid = 99999999
 
+// resetRSSProbe clears the probe's shared health now and after the test,
+// so another test's failures can't count toward this one's outage.
+func resetRSSProbe(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		rssProbe.fails.Store(0)
+		rssProbe.down.Store(false)
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
+// probeThroughOutage polls pgid one more time than an outage takes to
+// report, so a test can assert both that it was reported and that it was
+// reported once. It returns the stderr and every poll's result.
+func probeThroughOutage(t *testing.T, pgid int) (stderr string, got []int64) {
+	t.Helper()
+	stderr = captureStderr(t, func() {
+		for range rssProbeOutageAfter + 1 {
+			got = append(got, pgroupRSSBytes(pgid))
+		}
+	})
+	return stderr, got
+}
+
 // TestPgroupRSSBytesInvalidPgid probes a pgid no process has. The real
 // probe lists no row for it, and the group is gone rather than hidden, so
-// the result must be exactly 0 with no warning.
+// the result must be exactly 0 with no warning, however often it's polled.
 func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
-	rssProbeWarned.Store(false)
-	t.Cleanup(func() { rssProbeWarned.Store(false) })
-	var got int64
-	out := captureStderr(t, func() { got = pgroupRSSBytes(deadPgid) })
-	if got != 0 {
-		t.Errorf("pgroupRSSBytes(invalid) = %d, want 0", got)
+	resetRSSProbe(t)
+	out, got := probeThroughOutage(t, deadPgid)
+	if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
+		t.Errorf("pgroupRSSBytes(invalid) = %v, want all 0", got)
 	}
 	if out != "" {
 		t.Errorf("stderr = %q, want nothing — the group doesn't exist, the probe didn't fail", out)
@@ -99,18 +122,14 @@ func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
 //     failure, or one on success.
 //   - INVERT_LOGICAL on the `&&` of the not-listed check: a plain failure
 //     on a group that is gone stays silent.
-//   - the CompareAndSwap guard dropped: every failing poll warns again.
 //   - an error path that returns the probe's n: a partial total reaches
 //     the cap check.
 func TestPgroupRSSBytesProbeError(t *testing.T) {
 	orig := groupRSSFunc
-	rssProbeWarned.Store(false)
-	t.Cleanup(func() {
-		groupRSSFunc = orig
-		rssProbeWarned.Store(false)
-	})
+	t.Cleanup(func() { groupRSSFunc = orig })
 
 	t.Run("success passes the total through, silently", func(t *testing.T) {
+		resetRSSProbe(t)
 		groupRSSFunc = func(int) (int64, error) { return 7 * 1024, nil }
 		var got int64
 		out := captureStderr(t, func() { got = pgroupRSSBytes(0) })
@@ -123,18 +142,15 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 	})
 
 	t.Run("failure warns once and reads 0", func(t *testing.T) {
+		resetRSSProbe(t)
 		// A partial total alongside the error, and a group that is gone:
 		// neither may matter once the probe itself has failed.
 		groupRSSFunc = func(int) (int64, error) {
 			return 5 * 1024, errors.New("fork/exec /bin/ps: no such file or directory")
 		}
-		var first, second int64
-		out := captureStderr(t, func() {
-			first = pgroupRSSBytes(deadPgid)
-			second = pgroupRSSBytes(deadPgid)
-		})
-		if first != 0 || second != 0 {
-			t.Errorf("got %d, %d, want 0, 0", first, second)
+		out, got := probeThroughOutage(t, deadPgid)
+		if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
+			t.Errorf("got %v, want all 0", got)
 		}
 		if n := strings.Count(out, "RSS cap is off"); n != 1 {
 			t.Errorf("warned %d times, want once; stderr:\n%s", n, out)
@@ -145,6 +161,69 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 	})
 }
 
+// TestPgroupRSSBytesOutage scripts the probe's health poll by poll and pins
+// what each poll prints: an outage is reported once it is
+// rssProbeOutageAfter failures long, once per outage, and its end once; a
+// group that exited between tick and scan neither ends an outage nor adds
+// to one. Kills:
+//   - CONDITIONALS_BOUNDARY / INTEGER_* on `>= rssProbeOutageAfter`: the
+//     report moves off the third failure in a row.
+//   - STATEMENT_REMOVE on `fails.Store(0)`: failures either side of a
+//     success add up to an outage.
+//   - either CompareAndSwap guard dropped or negated: an outage reported
+//     per poll, its end reported per success, or one or the other never.
+func TestPgroupRSSBytesOutage(t *testing.T) {
+	orig := groupRSSFunc
+	t.Cleanup(func() { groupRSSFunc = orig })
+	resetRSSProbe(t)
+
+	const (
+		ok   = "ok"
+		fail = "fail"
+		gone = "gone" // unlisted, and deadPgid has no live group
+	)
+	var next string
+	groupRSSFunc = func(int) (int64, error) {
+		switch next {
+		case ok:
+			return 1024, nil
+		case fail:
+			return 0, errors.New("fork/exec /bin/ps: resource temporarily unavailable")
+		default:
+			return 0, errGroupNotListed
+		}
+	}
+
+	const (
+		silent = ""
+		off    = "RSS cap is off"
+		backOn = "RSS cap is back on"
+	)
+	steps := []struct{ probe, prints string }{
+		{fail, silent},
+		{fail, silent},
+		{gone, silent}, // not a third failure
+		{ok, silent},   // no outage to end; the count starts over
+		{fail, silent},
+		{fail, silent},
+		{gone, silent},
+		{fail, off}, // third failure in a row: gone didn't reset the count
+		{fail, silent},
+		{ok, backOn},
+		{ok, silent},
+		{fail, silent},
+		{fail, silent},
+		{fail, off}, // a new outage is reported too
+	}
+	for i, s := range steps {
+		next = s.probe
+		out := captureStderr(t, func() { pgroupRSSBytes(deadPgid) })
+		if s.prints == silent && out != "" || s.prints != silent && !strings.Contains(out, s.prints) {
+			t.Fatalf("step %d (%s) printed %q, want %q", i+1, s.probe, out, s.prints)
+		}
+	}
+}
+
 // TestPgroupRSSBytesGroupNotListed pins the probe that runs but lists no
 // row for the group, the shape issue #107 hid behind: a live group the
 // probe can't see must warn, while one that has exited must not. Kills
@@ -153,16 +232,13 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 // INTEGER_INCREMENT on the 0 signal.
 func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 	orig := groupRSSFunc
-	t.Cleanup(func() {
-		groupRSSFunc = orig
-		rssProbeWarned.Store(false)
-	})
+	t.Cleanup(func() { groupRSSFunc = orig })
 	groupRSSFunc = func(int) (int64, error) {
 		return 0, fmt.Errorf("/proc: %w", errGroupNotListed)
 	}
 
 	t.Run("live group warns once", func(t *testing.T) {
-		rssProbeWarned.Store(false)
+		resetRSSProbe(t)
 		cmd := exec.Command("sleep", "60")
 		applyProcessGroup(cmd)
 		if err := cmd.Start(); err != nil {
@@ -177,13 +253,9 @@ func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 			t.Fatalf("Getpgid: %v", err)
 		}
 
-		var first, second int64
-		out := captureStderr(t, func() {
-			first = pgroupRSSBytes(pgid)
-			second = pgroupRSSBytes(pgid)
-		})
-		if first != 0 || second != 0 {
-			t.Errorf("got %d, %d, want 0, 0", first, second)
+		out, got := probeThroughOutage(t, pgid)
+		if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
+			t.Errorf("got %v, want all 0", got)
 		}
 		if n := strings.Count(out, "RSS cap is off"); n != 1 {
 			t.Errorf("warned %d times, want once; stderr:\n%s", n, out)
@@ -205,7 +277,7 @@ func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 	// test binary it started: the leader's pid is gone but the group is not,
 	// so the check must address the group (-pgid), not the pid.
 	t.Run("group whose leader exited still counts as alive", func(t *testing.T) {
-		rssProbeWarned.Store(false)
+		resetRSSProbe(t)
 		cmd := exec.Command("sh", "-c", "sleep 60 &")
 		applyProcessGroup(cmd)
 		if err := cmd.Start(); err != nil {
@@ -217,22 +289,17 @@ func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 			t.Fatalf("sh: %v", err)
 		}
 
-		var got int64
-		out := captureStderr(t, func() { got = pgroupRSSBytes(pgid) })
-		if got != 0 {
-			t.Errorf("got %d, want 0", got)
-		}
+		out, _ := probeThroughOutage(t, pgid)
 		if n := strings.Count(out, "RSS cap is off"); n != 1 {
 			t.Errorf("warned %d times, want once — the group's sleep is alive; stderr:\n%s", n, out)
 		}
 	})
 
 	t.Run("exited group is silent", func(t *testing.T) {
-		rssProbeWarned.Store(false)
-		var got int64
-		out := captureStderr(t, func() { got = pgroupRSSBytes(deadPgid) })
-		if got != 0 {
-			t.Errorf("got %d, want 0", got)
+		resetRSSProbe(t)
+		out, got := probeThroughOutage(t, deadPgid)
+		if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
+			t.Errorf("got %v, want all 0", got)
 		}
 		if out != "" {
 			t.Errorf("stderr = %q, want nothing — the group exited, the probe didn't fail", out)

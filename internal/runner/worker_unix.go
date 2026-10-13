@@ -11,10 +11,19 @@ import (
 	"syscall"
 )
 
-// rssProbeWarned records that pgroupRSSBytes has reported a failed probe,
-// so a run with several workers polling every second warns once, not once
-// per poll.
-var rssProbeWarned atomic.Bool
+// rssProbeOutageAfter is how many probe failures in a row, counted across
+// workers, make an outage worth reporting: a lone fork failing under memory
+// pressure costs one poll of the cap, and the next poll may well work.
+const rssProbeOutageAfter = 3
+
+// rssProbe is the probe's health, shared by every worker's monitor so a run
+// polling from several workers every second reports an outage once, not
+// once per poll. Workers race on fails, so a report can land a failure
+// early or late; it only decides when a line is printed.
+var rssProbe struct {
+	fails atomic.Int32 // failures in a row since the last success
+	down  atomic.Bool  // an outage was reported and hasn't ended
+}
 
 // errGroupNotListed is what a groupRSSFunc returns when its scan lists no
 // process of the group. That is no failure by itself, since the group may
@@ -26,21 +35,29 @@ var errGroupNotListed = errors.New("no process of the group is listed")
 // read by the platform's groupRSSFunc (/proc on Linux, ps elsewhere).
 //
 // A probe that fails reads as 0, which leaves the RSS cap unable to fire,
-// so the first failure is reported rather than swallowed: a missing ps
-// once disabled the cap with no trace but the kernel's OOM kills. A probe
-// that runs but can't see a group that is still alive (a /proc from
-// another pid namespace) is the same failure: it is how issue #107 went
-// unnoticed, with ps matching no rows.
+// so an outage is reported rather than swallowed: a missing ps once
+// disabled the cap with no trace but the kernel's OOM kills. A probe that
+// runs but can't see a group that is still alive (a /proc from another pid
+// namespace) is the same failure: it is how issue #107 went unnoticed,
+// with ps matching no rows. An outage is reported when rssProbeOutageAfter
+// failures in a row start it and again when a success ends it, never per
+// poll; probing goes on throughout, so the cap returns with the probe.
 func pgroupRSSBytes(pgid int) int64 {
 	n, err := groupRSSFunc(pgid)
 	if err == nil {
+		rssProbe.fails.Store(0)
+		if rssProbe.down.CompareAndSwap(true, false) {
+			fmt.Fprintln(os.Stderr, "gomutants: can read mutant memory again, so the per-mutant RSS cap is back on")
+		}
 		return n
 	}
 	if errors.Is(err, errGroupNotListed) && !groupAlive(pgid) {
-		return 0 // the group exited between the tick and the scan
+		// The group exited between the tick and the scan. The probe had
+		// nothing to see, so this neither ends an outage nor adds to one.
+		return 0
 	}
-	if rssProbeWarned.CompareAndSwap(false, true) {
-		fmt.Fprintf(os.Stderr, "gomutants: can't read mutant memory, so the per-mutant RSS cap is off for this run: %v\n", err)
+	if rssProbe.fails.Add(1) >= rssProbeOutageAfter && rssProbe.down.CompareAndSwap(false, true) {
+		fmt.Fprintf(os.Stderr, "gomutants: can't read mutant memory, so the per-mutant RSS cap is off until it can: %v\n", err)
 	}
 	return 0
 }
