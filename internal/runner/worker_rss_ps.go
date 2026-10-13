@@ -4,6 +4,7 @@ package runner
 
 import (
 	"bytes"
+	"fmt"
 	"os/exec"
 	"strconv"
 )
@@ -34,20 +35,25 @@ func psGroupRSS(pgid int) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return sumPgroupRSS(out, pgid), nil
+	total, found := sumPgroupRSS(out, pgid)
+	if !found {
+		return 0, fmt.Errorf("%s -A: %w", psCommand, errGroupNotListed)
+	}
+	return total, nil
 }
 
 // sumPgroupRSS sums, in bytes, the RSS of each row of `ps -A -o pgid=,rss=`
-// output whose pgid is pgid. An rss that doesn't parse reads as 0.
-func sumPgroupRSS(table []byte, pgid int) int64 {
+// output whose pgid is pgid, and reports whether any row was the group's.
+// An rss that doesn't parse reads as 0; its row still counts as found.
+func sumPgroupRSS(table []byte, pgid int) (total int64, found bool) {
 	want := []byte(strconv.Itoa(pgid))
-	var total int64
 	for _, line := range bytes.Split(table, []byte("\n")) {
 		f := bytes.Fields(line)
 		if len(f) == 2 && bytes.Equal(f[0], want) {
+			found = true
 			kb, _ := strconv.Atoi(string(f[1]))
 			total += int64(kb) * 1024 // ps rss is KB
 		}
 	}
-	return total
+	return total, found
 }

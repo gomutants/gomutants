@@ -72,30 +72,39 @@ func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
 	}
 }
 
+// deadPgid is a pgid no process can have: it is above pid_max on Linux
+// (at most 2^22) and on macOS (99999).
+const deadPgid = 99999999
+
 // TestPgroupRSSBytesInvalidPgid probes a pgid no process has. The real
-// probe succeeds with no matching rows, so the result must be exactly 0,
-// and with no error there must be no warning.
+// probe lists no row for it, and the group is gone rather than hidden, so
+// the result must be exactly 0 with no warning.
 func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
+	rssProbeWarned.Store(false)
 	t.Cleanup(func() { rssProbeWarned.Store(false) })
 	var got int64
-	out := captureStderr(t, func() { got = pgroupRSSBytes(99999999) }) // unlikely to exist
+	out := captureStderr(t, func() { got = pgroupRSSBytes(deadPgid) })
 	if got != 0 {
 		t.Errorf("pgroupRSSBytes(invalid) = %d, want 0", got)
 	}
 	if out != "" {
-		t.Errorf("stderr = %q, want nothing — the probe didn't fail", out)
+		t.Errorf("stderr = %q, want nothing — the group doesn't exist, the probe didn't fail", out)
 	}
 }
 
 // TestPgroupRSSBytesProbeError pins how pgroupRSSBytes handles its probe.
 // A failed probe (no ps binary, no /proc) leaves the RSS cap unable to
 // fire, which once went unreported. Kills:
-//   - CONDITIONALS_NEGATION / BRANCH_IF on `err != nil`: no warning on
+//   - CONDITIONALS_NEGATION / BRANCH_IF on `err == nil`: no warning on
 //     failure, or one on success.
-//   - INVERT_LOGICAL on the `&&`: a successful probe warns.
+//   - INVERT_LOGICAL on the `&&` of the not-listed check: a plain failure
+//     on a group that is gone stays silent.
 //   - the CompareAndSwap guard dropped: every failing poll warns again.
+//   - an error path that returns the probe's n: a partial total reaches
+//     the cap check.
 func TestPgroupRSSBytesProbeError(t *testing.T) {
 	orig := groupRSSFunc
+	rssProbeWarned.Store(false)
 	t.Cleanup(func() {
 		groupRSSFunc = orig
 		rssProbeWarned.Store(false)
@@ -114,11 +123,15 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 	})
 
 	t.Run("failure warns once and reads 0", func(t *testing.T) {
-		groupRSSFunc = func(int) (int64, error) { return 0, errors.New("fork/exec /bin/ps: no such file or directory") }
+		// A partial total alongside the error, and a group that is gone:
+		// neither may matter once the probe itself has failed.
+		groupRSSFunc = func(int) (int64, error) {
+			return 5 * 1024, errors.New("fork/exec /bin/ps: no such file or directory")
+		}
 		var first, second int64
 		out := captureStderr(t, func() {
-			first = pgroupRSSBytes(0)
-			second = pgroupRSSBytes(0)
+			first = pgroupRSSBytes(deadPgid)
+			second = pgroupRSSBytes(deadPgid)
 		})
 		if first != 0 || second != 0 {
 			t.Errorf("got %d, %d, want 0, 0", first, second)
@@ -128,6 +141,101 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 		}
 		if !strings.Contains(out, "no such file or directory") {
 			t.Errorf("warning doesn't name the cause; stderr:\n%s", out)
+		}
+	})
+}
+
+// TestPgroupRSSBytesGroupNotListed pins the probe that runs but lists no
+// row for the group, the shape issue #107 hid behind: a live group the
+// probe can't see must warn, while one that has exited must not. Kills
+// CONDITIONALS_NEGATION / BRANCH_IF on the errors.Is and on `!groupAlive`,
+// and in groupAlive `!=` flipped to `==`, INVERT_NEGATIVES on -pgid, and
+// INTEGER_INCREMENT on the 0 signal.
+func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
+	orig := groupRSSFunc
+	t.Cleanup(func() {
+		groupRSSFunc = orig
+		rssProbeWarned.Store(false)
+	})
+	groupRSSFunc = func(int) (int64, error) {
+		return 0, fmt.Errorf("/proc: %w", errGroupNotListed)
+	}
+
+	t.Run("live group warns once", func(t *testing.T) {
+		rssProbeWarned.Store(false)
+		cmd := exec.Command("sleep", "60")
+		applyProcessGroup(cmd)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start sleep: %v", err)
+		}
+		t.Cleanup(func() {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		})
+		pgid, err := syscall.Getpgid(cmd.Process.Pid)
+		if err != nil {
+			t.Fatalf("Getpgid: %v", err)
+		}
+
+		var first, second int64
+		out := captureStderr(t, func() {
+			first = pgroupRSSBytes(pgid)
+			second = pgroupRSSBytes(pgid)
+		})
+		if first != 0 || second != 0 {
+			t.Errorf("got %d, %d, want 0, 0", first, second)
+		}
+		if n := strings.Count(out, "RSS cap is off"); n != 1 {
+			t.Errorf("warned %d times, want once; stderr:\n%s", n, out)
+		}
+		if !strings.Contains(out, errGroupNotListed.Error()) {
+			t.Errorf("warning doesn't name the cause; stderr:\n%s", out)
+		}
+
+		// The liveness check must only probe: any real signal it sent
+		// (signal 1, SIGHUP) would end sleep before our SIGKILL does.
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		if ws, ok := cmd.ProcessState.Sys().(syscall.WaitStatus); !ok || ws.Signal() != syscall.SIGKILL {
+			t.Errorf("sleep ended with %v, want SIGKILL — the liveness check signalled the group", cmd.ProcessState)
+		}
+	})
+
+	// A mutant's group outlives its leader when `go test` exits before the
+	// test binary it started: the leader's pid is gone but the group is not,
+	// so the check must address the group (-pgid), not the pid.
+	t.Run("group whose leader exited still counts as alive", func(t *testing.T) {
+		rssProbeWarned.Store(false)
+		cmd := exec.Command("sh", "-c", "sleep 60 &")
+		applyProcessGroup(cmd)
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start sh: %v", err)
+		}
+		pgid := cmd.Process.Pid // sh leads its own group (Setpgid)
+		t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("sh: %v", err)
+		}
+
+		var got int64
+		out := captureStderr(t, func() { got = pgroupRSSBytes(pgid) })
+		if got != 0 {
+			t.Errorf("got %d, want 0", got)
+		}
+		if n := strings.Count(out, "RSS cap is off"); n != 1 {
+			t.Errorf("warned %d times, want once — the group's sleep is alive; stderr:\n%s", n, out)
+		}
+	})
+
+	t.Run("exited group is silent", func(t *testing.T) {
+		rssProbeWarned.Store(false)
+		var got int64
+		out := captureStderr(t, func() { got = pgroupRSSBytes(deadPgid) })
+		if got != 0 {
+			t.Errorf("got %d, want 0", got)
+		}
+		if out != "" {
+			t.Errorf("stderr = %q, want nothing — the group exited, the probe didn't fail", out)
 		}
 	})
 }

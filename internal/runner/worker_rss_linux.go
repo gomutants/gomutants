@@ -4,6 +4,7 @@ package runner
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,6 +29,7 @@ func procGroupRSS(pgid int) (int64, error) {
 		return 0, err
 	}
 	var pages int64
+	found := false
 	for _, e := range ents {
 		// Entries that aren't pids (cpuinfo, sys) have no stat file, and a
 		// process that exits mid-scan no longer has one: either way
@@ -35,8 +37,12 @@ func procGroupRSS(pgid int) (int64, error) {
 		// thread-self are gomutants itself, whose group is never a mutant's.
 		stat, _ := os.ReadFile(filepath.Join(procRoot, e.Name(), "stat"))
 		if g, rss := parseProcStat(stat); g == pgid {
+			found = true // even at 0 pages: a zombie leader is still listed
 			pages += int64(rss)
 		}
+	}
+	if !found {
+		return 0, fmt.Errorf("%s: %w", procRoot, errGroupNotListed)
 	}
 	return pages * int64(os.Getpagesize()), nil
 }
