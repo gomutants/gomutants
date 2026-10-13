@@ -52,6 +52,11 @@ func TestPgroupRSSBytesSelf(t *testing.T) {
 // coincide, as they do under a shell without job control; here they never
 // do. GNU ps reads a numeric `-g` as a session list, so on Linux the
 // lookup matched nothing and the RSS monitor never tripped (issue #107).
+//
+// The probe is polled, not read once: a sleep sampled the instant Start
+// returns has barely faulted in a page (VmRSS ~12 kB), and Linux's stat rss
+// can still read 0 then, about 1 run in 500 under load. A lookup that
+// can't find the group reads 0 for the whole deadline.
 func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
 	cmd := exec.Command("sleep", "60")
 	applyProcessGroup(cmd)
@@ -67,8 +72,13 @@ func TestPgroupRSSBytesNewProcessGroup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Getpgid: %v", err)
 	}
-	if got := pgroupRSSBytes(pgid); got <= 0 {
-		t.Errorf("pgroupRSSBytes(child pgid=%d) = %d, want > 0", pgid, got)
+	got := pgroupRSSBytes(pgid)
+	for deadline := time.Now().Add(2 * time.Second); got <= 0 && time.Now().Before(deadline); {
+		time.Sleep(10 * time.Millisecond)
+		got = pgroupRSSBytes(pgid)
+	}
+	if got <= 0 {
+		t.Errorf("pgroupRSSBytes(child pgid=%d) = %d for 2s, want > 0", pgid, got)
 	}
 }
 
