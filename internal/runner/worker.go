@@ -761,14 +761,15 @@ func (w *Worker) runMonitored(cmd *exec.Cmd) (runErr error, memKilled bool, star
 	monitorDone := make(chan struct{})
 	monitorExited := make(chan struct{})
 	go func() {
-		// Polls every monitorPollInterval (1s). Each poll scans the whole
-		// process table, /proc on Linux and one `ps -A` elsewhere, once per
-		// worker. The cap is only checked at a poll, so a mutant can
-		// overshoot it by whatever it allocates within one interval: an
-		// unthrottled loop added 2 GiB in ~0.4s (PR #116). Under a memory
-		// limit below the cap plus that burst, the kernel's OOM killer can
-		// win the race and the mutant is reported INFRA ERROR, not TIMED
-		// OUT. testTimeout (10× baseline) is the outer backstop.
+		// Polls every monitorPollInterval (1s). Every worker's monitor reads
+		// one shared scan of the whole process table (/proc on Linux, `ps
+		// -A` elsewhere), at most half an interval old; see cachedGroupRSS.
+		// The cap is only checked at a poll, so a mutant can overshoot it
+		// by whatever it allocates within one interval: an unthrottled loop
+		// added 2 GiB in ~0.4s (PR #116). Under a memory limit below the
+		// cap plus that burst, the kernel's OOM killer can win the race and
+		// the mutant is reported INFRA ERROR, not TIMED OUT. testTimeout
+		// (10× baseline) is the outer backstop.
 		defer close(monitorExited)
 		t := time.NewTicker(monitorPollInterval)
 		defer t.Stop()

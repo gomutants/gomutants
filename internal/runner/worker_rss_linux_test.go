@@ -6,9 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -56,13 +58,14 @@ func TestParseProcStat(t *testing.T) {
 	}
 }
 
-// TestProcGroupRSS runs procGroupRSS over a fake procfs. Kills a match
-// that leaks other groups' rows (`!=`, `||`), a sum that keeps only the
-// last row (REMOVE_SELF_ASSIGNMENTS) or subtracts, a `/` for the page
-// multiply, and a probe that hides an unreadable /proc (RETURN_ERROR_NIL)
-// or a group it lists no row for (`!found` negated, `found = true`
-// removed), either of which would leave the RSS cap silently off.
-func TestProcGroupRSS(t *testing.T) {
+// TestScanProcTable runs scanProcTable over a fake procfs. Kills a sum
+// that keeps only the last row of a group (REMOVE_SELF_ASSIGNMENTS) or
+// subtracts, a `/` for the page multiply, a name filter that drops pids
+// starting with 9 (CONDITIONALS_BOUNDARY) or reads non-pids (self
+// would count a group twice), a table that keeps pgrp 0, and a scan that
+// hides an unreadable or unlistable /proc (RETURN_ERROR_NIL, BRANCH_IF),
+// which would leave the RSS cap silently off.
+func TestScanProcTable(t *testing.T) {
 	orig := procRoot
 	t.Cleanup(func() { procRoot = orig })
 
@@ -80,7 +83,12 @@ func TestProcGroupRSS(t *testing.T) {
 	write("12/stat", procStatLine("go", 7, 100))
 	write("34/stat", procStatLine("pkg.test", 7, 50))
 	write("56/stat", procStatLine("other", 8, 1000))
-	// Not a pid, so no stat file under it.
+	// A zombie leader: 0 pages, but its group is listed.
+	write("90/stat", procStatLine("zombie", 10, 0))
+	// A kernel thread: pgrp 0, no group of ours.
+	write("2/stat", procStatLine("kthreadd", 0, 0))
+	// Not pids, so never read; self is gomutants' own pid in a real /proc.
+	write("self/stat", procStatLine("self", 7, 4000))
 	write("cpuinfo", "processor : 0\n")
 	// A pid that exited mid-scan: its dir is listed, its stat is gone.
 	if err := os.Mkdir(filepath.Join(root, "78"), 0o755); err != nil {
@@ -88,32 +96,24 @@ func TestProcGroupRSS(t *testing.T) {
 	}
 	procRoot = root
 
-	got, err := procGroupRSS(7)
-	if err != nil {
-		t.Fatalf("procGroupRSS: %v", err)
-	}
-	if want := int64(150 * os.Getpagesize()); got != want {
-		t.Errorf("procGroupRSS(7) = %d, want %d (pages 100+50 of group 7 only)", got, want)
-	}
-
-	// A group whose only row has 0 pages, as a zombie leader has: listed,
-	// so no error.
-	write("90/stat", procStatLine("zombie", 10, 0))
-	if got, err := procGroupRSS(10); err != nil || got != 0 {
-		t.Errorf("procGroupRSS(zombie group) = (%d, %v), want (0, nil)", got, err)
+	got, err := scanProcTable()
+	page := int64(os.Getpagesize())
+	want := rssTable{7: 150 * page, 8: 1000 * page, 10: 0}
+	if err != nil || !maps.Equal(got, want) {
+		t.Errorf("scanProcTable() = (%v, %v), want (%v, nil)", got, err, want)
 	}
 
-	// A group with no row at all is reported, so pgroupRSSBytes can tell a
-	// probe that can't see a live group from one that has exited.
-	if got, err := procGroupRSS(9); !errors.Is(err, errGroupNotListed) || got != 0 {
-		t.Errorf("procGroupRSS(unlisted group) = (%d, %v), want (0, errGroupNotListed)", got, err)
+	// A procfs that opens but can't be listed is reported too.
+	procRoot = filepath.Join(root, "cpuinfo")
+	if got, err := scanProcTable(); !errors.Is(err, syscall.ENOTDIR) || got != nil {
+		t.Errorf("scanProcTable on a file = (%v, %v), want (nil, ENOTDIR)", got, err)
 	}
 
-	// An unreadable procfs is reported as itself, not as an unlisted group:
+	// An unreadable procfs is reported as itself, not as an empty table:
 	// pgroupRSSBytes stays silent about an unlisted group that has exited,
 	// but a probe that can't read /proc must warn regardless.
 	procRoot = filepath.Join(root, "missing")
-	if got, err := procGroupRSS(7); !errors.Is(err, fs.ErrNotExist) || got != 0 {
-		t.Errorf("procGroupRSS with no procfs = (%d, %v), want (0, ErrNotExist)", got, err)
+	if got, err := scanProcTable(); !errors.Is(err, fs.ErrNotExist) || got != nil {
+		t.Errorf("scanProcTable with no procfs = (%v, %v), want (nil, ErrNotExist)", got, err)
 	}
 }

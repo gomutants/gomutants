@@ -4,47 +4,64 @@ package runner
 
 import (
 	"bytes"
-	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 )
 
-// procRoot is the procfs mount procGroupRSS scans. Swappable so tests can
+// procRoot is the procfs mount scanProcTable reads. Swappable so tests can
 // point it at a fake tree.
 var procRoot = "/proc"
 
-// groupRSSFunc returns the summed RSS, in bytes, of every process in group
-// pgid. Swappable so tests can drive the RSS monitor without touching the
-// host's process table.
-var groupRSSFunc = procGroupRSS
+// rssScanFunc scans the whole process table for cachedGroupRSS. Swappable
+// so tests can drive the snapshot without touching the host's processes.
+var rssScanFunc = scanProcTable
 
-// procGroupRSS reads the group's RSS straight from /proc, one stat file per
-// process, rather than through ps: slim and distroless images ship no ps,
-// and a failed exec once left the RSS cap silently off. procps can't select
-// a process group by itself anyway (see worker_rss_ps.go, issue #107).
-func procGroupRSS(pgid int) (int64, error) {
-	ents, err := os.ReadDir(procRoot)
+// scanProcTable reads every process's group and RSS straight from /proc,
+// one stat file per process, rather than through ps: slim and distroless
+// images ship no ps, and a failed exec once left the RSS cap silently off.
+// procps can't select a process group by itself anyway (see
+// worker_rss_ps.go, issue #107).
+func scanProcTable() (rssTable, error) {
+	dir, err := os.Open(procRoot)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	var pages int64
-	found := false
-	for _, e := range ents {
-		// Entries that aren't pids (cpuinfo, sys) have no stat file, and a
-		// process that exits mid-scan no longer has one: either way
-		// ReadFile leaves stat nil, which parses as no group. self and
-		// thread-self are gomutants itself, whose group is never a mutant's.
-		stat, _ := os.ReadFile(filepath.Join(procRoot, e.Name(), "stat"))
-		if g, rss := parseProcStat(stat); g == pgid {
-			found = true // even at 0 pages: a zombie leader is still listed
-			pages += int64(rss)
+	// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="-2 and 0 read every name as -1 does: any n <= 0 means all"
+	names, err := dir.Readdirnames(-1) // unsorted, unlike os.ReadDir
+	_ = dir.Close()
+	if err != nil {
+		return nil, err
+	}
+	page := int64(os.Getpagesize())
+	table := rssTable{}
+	// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="buffer capacity: any size well above a ~300-byte stat line reads the same"
+	buf := make([]byte, 1024) // a stat line runs ~300 bytes
+	for _, name := range names {
+		// Only a pid has a stat to read. Every other entry is named by a
+		// word (cpuinfo, sys, and self, which is gomutants itself, never a
+		// mutant's group), so it is skipped before any I/O.
+		if name[0] > '9' {
+			continue
+		}
+		// pgrp 0 is a kernel thread's, or a stat that didn't parse: a
+		// process that exited mid-scan has none to read.
+		if g, rss := parseProcStat(readStat(procRoot+"/"+name+"/stat", buf)); g != 0 {
+			table[g] += int64(rss) * page
 		}
 	}
-	if !found {
-		return 0, fmt.Errorf("%s: %w", procRoot, errGroupNotListed)
+	return table, nil
+}
+
+// readStat reads the stat file at path into buf and returns what it read,
+// or nothing if the process has exited.
+func readStat(path string, buf []byte) []byte {
+	f, err := os.Open(path)
+	if err == nil {
+		n, _ := f.Read(buf)
+		_ = f.Close()
+		return buf[:n]
 	}
-	return pages * int64(os.Getpagesize()), nil
+	return nil
 }
 
 // parseProcStat returns the pgrp and rss (in pages) fields of a

@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 // rssProbeOutageAfter is how many probe failures in a row, counted across
@@ -31,6 +33,70 @@ var rssProbe struct {
 func resetRSSProbe() {
 	rssProbe.fails.Store(0)
 	rssProbe.down.Store(false)
+	rssSnapshot.mu.Lock()
+	defer rssSnapshot.mu.Unlock()
+	rssSnapshot.table, rssSnapshot.at = nil, time.Time{}
+}
+
+// rssTable maps a process group to its summed RSS in bytes. A group whose
+// processes all read 0 (a zombie leader) is present at 0: listed, not
+// missing.
+type rssTable map[int]int64
+
+// groupRSSFunc returns the summed RSS, in bytes, of every process in group
+// pgid. Swappable so tests can drive the RSS monitor without touching the
+// host's process table.
+var groupRSSFunc = cachedGroupRSS
+
+// rssSnapshot is the last scan of the whole process table, shared by every
+// worker's monitor. A scan reads every process on the host (21 ms and 9 MB
+// at 3000 processes on Linux, a fork of ps elsewhere), and each worker
+// scanning once a second for its own group multiplied that by the workers.
+var rssSnapshot struct {
+	mu    sync.Mutex
+	table rssTable
+	at    time.Time // when the scan behind table started; zero for none
+}
+
+// cachedGroupRSS reads group pgid's RSS from the shared snapshot, scanning
+// anew once it is older than half a poll interval, so all workers together
+// scan at most twice an interval; ones that arrive mid-scan wait for it.
+// A group missing from a scan that started before this call may have
+// started since, so it gets a fresh scan before it reads as unlisted.
+func cachedGroupRSS(pgid int) (int64, error) {
+	asked := time.Now()
+	rssSnapshot.mu.Lock()
+	defer rssSnapshot.mu.Unlock()
+	// gomutants:disable-next-line CONDITIONALS_BOUNDARY reason="elapsed time is never exactly half an interval, so > and >= scan alike"
+	if time.Since(rssSnapshot.at) > monitorPollInterval/2 {
+		if err := rescanRSS(); err != nil {
+			return 0, err
+		}
+	}
+	n, ok := rssSnapshot.table[pgid]
+	if !ok && rssSnapshot.at.Before(asked) {
+		if err := rescanRSS(); err != nil {
+			return 0, err
+		}
+		n, ok = rssSnapshot.table[pgid]
+	}
+	if !ok {
+		return 0, fmt.Errorf("group %d: %w", pgid, errGroupNotListed)
+	}
+	return n, nil
+}
+
+// rescanRSS replaces the snapshot with a fresh scan; the caller holds
+// rssSnapshot.mu. A failed scan is returned but never kept: several workers
+// reading one kept failure would add up to an outage that never happened.
+func rescanRSS() error {
+	at := time.Now()
+	table, err := rssScanFunc()
+	if err != nil {
+		return err
+	}
+	rssSnapshot.table, rssSnapshot.at = table, at
+	return nil
 }
 
 // errGroupNotListed is what a groupRSSFunc returns when its scan lists no
@@ -40,7 +106,8 @@ func resetRSSProbe() {
 var errGroupNotListed = errors.New("no process of the group is listed")
 
 // pgroupRSSBytes returns the summed RSS of all processes in the given PGID,
-// read by the platform's groupRSSFunc (/proc on Linux, ps elsewhere).
+// read through groupRSSFunc from the shared scan of the process table
+// (/proc on Linux, ps elsewhere).
 //
 // A probe that fails reads as 0, which leaves the RSS cap unable to fire,
 // so an outage is reported rather than swallowed: a missing ps once
