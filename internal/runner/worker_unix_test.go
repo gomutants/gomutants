@@ -128,144 +128,194 @@ func probeThroughOutage(t *testing.T, pgid int) (stderr string, got []int64) {
 	return stderr, got
 }
 
-// TestCachedGroupRSS pins the snapshot every worker's monitor shares. The
-// scan is stubbed with a call counter, and the snapshot is aged by moving
-// its timestamp back. Kills:
-//   - CONDITIONALS_* / ARITHMETIC_BASE / INTEGER_* on the max age
-//     `> monitorPollInterval/2`: a snapshot 0.4 of an interval old must be
-//     reused, one 0.75 old must not.
-//   - the rescan of a group missing from an older scan dropped or negated.
-//   - either rescan's error dropped, or rescanRSS keeping a failed scan:
-//     the scan's own error must come back, and the next call rescan.
-//   - INTEGER_* on the 0 an unlisted group reads as.
-//   - the snapshot clear in resetRSSProbe dropped.
-//   - the mutex dropped: concurrent pollers must share one scan.
-func TestCachedGroupRSS(t *testing.T) {
-	origScan := rssScanFunc
-	t.Cleanup(func() { rssScanFunc = origScan })
+// scanStub stands in for the process-table scan under cachedGroupRSS: it
+// counts scans and returns a scripted table or error, after an optional
+// delay.
+type scanStub struct {
+	scans atomic.Int32
+	table rssTable
+	err   error
+	delay time.Duration
+}
 
-	var (
-		scans   atomic.Int32
-		table   rssTable
-		scanErr error
-		delay   time.Duration
-	)
+// stubScan installs a scanStub that returns table, starting from a clean
+// probe and snapshot, and restores the real scan after the test.
+func stubScan(t *testing.T, table rssTable) *scanStub {
+	t.Helper()
+	cleanRSSProbe(t)
+	s := &scanStub{table: table}
+	orig := rssScanFunc
+	t.Cleanup(func() { rssScanFunc = orig })
 	rssScanFunc = func() (rssTable, error) {
-		scans.Add(1)
-		time.Sleep(delay)
-		if scanErr != nil {
-			return nil, scanErr
+		s.scans.Add(1)
+		time.Sleep(s.delay)
+		if s.err != nil {
+			return nil, s.err
 		}
-		return maps.Clone(table), nil
+		return maps.Clone(s.table), nil
 	}
-	setup := func(t *testing.T, tb rssTable) {
-		t.Helper()
-		cleanRSSProbe(t)
-		scans.Store(0)
-		table, scanErr, delay = tb, nil, 0
+	return s
+}
+
+// lookup asserts that cachedGroupRSS reads want for pgid.
+func (s *scanStub) lookup(t *testing.T, pgid int, want int64) {
+	t.Helper()
+	if got, err := cachedGroupRSS(pgid); err != nil || got != want {
+		t.Fatalf("cachedGroupRSS(%d) = (%d, %v), want (%d, nil)", pgid, got, err, want)
 	}
-	// age moves the snapshot back by fraction of a poll interval.
-	age := func(fraction float64) {
-		rssSnapshot.at = rssSnapshot.at.Add(-time.Duration(fraction * float64(monitorPollInterval)))
+}
+
+// wantScans asserts how many scans have run.
+func (s *scanStub) wantScans(t *testing.T, want int32) {
+	t.Helper()
+	if got := s.scans.Load(); got != want {
+		t.Fatalf("%d scans, want %d", got, want)
 	}
-	lookup := func(t *testing.T, pgid int, want int64) {
-		t.Helper()
-		if got, err := cachedGroupRSS(pgid); err != nil || got != want {
-			t.Fatalf("cachedGroupRSS(%d) = (%d, %v), want (%d, nil)", pgid, got, err, want)
-		}
+}
+
+// ageSnapshot moves the snapshot back by fraction of a poll interval.
+func ageSnapshot(fraction float64) {
+	rssSnapshot.at = rssSnapshot.at.Add(-time.Duration(fraction * float64(monitorPollInterval)))
+}
+
+// TestCachedGroupRSSSharesAScan pins the snapshot's max age: one 0.4 of an
+// interval old is reused, one 0.75 old is not. Kills CONDITIONALS_NEGATION,
+// ARITHMETIC_BASE and INTEGER_* on `> monitorPollInterval/2`.
+func TestCachedGroupRSSSharesAScan(t *testing.T) {
+	s := stubScan(t, rssTable{7: 100})
+	s.lookup(t, 7, 100)
+	s.lookup(t, 7, 100)
+	s.wantScans(t, 1)
+	ageSnapshot(0.4)
+	s.lookup(t, 7, 100)
+	s.wantScans(t, 1)
+	ageSnapshot(0.35) // 0.75 of an interval in all
+	s.lookup(t, 7, 100)
+	s.wantScans(t, 2)
+}
+
+// TestCachedGroupRSSListedAtZero: a group whose processes all read 0 (a
+// zombie leader) is listed, not missing.
+func TestCachedGroupRSSListedAtZero(t *testing.T) {
+	s := stubScan(t, rssTable{10: 0})
+	s.lookup(t, 10, 0)
+}
+
+// TestCachedGroupRSSRescansForANewGroup: a group missing from a scan that
+// started before the call may have started since, so it gets a fresh scan.
+// Kills the rescan dropped, or its `Before` negated.
+func TestCachedGroupRSSRescansForANewGroup(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	s.lookup(t, 7, 1)
+	s.table = rssTable{7: 1, 8: 2} // group 8 started after the scan
+	s.lookup(t, 8, 2)
+	s.wantScans(t, 2)
+}
+
+// TestCachedGroupRSSUnlisted: a group missing from a scan made for this
+// call is unlisted, at 0, with no second scan. Kills INTEGER_* on the 0.
+func TestCachedGroupRSSUnlisted(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	if n, err := cachedGroupRSS(9); !errors.Is(err, errGroupNotListed) || n != 0 {
+		t.Fatalf("cachedGroupRSS(9) = (%d, %v), want (0, errGroupNotListed)", n, err)
 	}
-	wantScans := func(t *testing.T, want int32) {
-		t.Helper()
-		if got := scans.Load(); got != want {
-			t.Fatalf("%d scans, want %d", got, want)
-		}
+	s.wantScans(t, 1)
+}
+
+// TestCachedGroupRSSFailedScanNotKept: a scan's own error comes back from
+// both rescans, and the next call scans again rather than reading a kept
+// failure, which several workers would count as an outage. Kills either
+// rescan's error check dropped, and rescanRSS keeping a failed scan.
+func TestCachedGroupRSSFailedScanNotKept(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	s.lookup(t, 7, 1)
+	boom := errors.New("fork/exec /bin/ps: resource temporarily unavailable")
+	s.err = boom
+	// A fresh snapshot without group 8: the rescan for the miss fails.
+	if n, err := cachedGroupRSS(8); !errors.Is(err, boom) || n != 0 {
+		t.Fatalf("miss, failing rescan: (%d, %v), want (0, %v)", n, err, boom)
 	}
+	// A stale snapshot: the rescan for its age fails.
+	ageSnapshot(0.75)
+	if n, err := cachedGroupRSS(7); !errors.Is(err, boom) || n != 0 {
+		t.Fatalf("stale snapshot, failing rescan: (%d, %v), want (0, %v)", n, err, boom)
+	}
+	s.err = nil
+	s.lookup(t, 7, 1)
+	s.wantScans(t, 4)
+}
 
-	t.Run("lookups share a scan until it is half an interval old", func(t *testing.T) {
-		setup(t, rssTable{7: 100})
-		lookup(t, 7, 100)
-		lookup(t, 7, 100)
-		wantScans(t, 1)
-		age(0.4)
-		lookup(t, 7, 100)
-		wantScans(t, 1)
-		age(0.35) // 0.75 of an interval in all
-		lookup(t, 7, 100)
-		wantScans(t, 2)
-	})
+// TestCachedGroupRSSResetDropsSnapshot kills the snapshot clear in
+// resetRSSProbe dropped.
+func TestCachedGroupRSSResetDropsSnapshot(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	s.lookup(t, 7, 1)
+	resetRSSProbe()
+	s.lookup(t, 7, 1)
+	s.wantScans(t, 2)
+}
 
-	t.Run("a group listed at 0 is listed", func(t *testing.T) {
-		setup(t, rssTable{10: 0})
-		lookup(t, 10, 0)
-	})
+// TestCachedGroupRSSConcurrentPollers: pollers that arrive mid-scan wait
+// for it rather than scanning again. Kills the mutex dropped.
+func TestCachedGroupRSSConcurrentPollers(t *testing.T) {
+	s := stubScan(t, rssTable{7: 1})
+	s.delay = 20 * time.Millisecond
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Go(func() {
+			if n, err := cachedGroupRSS(7); err != nil || n != 1 {
+				t.Errorf("cachedGroupRSS(7) = (%d, %v), want (1, nil)", n, err)
+			}
+		})
+	}
+	wg.Wait()
+	s.wantScans(t, 1)
+}
 
-	t.Run("a group missing from an older scan gets a fresh one", func(t *testing.T) {
-		setup(t, rssTable{7: 1})
-		lookup(t, 7, 1)
-		table = rssTable{7: 1, 8: 2} // group 8 started after the scan
-		lookup(t, 8, 2)
-		wantScans(t, 2)
-	})
+// TestCachedGroupRSSRealScanUnlisted runs the platform's real scan for a
+// group nobody has.
+func TestCachedGroupRSSRealScanUnlisted(t *testing.T) {
+	cleanRSSProbe(t)
+	if _, err := cachedGroupRSS(deadPgid); !errors.Is(err, errGroupNotListed) {
+		t.Errorf("cachedGroupRSS(deadPgid) err = %v, want errGroupNotListed", err)
+	}
+}
 
-	t.Run("a group missing from a scan made for this call is unlisted", func(t *testing.T) {
-		setup(t, rssTable{7: 1})
-		if n, err := cachedGroupRSS(9); !errors.Is(err, errGroupNotListed) || n != 0 {
-			t.Fatalf("cachedGroupRSS(9) = (%d, %v), want (0, errGroupNotListed)", n, err)
-		}
-		wantScans(t, 1) // the snapshot was made for this call: no second scan
-	})
+// wantAllZero asserts that every poll read 0.
+func wantAllZero(t *testing.T, got []int64) {
+	t.Helper()
+	if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
+		t.Errorf("got %v, want all 0", got)
+	}
+}
 
-	t.Run("a failed scan is returned, not kept", func(t *testing.T) {
-		setup(t, rssTable{7: 1})
-		lookup(t, 7, 1)
-		boom := errors.New("fork/exec /bin/ps: resource temporarily unavailable")
-		scanErr = boom
-		// A fresh snapshot without group 8: the rescan for the miss fails.
-		if n, err := cachedGroupRSS(8); !errors.Is(err, boom) || n != 0 {
-			t.Fatalf("miss, failing rescan: (%d, %v), want (0, %v)", n, err, boom)
-		}
-		// A stale snapshot: the rescan for its age fails.
-		age(0.75)
-		if n, err := cachedGroupRSS(7); !errors.Is(err, boom) || n != 0 {
-			t.Fatalf("stale snapshot, failing rescan: (%d, %v), want (0, %v)", n, err, boom)
-		}
-		// Neither failure replaced the stale snapshot, so the next call
-		// scans again rather than reading a kept failure.
-		scanErr = nil
-		lookup(t, 7, 1)
-		wantScans(t, 4)
-	})
+// wantWarnedOnce asserts that stderr holds exactly one "cap is off"
+// warning, and that it names cause.
+func wantWarnedOnce(t *testing.T, stderr, cause string) {
+	t.Helper()
+	if n := strings.Count(stderr, "RSS cap is off"); n != 1 {
+		t.Errorf("warned %d times, want once; stderr:\n%s", n, stderr)
+	}
+	if !strings.Contains(stderr, cause) {
+		t.Errorf("warning doesn't name the cause %q; stderr:\n%s", cause, stderr)
+	}
+}
 
-	t.Run("resetRSSProbe drops the snapshot", func(t *testing.T) {
-		setup(t, rssTable{7: 1})
-		lookup(t, 7, 1)
-		resetRSSProbe()
-		lookup(t, 7, 1)
-		wantScans(t, 2)
+// startGroup starts argv in its own process group, as makeCmd starts a
+// mutant, and returns it with its pgid. The group is killed after the test.
+func startGroup(t *testing.T, argv ...string) (*exec.Cmd, int) {
+	t.Helper()
+	cmd := exec.Command(argv[0], argv[1:]...)
+	applyProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start %s: %v", argv[0], err)
+	}
+	pgid := cmd.Process.Pid // with Setpgid the child leads its own group
+	t.Cleanup(func() {
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+		_ = cmd.Wait()
 	})
-
-	t.Run("concurrent pollers share one scan", func(t *testing.T) {
-		setup(t, rssTable{7: 1})
-		delay = 20 * time.Millisecond
-		var wg sync.WaitGroup
-		for range 10 {
-			wg.Go(func() {
-				if n, err := cachedGroupRSS(7); err != nil || n != 1 {
-					t.Errorf("cachedGroupRSS(7) = (%d, %v), want (1, nil)", n, err)
-				}
-			})
-		}
-		wg.Wait()
-		wantScans(t, 1)
-	})
-
-	t.Run("the real scan reports a group nobody has as unlisted", func(t *testing.T) {
-		setup(t, nil)
-		rssScanFunc = origScan
-		if _, err := cachedGroupRSS(deadPgid); !errors.Is(err, errGroupNotListed) {
-			t.Errorf("cachedGroupRSS(deadPgid) err = %v, want errGroupNotListed", err)
-		}
-	})
+	return cmd, pgid
 }
 
 // TestPgroupRSSBytesInvalidPgid probes a pgid no process has. The real
@@ -274,9 +324,7 @@ func TestCachedGroupRSS(t *testing.T) {
 func TestPgroupRSSBytesInvalidPgid(t *testing.T) {
 	cleanRSSProbe(t)
 	out, got := probeThroughOutage(t, deadPgid)
-	if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
-		t.Errorf("pgroupRSSBytes(invalid) = %v, want all 0", got)
-	}
+	wantAllZero(t, got)
 	if out != "" {
 		t.Errorf("stderr = %q, want nothing — the group doesn't exist, the probe didn't fail", out)
 	}
@@ -316,15 +364,8 @@ func TestPgroupRSSBytesProbeError(t *testing.T) {
 			return 5 * 1024, errors.New("fork/exec /bin/ps: no such file or directory")
 		}
 		out, got := probeThroughOutage(t, deadPgid)
-		if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
-			t.Errorf("got %v, want all 0", got)
-		}
-		if n := strings.Count(out, "RSS cap is off"); n != 1 {
-			t.Errorf("warned %d times, want once; stderr:\n%s", n, out)
-		}
-		if !strings.Contains(out, "no such file or directory") {
-			t.Errorf("warning doesn't name the cause; stderr:\n%s", out)
-		}
+		wantAllZero(t, got)
+		wantWarnedOnce(t, out, "no such file or directory")
 	})
 }
 
@@ -406,30 +447,10 @@ func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 
 	t.Run("live group warns once", func(t *testing.T) {
 		cleanRSSProbe(t)
-		cmd := exec.Command("sleep", "60")
-		applyProcessGroup(cmd)
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start sleep: %v", err)
-		}
-		t.Cleanup(func() {
-			_ = cmd.Process.Kill()
-			_ = cmd.Wait()
-		})
-		pgid, err := syscall.Getpgid(cmd.Process.Pid)
-		if err != nil {
-			t.Fatalf("Getpgid: %v", err)
-		}
-
+		cmd, pgid := startGroup(t, "sleep", "60")
 		out, got := probeThroughOutage(t, pgid)
-		if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
-			t.Errorf("got %v, want all 0", got)
-		}
-		if n := strings.Count(out, "RSS cap is off"); n != 1 {
-			t.Errorf("warned %d times, want once; stderr:\n%s", n, out)
-		}
-		if !strings.Contains(out, errGroupNotListed.Error()) {
-			t.Errorf("warning doesn't name the cause; stderr:\n%s", out)
-		}
+		wantAllZero(t, got)
+		wantWarnedOnce(t, out, errGroupNotListed.Error())
 
 		// The liveness check must only probe: any real signal it sent
 		// (signal 1, SIGHUP) would end sleep before our SIGKILL does.
@@ -445,29 +466,18 @@ func TestPgroupRSSBytesGroupNotListed(t *testing.T) {
 	// so the check must address the group (-pgid), not the pid.
 	t.Run("group whose leader exited still counts as alive", func(t *testing.T) {
 		cleanRSSProbe(t)
-		cmd := exec.Command("sh", "-c", "sleep 60 &")
-		applyProcessGroup(cmd)
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start sh: %v", err)
-		}
-		pgid := cmd.Process.Pid // sh leads its own group (Setpgid)
-		t.Cleanup(func() { _ = syscall.Kill(-pgid, syscall.SIGKILL) })
+		cmd, pgid := startGroup(t, "sh", "-c", "sleep 60 &")
 		if err := cmd.Wait(); err != nil {
 			t.Fatalf("sh: %v", err)
 		}
-
 		out, _ := probeThroughOutage(t, pgid)
-		if n := strings.Count(out, "RSS cap is off"); n != 1 {
-			t.Errorf("warned %d times, want once — the group's sleep is alive; stderr:\n%s", n, out)
-		}
+		wantWarnedOnce(t, out, errGroupNotListed.Error())
 	})
 
 	t.Run("exited group is silent", func(t *testing.T) {
 		cleanRSSProbe(t)
 		out, got := probeThroughOutage(t, deadPgid)
-		if slices.ContainsFunc(got, func(n int64) bool { return n != 0 }) {
-			t.Errorf("got %v, want all 0", got)
-		}
+		wantAllZero(t, got)
 		if out != "" {
 			t.Errorf("stderr = %q, want nothing — the group exited, the probe didn't fail", out)
 		}
