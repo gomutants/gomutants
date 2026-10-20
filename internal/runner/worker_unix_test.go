@@ -610,7 +610,9 @@ func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 	}()
-	maxSubprocRSSBytes = 1024 // 1 KB — well below any real process
+	// 2 MiB, well below the stubbed probe, and a whole number of MiB so the
+	// log line's cap reads back as set.
+	maxSubprocRSSBytes = 2 << 20
 	monitorPollInterval = 50 * time.Millisecond
 
 	groupRSSFunc = func(int) (int64, error) {
@@ -627,12 +629,54 @@ func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), 30*time.Second)
 	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sleep", "0.5"} })
-	result := w.Test(context.Background(), m)
+	var result mutator.Mutant
+	stderr := captureStderr(t, func() { result = w.Test(context.Background(), m) })
 	if result.Status != mutator.StatusTimedOut {
 		t.Errorf("Status=%v, want TimedOut — BRANCH_IF on `pgroupRSSBytes > cap` body skips the kill", result.Status)
 	}
 	if killCalls.Load() == 0 {
 		t.Errorf("syscallKillFunc never invoked — STATEMENT_REMOVE on killPgroup elides the kill call")
+	}
+	want := "gomutants: worker 0: testing m/calc went over the 2 MiB memory cap and was killed, treating as TIMED OUT\n"
+	if stderr != want {
+		t.Errorf("stderr = %q, want %q: a memory kill must say so, or it reads as a deadline", stderr, want)
+	}
+}
+
+// TestWorkerTestRSSKillsRunawayBuild is TestWorkerTestRSSKillsRunaway for
+// a build: the monitor's kill of a compile or link reads TIMED OUT too, and
+// says which it stopped. The stand-in build fails on its own after the
+// monitor has polled it, as one the stubbed-out kill had stopped would.
+func TestWorkerTestRSSKillsRunawayBuild(t *testing.T) {
+	origCap := maxSubprocRSSBytes
+	origPoll := monitorPollInterval
+	origRSS := groupRSSFunc
+	origKill := syscallKillFunc
+	defer func() {
+		maxSubprocRSSBytes = origCap
+		monitorPollInterval = origPoll
+		groupRSSFunc = origRSS
+		syscallKillFunc = origKill
+	}()
+	maxSubprocRSSBytes = 3 << 20
+	monitorPollInterval = 50 * time.Millisecond
+	groupRSSFunc = func(int) (int64, error) { return 999999 * 1024, nil }
+	syscallKillFunc = func(int, syscall.Signal) error { return nil }
+
+	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), 30*time.Second)
+	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 0.5; exit 1"} },
+		func(string) []string { return []string{"true"} })
+	var result mutator.Mutant
+	stderr := captureStderr(t, func() { result = w.Test(context.Background(), m) })
+	if result.Status != mutator.StatusTimedOut {
+		t.Errorf("Status=%v, want TimedOut", result.Status)
+	}
+	if len(runs.runs) != 0 {
+		t.Errorf("ran %v, want no test run after a build the monitor stopped", runs.runs)
+	}
+	want := "gomutants: worker 0: building m/calc went over the 3 MiB memory cap and was killed, treating as TIMED OUT\n"
+	if stderr != want {
+		t.Errorf("stderr = %q, want %q", stderr, want)
 	}
 }
 
@@ -678,7 +722,11 @@ func TestWorkerTestRSSExactlyAtCapDoesNotKill(t *testing.T) {
 		StartOffset: plusIdx, EndOffset: plusIdx + 1,
 		Replacement: "-", Status: mutator.StatusPending,
 	}
-	result := w.Test(context.Background(), m)
+	var result mutator.Mutant
+	stderr := captureStderr(t, func() { result = w.Test(context.Background(), m) })
+	if strings.Contains(stderr, "memory cap") {
+		t.Errorf("stderr = %q, want no memory-kill line for a run the monitor let finish", stderr)
+	}
 	// The mutated `+`→`-` makes TestAdd fail, so original status is Killed.
 	// Boundary mutation `>=` would trigger the RSS kill at the equality
 	// boundary, classifying the result as TimedOut instead.

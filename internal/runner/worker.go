@@ -648,6 +648,9 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 			fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s took over %v, treating as %s\n", w.id, pkg, buildTimeout, mutator.StatusInfraError)
 			return "", mutator.StatusInfraError
 		}
+		if memKilled {
+			w.reportMemKill("building", pkg)
+		}
 		return "", classifyBuildFailure(runErr, memKilled, stdout.String(), stderr.String())
 	}
 	if _, err := os.Stat(bin); err != nil {
@@ -715,6 +718,9 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 		}
 		return w.startFailure(err), time.Since(start)
 	}
+	if memKilled {
+		w.reportMemKill("testing", run.pkg)
+	}
 	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), output.truncated), time.Since(start)
 }
 
@@ -737,6 +743,14 @@ func (w *Worker) startFailure(err error) mutator.MutantStatus {
 	status := setupErrorStatus(err)
 	fmt.Fprintf(os.Stderr, "gomutants: worker %d: cmd.Start failed, treating as %s: %v\n", w.id, status, err)
 	return status
+}
+
+// reportMemKill reports that the RSS monitor killed a build or test run of
+// pkg. The mutant reads TIMED OUT either way, the same as one that ran out
+// its deadline, and this line is all that tells the two apart: a longer
+// timeout won't change a mutant the cap stopped.
+func (w *Worker) reportMemKill(doing, pkg string) {
+	fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s %s went over the %d MiB memory cap and was killed, treating as %s\n", w.id, doing, pkg, maxSubprocRSSBytes>>20, mutator.StatusTimedOut)
 }
 
 // runMonitored runs cmd (see makeCmd) under the RSS monitor and returns
