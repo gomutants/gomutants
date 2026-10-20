@@ -327,3 +327,47 @@ func TestIntegrationExcludeCallsDefaultsOff(t *testing.T) {
 		t.Errorf("both call lines must be mutated with the built-ins off, got lines %v", lines)
 	}
 }
+
+// TestIntegrationMutantsKeepUsesCompiling pins that a mutant is judged by
+// the tests, not by Go's unused checks: RETURN_ZERO on Label drops the
+// package's only use of strconv, and on Twice the only read of m, which
+// `go build` rejects, so before patch.ApplyMutant put the names back to use
+// both read NOT VIABLE and the weak test they expose went unreported.
+// TestWeak asserts nothing about either value, so both must live.
+//
+// The ARITHMETIC_BASE on Label's string `+` is the opposite case, and the
+// one gremlins#321 reports KILLED: `-` is undefined on strings, so the
+// mutation itself doesn't compile and must stay NOT VIABLE.
+func TestIntegrationMutantsKeepUsesCompiling(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+	outPath := filepath.Join(t.TempDir(), "report.json")
+	if err := run(context.Background(), []string{
+		"-w", "1", "--cache=off", "-o", outPath,
+		"./testdata/unusedimport/",
+	}); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	want := map[string]string{
+		"testdata/unusedimport/unusedimport.go:Label:RETURN_ZERO#1":     "LIVED",
+		"testdata/unusedimport/unusedimport.go:Twice:RETURN_ZERO#1":     "LIVED",
+		"testdata/unusedimport/unusedimport.go:Label:ARITHMETIC_BASE#1": "NOT VIABLE",
+	}
+	for _, f := range loadReport(t, outPath).Files {
+		for _, m := range f.Mutations {
+			status, ok := want[m.ID]
+			if !ok {
+				continue
+			}
+			delete(want, m.ID)
+			if m.Status != status {
+				t.Errorf("%s (%q -> %q) = %s, want %s", m.ID, m.Original, m.Replacement, m.Status, status)
+			}
+		}
+	}
+	for id := range want {
+		t.Errorf("no mutant %s in the report", id)
+	}
+}

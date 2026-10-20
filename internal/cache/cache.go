@@ -76,7 +76,11 @@ import (
 //	    pass alone but fail together on unmutated code — one leaves state
 //	    behind that breaks another — so v8 KILLED entries can be such
 //	    false kills.
-const SchemaVersion = 9
+//	v10: NOT_VIABLE means the mutation itself doesn't compile. Through v9 a
+//	    mutant that removed the last use of an import or local variable
+//	    failed on Go's unused checks instead, so v9 NOT_VIABLE entries can
+//	    be mutants that now compile (see patch.ApplyMutant) and must run.
+const SchemaVersion = 10
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path

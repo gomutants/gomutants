@@ -31,7 +31,9 @@ func (s *statementRemove) Discover(fset *token.FileSet, file *ast.File, src []by
 				return true
 			}
 			// Replace "x = expr" with "_ = expr".
-			// The replacement keeps the RHS to avoid unused-import errors.
+			// The replacement keeps the RHS, so its calls still run and
+			// nothing it uses goes unused (patch.ApplyMutant would put
+			// back an import or local the mutant orphaned anyway).
 			pos := fset.Position(stmt.Pos())
 			end := fset.Position(stmt.End())
 			startOffset := pos.Offset
