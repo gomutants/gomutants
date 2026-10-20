@@ -5,6 +5,8 @@ import (
 	"go/parser"
 	"go/token"
 	"go/types"
+	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,73 +27,65 @@ func ApplyMutant(filename string, original []byte, start, end int, replacement s
 	if err != nil {
 		return nil, err
 	}
-	return keepUses(filename, original, patched, start, end, len(replacement)), nil
+	return keepUses(filename, original, patched), nil
 }
 
-// edit replaces patched[start:end) with text.
+// edit replaces patched[start:end) with text. The zero edit changes nothing.
 type edit struct {
 	start, end int
 	text       string
 }
 
 // keepUses returns patched with a repair for each import or local that
-// go/types reports unused in it but not in original. Comparing the two is
-// what makes the single-file check sound: it runs without the package's
-// other files or its dependencies, so it misreads some code, but the same
-// way in both versions. An import whose package name guessName gets wrong
-// reads unused in original too, and is left alone; a local is matched by
-// its declaration's offset, mapped across the replaced span.
+// go/types reports unused in it but not, at the same offset, in original.
+// Comparing the two is what makes the single-file check sound: it runs
+// without the package's other files or its dependencies, so it misreads
+// some code, but the same way in both versions. An import whose package
+// name guessName gets wrong reads unused in original too, and is left
+// alone.
 //
-// Every miss leaves the mutant as it compiles today, and an extra `_ = x`
-// is harmless, so no reading of the code can break a mutant that compiles.
-func keepUses(filename string, original, patched []byte, start, end, replLen int) []byte {
+// Offsets agree between the versions only ahead of the replacement, which
+// is where it matters. Imports always sit there, and so does every local
+// whose last use a mutation can remove, as a use follows its declaration.
+// A local reported past the replacement gets a harmless `_ = x`, as does
+// one the check misreads: no repair can break a mutant that compiles.
+func keepUses(filename string, original, patched []byte) []byte {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, filename, patched, parser.SkipObjectResolution)
 	if err != nil {
 		return patched
 	}
 	lost := unusedOffsets(fset, file)
+	// gomutants:disable-next-line BRANCH_IF,INTEGER_DECREMENT reason="fast-path optimisation; identical observable when removed (with nothing lost there is nothing to repair, and applyEdits of no edits returns the same bytes)"
 	if len(lost) == 0 {
 		return patched
 	}
-	orig, err := parser.ParseFile(fset, filename, original, parser.SkipObjectResolution)
-	if err != nil {
-		return patched
-	}
+	// original parsed at discovery, or it would have no mutants.
+	orig, _ := parser.ParseFile(fset, filename, original, parser.SkipObjectResolution)
 	before := make(map[int]bool)
 	for _, off := range unusedOffsets(fset, orig) {
 		before[off] = true
 	}
-	replEnd := start + replLen
 	var edits []edit
 	for _, off := range lost {
-		origOff := off
-		switch {
-		case off >= replEnd:
-			origOff = off - replLen + (end - start)
-		case off >= start:
-			continue // declared by the replacement itself
-		}
-		if before[origOff] {
-			continue
-		}
-		if e, ok := repair(fset, file, off); ok && (e.end <= start || e.start >= replEnd) {
-			edits = append(edits, e)
+		if !before[off] {
+			edits = append(edits, repair(fset, file, off))
 		}
 	}
 	return applyEdits(patched, edits)
 }
 
 // unusedOffsets type-checks file alone and returns the byte offsets go/types
-// reports an unused import or local at: the import's path, or the local's
+// reports an unused import or local at: the import spec, or the local's
 // declaring identifier. Every other error is the missing context (sibling
 // files, dependencies) and is ignored.
 func unusedOffsets(fset *token.FileSet, file *ast.File) []int {
 	var offs []int
 	conf := types.Config{
 		Importer: stubImporter{},
+		// go/types documents every error it reports as a types.Error.
 		Error: func(err error) {
-			if te, ok := err.(types.Error); ok && te.Soft && strings.Contains(te.Msg, "not used") {
+			if te := err.(types.Error); strings.Contains(te.Msg, "and not used") {
 				offs = append(offs, fset.Position(te.Pos).Offset)
 			}
 		},
@@ -104,23 +98,23 @@ func unusedOffsets(fset *token.FileSet, file *ast.File) []int {
 // enough for go/types to tell which imports a file uses.
 type stubImporter struct{}
 
-func (stubImporter) Import(path string) (*types.Package, error) {
-	pkg := types.NewPackage(path, guessName(path))
+func (stubImporter) Import(importPath string) (*types.Package, error) {
+	pkg := types.NewPackage(importPath, guessName(importPath))
 	pkg.MarkComplete()
 	return pkg, nil
 }
 
-// guessName guesses the package name of import path the way the go command
-// lays packages out: the last element, skipping a /vN major-version suffix,
-// with a gopkg.in .vN suffix and a go- prefix or -go suffix dropped.
-func guessName(path string) string {
-	elems := strings.Split(path, "/")
-	name := elems[len(elems)-1]
-	if len(elems) > 1 && isMajorVersion(name) {
-		name = elems[len(elems)-2]
+// guessName guesses the package name of an import path the way the go
+// command lays packages out: the last element, skipping a /vN
+// major-version suffix, with a gopkg.in .vN suffix and a go- prefix or -go
+// suffix dropped.
+func guessName(importPath string) string {
+	name := path.Base(importPath)
+	if isMajorVersion(name) {
+		name = path.Base(path.Dir(importPath))
 	}
-	if i := strings.LastIndex(name, "."); i > 0 && isMajorVersion(name[i+1:]) {
-		name = name[:i]
+	if ext := path.Ext(name); isMajorVersion(strings.TrimPrefix(ext, ".")) {
+		name = strings.TrimSuffix(name, ext)
 	}
 	name = strings.TrimPrefix(name, "go-")
 	return strings.TrimSuffix(name, "-go")
@@ -128,62 +122,56 @@ func guessName(path string) string {
 
 // isMajorVersion reports whether s is a major-version element: v2, v10.
 func isMajorVersion(s string) bool {
-	if len(s) < 2 || s[0] != 'v' {
-		return false
-	}
-	_, err := strconv.Atoi(s[1:])
-	return err == nil
+	digits, ok := strings.CutPrefix(s, "v")
+	_, err := strconv.Atoi(digits)
+	return ok && err == nil
 }
 
 // repair returns the edit that puts the import or local reported unused at
-// off back to use, or false where no same-line repair exists: a cgo import,
-// a type switch's symbol, a switch's init. Those stay NOT VIABLE.
-func repair(fset *token.FileSet, file *ast.File, off int) (edit, bool) {
+// off back to use, or the zero edit where no same-line repair exists: a cgo
+// import, a type switch's symbol, a switch's init, a label. Those stay NOT
+// VIABLE.
+func repair(fset *token.FileSet, file *ast.File, off int) edit {
 	at := func(p token.Pos) int { return fset.Position(p).Offset }
 	for _, spec := range file.Imports {
-		if at(spec.Pos()) > off || off >= at(spec.End()) {
-			continue
+		switch {
+		case at(spec.Pos()) != off, spec.Path.Value == `"C"`:
+		case spec.Name != nil:
+			return edit{at(spec.Name.Pos()), at(spec.Name.End()), "_"}
+		default:
+			return edit{off, off, "_ "}
 		}
-		if spec.Path.Value == `"C"` {
-			return edit{}, false
-		}
-		if spec.Name != nil {
-			return edit{at(spec.Name.Pos()), at(spec.Name.End()), "_"}, true
-		}
-		p := at(spec.Path.Pos())
-		return edit{p, p, "_ "}, true
 	}
 
-	path := pathTo(fset, file, off)
-	if len(path) < 2 {
-		return edit{}, false
-	}
-	id, ok := path[len(path)-1].(*ast.Ident)
-	if !ok {
-		return edit{}, false
-	}
-	use := "_ = " + id.Name
-	// after inserts the use behind stmt, which must sit in a statement list.
-	after := func(stmt ast.Node, list ast.Node) (edit, bool) {
-		switch list.(type) {
-		case *ast.BlockStmt, *ast.CaseClause, *ast.CommClause:
-			p := at(stmt.End())
-			return edit{p, p, "; " + use}, true
+	// go/types reports a local unused at its declaring identifier, so the
+	// path ends at it, under a := or a var spec inside a function.
+	var path []ast.Node
+	ast.PreorderStack(file, nil, func(n ast.Node, stack []ast.Node) bool {
+		if id, ok := n.(*ast.Ident); ok && at(id.Pos()) == off {
+			path = append(slices.Clone(stack), id)
 		}
-		return edit{}, false
+		return true
+	})
+	if path == nil {
+		return edit{}
 	}
+	nth := func(i int) ast.Node { return path[len(path)-i] }
+	use := "_ = " + nth(1).(*ast.Ident).Name
 	// into opens body with the use.
-	into := func(body *ast.BlockStmt) (edit, bool) {
+	into := func(body *ast.BlockStmt) edit {
 		p := at(body.Lbrace) + 1
-		return edit{p, p, " " + use + ";"}, true
+		return edit{p, p, " " + use + ";"}
+	}
+	// behind follows node with the use. Behind a var spec that is a
+	// statement of its own, or, in a `var ( … )` group, a spec `_ = x`.
+	behind := func(node ast.Node) edit {
+		p := at(node.End())
+		return edit{p, p, "; " + use}
 	}
 
-	switch decl := path[len(path)-2].(type) {
+	switch decl := nth(2).(type) {
 	case *ast.AssignStmt:
-		if decl.Tok != token.DEFINE || len(path) < 3 {
-			return edit{}, false
-		}
-		switch owner := path[len(path)-3].(type) {
+		switch owner := nth(3).(type) {
 		case *ast.IfStmt:
 			return into(owner.Body)
 		case *ast.ForStmt:
@@ -191,59 +179,29 @@ func repair(fset *token.FileSet, file *ast.File, off int) (edit, bool) {
 		case *ast.CommClause:
 			if owner.Comm == decl {
 				p := at(owner.Colon) + 1
-				return edit{p, p, " " + use + ";"}, true
+				return edit{p, p, " " + use + ";"}
 			}
-			return after(decl, owner)
-		default:
-			return after(decl, owner)
+		case *ast.SwitchStmt, *ast.TypeSwitchStmt:
+			return edit{}
 		}
+		return behind(decl)
 	case *ast.RangeStmt:
-		if decl.Tok == token.DEFINE {
-			return into(decl.Body)
-		}
+		return into(decl.Body)
 	case *ast.ValueSpec:
-		// ValueSpec → GenDecl → DeclStmt → statement list.
-		if len(path) >= 5 {
-			if stmt, ok := path[len(path)-4].(*ast.DeclStmt); ok {
-				return after(stmt, path[len(path)-5])
-			}
-		}
+		return behind(decl)
 	}
-	return edit{}, false
+	return edit{}
 }
 
-// pathTo returns the chain of nodes from file down to the identifier that
-// starts at off, or nil when none does.
-func pathTo(fset *token.FileSet, file *ast.File, off int) []ast.Node {
-	var stack, found []ast.Node
-	ast.Inspect(file, func(n ast.Node) bool {
-		if found != nil {
-			return false
-		}
-		if n == nil {
-			stack = stack[:len(stack)-1]
-			return false
-		}
-		stack = append(stack, n)
-		if id, ok := n.(*ast.Ident); ok && fset.Position(id.Pos()).Offset == off {
-			found = append([]ast.Node(nil), stack...)
-		}
-		return true
-	})
-	return found
-}
-
-// applyEdits applies non-overlapping edits to src, last first so earlier
-// offsets stay valid. Edits at one offset keep their order.
+// applyEdits applies non-overlapping edits to a copy of src, last first so
+// earlier offsets stay valid. go/types reports unused imports after unused
+// locals, so the edits come unsorted; edits at one offset keep their order.
 func applyEdits(src []byte, edits []edit) []byte {
-	if len(edits) == 0 {
-		return src
-	}
 	sort.SliceStable(edits, func(i, j int) bool { return edits[i].start < edits[j].start })
-	out := append([]byte(nil), src...)
+	out := slices.Clone(src)
 	for i := len(edits) - 1; i >= 0; i-- {
 		e := edits[i]
-		out = append(out[:e.start], append([]byte(e.text), out[e.end:]...)...)
+		out = slices.Replace(out, e.start, e.end, []byte(e.text)...)
 	}
 	return out
 }
