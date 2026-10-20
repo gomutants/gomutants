@@ -3161,3 +3161,39 @@ func TestSuiteDirs(t *testing.T) {
 		t.Errorf("suiteDirs = %v, want %v", got, want)
 	}
 }
+
+// TestWriteReportsListsSurvivors: the summary is followed by the LIVED
+// ids and the command to re-check one, with the run's package arguments —
+// except under --run-mutant-id, whose command line already names the
+// mutant.
+func TestWriteReportsListsSurvivors(t *testing.T) {
+	for name, tc := range map[string]struct {
+		runMutantID string
+		want        bool
+	}{
+		"full run":        {want: true},
+		"--run-mutant-id": {runMutantID: "add.go:Add:ARITHMETIC_BASE#1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			mr := &mutationRun{
+				cfg:  config.Config{Output: filepath.Join(t.TempDir(), "report.json"), RunMutantID: tc.runMutantID},
+				opts: runOptions{packages: []string{"./pkg/..."}},
+				mutants: []mutator.Mutant{{
+					StableID: "add.go:Add:ARITHMETIC_BASE#1", RelFile: "add.go", Status: mutator.StatusLived,
+				}},
+				term:     report.NewTerminal(&buf, 0, false, true),
+				progress: report.NewTerminal(&buf, 0, false, true),
+			}
+			if _, err := mr.writeReports(); err != nil {
+				t.Fatal(err)
+			}
+			got := buf.String()
+			listed := strings.Contains(got, "Surviving mutants (1):\n  add.go:Add:ARITHMETIC_BASE#1\n")
+			command := strings.Contains(got, "--threshold-efficacy 100 ./pkg/...\n")
+			if listed != tc.want || command != tc.want {
+				t.Errorf("listed=%v command=%v, want both %v; output:\n%s", listed, command, tc.want, got)
+			}
+		})
+	}
+}

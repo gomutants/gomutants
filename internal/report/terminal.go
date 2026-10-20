@@ -263,6 +263,45 @@ func (t *Terminal) Summary(r *Report) {
 	fmt.Fprintln(t.w)
 }
 
+// maxListedSurvivors caps the ids Survivors prints; the rest are left to
+// the JSON report, which it names.
+const maxListedSurvivors = 10
+
+// Survivors prints the ids of the LIVED mutants in r, up to
+// maxListedSurvivors, and the --run-mutant-id command that re-checks one
+// of them. Without it a reader of the run's output has the count of
+// survivors but neither their ids nor a way to verify a new test short of
+// a full rerun. packages are the run's own package arguments, so the
+// command re-checks the id against the scope it came from. Prints nothing
+// when no mutant lived.
+func (t *Terminal) Survivors(r *Report, reportPath string, packages []string) {
+	livedStatus := mutator.StatusLived.String()
+	var ids []string
+	for _, f := range r.Files {
+		for _, m := range f.Mutations {
+			if m.Status == livedStatus {
+				ids = append(ids, m.ID)
+			}
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	fmt.Fprintf(t.w, "Surviving mutants (%d):\n", len(ids))
+	for _, id := range ids[:min(len(ids), maxListedSurvivors)] {
+		fmt.Fprintf(t.w, "  %s\n", id)
+	}
+	if rest := len(ids) - maxListedSurvivors; rest > 0 {
+		fmt.Fprintf(t.w, "  …and %d more in %s\n", rest, reportPath)
+	}
+	fmt.Fprintln(t.w)
+	fmt.Fprintln(t.w, "Check one after adding a test, without a full rerun:")
+	fmt.Fprintf(t.w, "  gomutants --run-mutant-id '<id>' --threshold-efficacy 100 %s\n", strings.Join(packages, " "))
+	fmt.Fprintln(t.w, "  (exit 0 = killed, 10 = still alive; repeat any other flags this run used, such as --integration)")
+	fmt.Fprintln(t.w)
+}
+
 // suppressedSources labels the Suppressed line with where the mutants
 // went. One source names itself; both split the count, so a reader can
 // tell how much of the drop came from a project-wide --exclude-calls
