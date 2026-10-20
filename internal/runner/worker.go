@@ -497,7 +497,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	}
 
 	// 2. Apply patch.
-	patched, err := patch.Apply(original, m.StartOffset, m.EndOffset, m.Replacement)
+	patched, err := patch.ApplyMutant(m.File, original, m.StartOffset, m.EndOffset, m.Replacement)
 	if err != nil {
 		m.Status = mutator.StatusNotViable
 		m.Duration = nonZeroSince(start)
