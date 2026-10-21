@@ -17,14 +17,7 @@ import (
 // file that still parses. A mutant that breaks the syntax can never
 // compile, so it would read NOT VIABLE however good the tests are.
 func FuzzMutatorsKeepSourceParseable(f *testing.F) {
-	seeds, _ := filepath.Glob("../../testdata/*/*.go")
-	for _, path := range seeds {
-		src, err := os.ReadFile(path)
-		if err != nil {
-			f.Fatal(err)
-		}
-		f.Add(src)
-	}
+	addFixtureSeeds(f)
 	for _, src := range []string{
 		"package p\nfunc f() int { return 1 + 2 - 3 * 4 / 5 % 6 }\n",
 		"package p\nfunc f(a, b int) bool { return a < b && !(a >= b) || a == b }\n",
@@ -48,18 +41,38 @@ func FuzzMutatorsKeepSourceParseable(f *testing.F) {
 		}
 		for _, m := range reg.Mutators() {
 			for _, c := range m.Discover(fset, file, src) {
-				if c.StartOffset < 0 || c.StartOffset > c.EndOffset || c.EndOffset > len(src) {
-					t.Fatalf("%s: range [%d:%d) outside %d-byte source", c.Type, c.StartOffset, c.EndOffset, len(src))
-				}
-				mutated, err := patch.ApplyMutant("fuzz.go", src, c.StartOffset, c.EndOffset, c.Replacement)
-				if err != nil {
-					t.Fatalf("%s: %v", c.Type, err)
-				}
-				if _, err := parser.ParseFile(token.NewFileSet(), "fuzz.go", mutated, 0); err != nil {
-					t.Fatalf("%s: %q -> %q leaves source that does not parse: %v\n%s",
-						c.Type, src[c.StartOffset:c.EndOffset], c.Replacement, err, mutated)
-				}
+				checkCandidateParses(t, src, c)
 			}
 		}
 	})
+}
+
+// addFixtureSeeds seeds f with every Go file of the repo's testdata
+// fixtures.
+func addFixtureSeeds(f *testing.F) {
+	paths, _ := filepath.Glob("../../testdata/*/*.go")
+	for _, path := range paths {
+		src, err := os.ReadFile(path)
+		if err != nil {
+			f.Fatal(err)
+		}
+		f.Add(src)
+	}
+}
+
+// checkCandidateParses fails t unless c's range lies inside src and
+// applying c leaves source that still parses.
+func checkCandidateParses(t *testing.T, src []byte, c mutator.MutantCandidate) {
+	t.Helper()
+	if c.StartOffset < 0 || c.StartOffset > c.EndOffset || c.EndOffset > len(src) {
+		t.Fatalf("%s: range [%d:%d) outside %d-byte source", c.Type, c.StartOffset, c.EndOffset, len(src))
+	}
+	mutated, err := patch.ApplyMutant("fuzz.go", src, c.StartOffset, c.EndOffset, c.Replacement)
+	if err != nil {
+		t.Fatalf("%s: %v", c.Type, err)
+	}
+	if _, err := parser.ParseFile(token.NewFileSet(), "fuzz.go", mutated, 0); err != nil {
+		t.Fatalf("%s: %q -> %q leaves source that does not parse: %v\n%s",
+			c.Type, src[c.StartOffset:c.EndOffset], c.Replacement, err, mutated)
+	}
 }
