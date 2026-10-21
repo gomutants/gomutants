@@ -1043,6 +1043,17 @@ func f(x int) int {
 	}
 }
 
+// TestBranchCaseStopsBeforeTrailingEmptyStatements covers an explicit `;`
+// ending a case body: in `case 1:;default:` it is the only separator
+// before the next clause, so the replaced span must stop short of it, and
+// a body of nothing else gets no mutant. Found by
+// FuzzMutatorsKeepSourceParseable.
+func TestBranchCaseStopsBeforeTrailingEmptyStatements(t *testing.T) {
+	assertReplacements(t, mutator.BranchCase,
+		"package p\nfunc f(x int) { switch x { case 1:;default:x++;;case 2:;; } }\n",
+		[]replacementCase{{"x++", "_ = 0"}})
+}
+
 func TestExpressionRemove(t *testing.T) {
 	src := `package p
 func f(a, b bool) bool {

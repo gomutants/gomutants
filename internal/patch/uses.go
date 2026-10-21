@@ -21,9 +21,11 @@ import (
 //
 // The repairs change no behaviour: an import is blanked (`_ "strconv"`),
 // which still runs its init, and a local is read once (`_ = x`). Both are
-// written on the line they belong to, so no line number moves.
+// written on the line they belong to, so no line number moves. Likewise a
+// replacement that would fuse with a neighbouring token in unformatted
+// source is spaced off from it first (see keepApart).
 func ApplyMutant(filename string, original []byte, start, end int, replacement string) ([]byte, error) {
-	patched, err := Apply(original, start, end, replacement)
+	patched, err := Apply(original, start, end, keepApart(original, start, end, replacement))
 	if err != nil {
 		return nil, err
 	}
@@ -196,12 +198,15 @@ func repair(fset *token.FileSet, file *ast.File, off int) edit {
 // applyEdits applies non-overlapping edits to a copy of src, last first so
 // earlier offsets stay valid. go/types reports unused imports after unused
 // locals, so the edits come unsorted; edits at one offset keep their order.
+// Each is kept apart from its neighbours like the mutant itself: the `_ `
+// that blanks the import in `import"strconv"` would otherwise make
+// `import_`.
 func applyEdits(src []byte, edits []edit) []byte {
 	sort.SliceStable(edits, func(i, j int) bool { return edits[i].start < edits[j].start })
 	out := slices.Clone(src)
 	for i := len(edits) - 1; i >= 0; i-- {
 		e := edits[i]
-		out = slices.Replace(out, e.start, e.end, []byte(e.text)...)
+		out = slices.Replace(out, e.start, e.end, []byte(keepApart(out, e.start, e.end, e.text))...)
 	}
 	return out
 }

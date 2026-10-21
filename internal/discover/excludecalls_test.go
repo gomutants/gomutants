@@ -87,6 +87,19 @@ func TestNewCallExcluderRejectsMatchAllPattern(t *testing.T) {
 	}
 }
 
+// TestNewCallExcluderRejectsInvalidUTF8 covers a spec regexp can't compile:
+// QuoteMeta leaves an invalid byte as it is, so MustCompile would panic.
+// Found by FuzzCallExcluder.
+func TestNewCallExcluderRejectsInvalidUTF8(t *testing.T) {
+	ce, err := NewCallExcluder([]string{"log.Print*", "log.\x80"})
+	if err == nil {
+		t.Error("want error, got nil")
+	}
+	if ce != nil {
+		t.Errorf("want nil CallExcluder on error, got %+v", ce)
+	}
+}
+
 func TestNewCallExcluderSkipsBlanksKeepsLater(t *testing.T) {
 	// A blank entry must be skipped (continue), not stop the loop (break):
 	// the valid pattern after it has to survive.

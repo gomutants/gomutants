@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/gomutants/gomutants/internal/mutator"
 )
@@ -36,6 +37,9 @@ type CallExcluder struct {
 // module, which would suppress nearly every mutant. That is never what
 // someone means, and as a silent config typo it would zero out a suite's
 // mutation score without any other symptom.
+//
+// A spec that isn't valid UTF-8 is rejected too: Go source is UTF-8, so it
+// could never match a selector, and regexp won't compile it.
 func NewCallExcluder(specs []string) (*CallExcluder, error) {
 	patterns := make([]*regexp.Regexp, 0, len(specs))
 	for _, s := range specs {
@@ -49,9 +53,13 @@ func NewCallExcluder(specs []string) (*CallExcluder, error) {
 		if strings.Trim(spec, "*") == "" {
 			return nil, fmt.Errorf("pattern %q matches every call; list the calls to exclude instead", s)
 		}
-		// MustCompile is safe: globToRegexp emits QuoteMeta'd literals,
-		// `.*`, and the two anchors, so the result always compiles. A
-		// returned-and-checked error here would be an untestable branch.
+		if !utf8.ValidString(spec) {
+			return nil, fmt.Errorf("pattern %q is not valid UTF-8", s)
+		}
+		// MustCompile is safe: globToRegexp emits QuoteMeta'd literals of
+		// valid UTF-8, `.*`, and the two anchors, so the result always
+		// compiles. A returned-and-checked error here would be an
+		// untestable branch.
 		patterns = append(patterns, regexp.MustCompile(globToRegexp(spec)))
 	}
 	if len(patterns) == 0 {
