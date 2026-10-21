@@ -68,7 +68,7 @@ workers and a timeout coefficient of 50.
 
 ## Why isolated Go 1.25 fixtures?
 
-The main module now requires Go 1.26.1. Pinned Gremlins v0.6.0 panics while
+The main module now requires Go 1.26.10. Pinned Gremlins v0.6.0 panics while
 executing these targets with Go 1.26.x, so directly benchmarking the live module
 would fail before any useful timing. Copying the exact source and tests into a
 temporary `go 1.25.7` module lets all three binaries execute the same target

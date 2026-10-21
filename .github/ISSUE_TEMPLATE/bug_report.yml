@@ -114,7 +114,7 @@ body:
     attributes:
       label: Go version
       description: Output of `go version`
-      placeholder: "go version go1.26.1 darwin/arm64"
+      placeholder: "go version go1.26.10 darwin/arm64"
     validations:
       required: true
 
