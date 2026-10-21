@@ -3162,10 +3162,10 @@ func TestSuiteDirs(t *testing.T) {
 	}
 }
 
-// TestWriteReportsListsSurvivors: the summary is followed by the LIVED
-// ids and the flags that re-check one — except under --run-mutant-id,
-// whose command line already names the mutant.
-func TestWriteReportsListsSurvivors(t *testing.T) {
+// TestWriteReportsRecheckHint: when a mutant lived, the summary is
+// followed by the flags that re-check one — except under --run-mutant-id,
+// whose command line already is the re-check.
+func TestWriteReportsRecheckHint(t *testing.T) {
 	for name, tc := range map[string]struct {
 		runMutantID string
 		want        bool
@@ -3187,10 +3187,8 @@ func TestWriteReportsListsSurvivors(t *testing.T) {
 				t.Fatal(err)
 			}
 			got := buf.String()
-			listed := strings.Contains(got, "Surviving mutants (1):\n  add.go:Add:ARITHMETIC_BASE#1\n")
-			hint := strings.Contains(got, "Re-check one: re-run the same command, adding before the packages\n")
-			if listed != tc.want || hint != tc.want {
-				t.Errorf("listed=%v hint=%v, want both %v; output:\n%s", listed, hint, tc.want, got)
+			if hint := strings.Contains(got, "Re-check a survivor: re-run the same command, adding before the packages\n"); hint != tc.want {
+				t.Errorf("hint=%v, want %v; output:\n%s", hint, tc.want, got)
 			}
 		})
 	}

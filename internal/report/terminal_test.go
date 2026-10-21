@@ -232,91 +232,26 @@ func TestSummaryInfraErrorsNonZero(t *testing.T) {
 	}
 }
 
-// livedReport returns a Report whose single file holds n LIVED mutants,
-// with ids a.go:F:T#1 … a.go:F:T#n.
-func livedReport(n int) *Report {
-	f := FileReport{FileName: "a.go"}
-	for i := 1; i <= n; i++ {
-		f.Mutations = append(f.Mutations, MutationReport{ID: fmt.Sprintf("a.go:F:T#%d", i), Status: "LIVED"})
-	}
-	return &Report{Files: []FileReport{f}, MutantsLived: n}
-}
-
-// TestSurvivorsExact pins the full Survivors output: only LIVED entries
-// are listed, in report order across files, followed by the re-check hint.
-func TestSurvivorsExact(t *testing.T) {
-	var buf bytes.Buffer
-	term := NewTerminal(&buf, 0, false, false)
-	term.Survivors(&Report{Files: []FileReport{
-		{FileName: "a.go", Mutations: []MutationReport{
-			{ID: "a.go:F:ARITHMETIC_BASE#1", Status: "KILLED"},
-			{ID: "a.go:F:ARITHMETIC_BASE#2", Status: "LIVED"},
-			{ID: "a.go:F:ARITHMETIC_BASE#3", Status: "NOT COVERED"},
-		}},
-		{FileName: "b.go", Mutations: []MutationReport{
-			{ID: "b.go:G:CONDITIONALS_BOUNDARY#1", Status: "LIVED"},
-		}},
-	}}, "report.json")
-
-	want := "Surviving mutants (2):\n" +
-		"  a.go:F:ARITHMETIC_BASE#2\n" +
-		"  b.go:G:CONDITIONALS_BOUNDARY#1\n" +
-		"\n" +
-		"Re-check one: re-run the same command, adding before the packages\n" +
-		"  --run-mutant-id '<id>' --threshold-efficacy 100\n" +
-		"\n"
-	if got := buf.String(); got != want {
-		t.Errorf("Survivors output mismatch:\n got: %q\nwant: %q", got, want)
-	}
-}
-
-// TestSurvivorsNone: no LIVED entry, no output — including a Report whose
-// MutantsLived count has no file entries behind it.
-func TestSurvivorsNone(t *testing.T) {
-	for name, r := range map[string]*Report{
-		"no lived": {Files: []FileReport{{FileName: "a.go", Mutations: []MutationReport{
-			{ID: "a.go:F:T#1", Status: "KILLED"},
-		}}}},
-		"count without entries": {MutantsLived: 3},
+// TestRecheckHint pins the hint's text when a mutant lived, and its
+// absence when none did.
+func TestRecheckHint(t *testing.T) {
+	for name, tc := range map[string]struct {
+		lived int
+		want  string
+	}{
+		"lived": {lived: 2, want: "Re-check a survivor: re-run the same command, adding before the packages\n" +
+			"  --run-mutant-id '<id>' --threshold-efficacy 100\n" +
+			"\n"},
+		"none lived": {},
 	} {
 		t.Run(name, func(t *testing.T) {
 			var buf bytes.Buffer
-			NewTerminal(&buf, 0, false, false).Survivors(r, "report.json")
-			if buf.Len() != 0 {
-				t.Errorf("want no output, got %q", buf.String())
+			NewTerminal(&buf, 0, false, false).RecheckHint(&Report{MutantsLived: tc.lived})
+			if got := buf.String(); got != tc.want {
+				t.Errorf("RecheckHint output mismatch:\n got: %q\nwant: %q", got, tc.want)
 			}
 		})
 	}
-}
-
-// TestSurvivorsCapBoundary pins the cap: exactly maxListedSurvivors ids
-// list in full, one more lists the cap and points at the report for it.
-func TestSurvivorsCapBoundary(t *testing.T) {
-	t.Run("at cap", func(t *testing.T) {
-		var buf bytes.Buffer
-		NewTerminal(&buf, 0, false, false).Survivors(livedReport(maxListedSurvivors), "out/r.json")
-		got := buf.String()
-		if !strings.Contains(got, "  a.go:F:T#10\n\n") {
-			t.Errorf("want the 10th id followed by the blank line, got %q", got)
-		}
-		if strings.Contains(got, "more in") {
-			t.Errorf("want no overflow line at the cap, got %q", got)
-		}
-	})
-	t.Run("over cap", func(t *testing.T) {
-		var buf bytes.Buffer
-		NewTerminal(&buf, 0, false, false).Survivors(livedReport(maxListedSurvivors+1), "out/r.json")
-		got := buf.String()
-		if !strings.Contains(got, "Surviving mutants (11):\n") {
-			t.Errorf("want the full count in the heading, got %q", got)
-		}
-		if !strings.Contains(got, "  a.go:F:T#10\n  …and 1 more in out/r.json\n\n") {
-			t.Errorf("want the 10th id then the overflow line, got %q", got)
-		}
-		if strings.Contains(got, "a.go:F:T#11") {
-			t.Errorf("want the 11th id left to the report, got %q", got)
-		}
-	})
 }
 
 // TestSummaryTTYLeadingNewline covers the `t.isTTY && !t.verbose` branch
