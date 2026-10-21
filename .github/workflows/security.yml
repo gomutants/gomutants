@@ -62,7 +62,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.10"
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
@@ -107,7 +107,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.10"
 
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
@@ -116,6 +116,6 @@ jobs:
           # The v2.1.6 prebuilt binary was compiled with Go 1.24 and
           # refuses to lint projects targeting a newer Go version.
           # goinstall rebuilds golangci-lint with the toolchain from
-          # the setup-go step above (go.mod's 1.26.1), so the linter's
+          # the setup-go step above (go.mod's 1.26.10), so the linter's
           # Go version matches the target.
           install-mode: goinstall
