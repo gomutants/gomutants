@@ -913,7 +913,7 @@ jq -r '.files[].mutations[] | select(.status == "LIVED") | .id' report.json
 gomutants --run-mutant-id 'internal/cli/cli.go:parseArgs:CONDITIONALS_BOUNDARY#2' ./...
 ```
 
-You often won't need `jq`: when mutants survive, the end-of-run summary lists up to 10 of their ids and the flags that re-check one, and points at the report for the rest.
+You often won't need `jq`: when mutants survive, the end-of-run summary lists up to 10 of their ids with this command, and points at the report for the rest.
 
 A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. So is naming a mutant that another filter then drops — a `// gomutants:disable` directive, [`--exclude-calls`](#call-site-exclusion), or a `--changed-since` range that excludes its line — because the alternative is a run that tests nothing and exits 0. So is combining it with `--dry-run`, which returns before anything is compiled or tested. All of those exit **2**, the same as any other bad invocation. The id is checked against the source before coverage and the baseline, and again after; if an edit saved in between makes the second check fail, or makes the id name a different mutant, the run exits **1** instead — the command line was fine, and running again is the fix. The flag is CLI-only: there is no `run-mutant-id` config key, since a committed one would pin every later run to a single mutant.
 
