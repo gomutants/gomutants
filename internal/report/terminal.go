@@ -268,13 +268,15 @@ func (t *Terminal) Summary(r *Report) {
 const maxListedSurvivors = 10
 
 // Survivors prints the ids of the LIVED mutants in r, up to
-// maxListedSurvivors, and the --run-mutant-id command that re-checks one
-// of them. Without it a reader of the run's output has the count of
+// maxListedSurvivors, and the --run-mutant-id flags that re-check one of
+// them. Without it a reader of the run's output has the count of
 // survivors but neither their ids nor a way to verify a new test short of
-// a full rerun. packages are the run's own package arguments, so the
-// command re-checks the id against the scope it came from. Prints nothing
-// when no mutant lived.
-func (t *Terminal) Survivors(r *Report, reportPath string, packages []string) {
+// a full rerun. The hint adds the flags to the reader's own command rather
+// than printing one: only that command carries every flag the verdict
+// depends on (--integration, --config, --only, ...), quoted for their
+// shell. The flags must go before the packages, where flag parsing stops.
+// Prints nothing when no mutant lived.
+func (t *Terminal) Survivors(r *Report, reportPath string) {
 	livedStatus := mutator.StatusLived.String()
 	var ids []string
 	for _, f := range r.Files {
@@ -296,9 +298,8 @@ func (t *Terminal) Survivors(r *Report, reportPath string, packages []string) {
 		fmt.Fprintf(t.w, "  …and %d more in %s\n", rest, reportPath)
 	}
 	fmt.Fprintln(t.w)
-	fmt.Fprintln(t.w, "Check one after adding a test, without a full rerun:")
-	fmt.Fprintf(t.w, "  gomutants --run-mutant-id '<id>' --threshold-efficacy 100 %s\n", strings.Join(packages, " "))
-	fmt.Fprintln(t.w, "  (exit 0 = killed, 10 = still alive; repeat any other flags this run used, such as --integration)")
+	fmt.Fprintln(t.w, "Re-check one: re-run the same command, adding before the packages")
+	fmt.Fprintln(t.w, "  --run-mutant-id '<id>' --threshold-efficacy 100")
 	fmt.Fprintln(t.w)
 }
 

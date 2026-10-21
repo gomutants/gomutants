@@ -243,7 +243,7 @@ func livedReport(n int) *Report {
 }
 
 // TestSurvivorsExact pins the full Survivors output: only LIVED entries
-// are listed, in report order across files, followed by the command.
+// are listed, in report order across files, followed by the re-check hint.
 func TestSurvivorsExact(t *testing.T) {
 	var buf bytes.Buffer
 	term := NewTerminal(&buf, 0, false, false)
@@ -256,15 +256,14 @@ func TestSurvivorsExact(t *testing.T) {
 		{FileName: "b.go", Mutations: []MutationReport{
 			{ID: "b.go:G:CONDITIONALS_BOUNDARY#1", Status: "LIVED"},
 		}},
-	}}, "report.json", []string{"./..."})
+	}}, "report.json")
 
 	want := "Surviving mutants (2):\n" +
 		"  a.go:F:ARITHMETIC_BASE#2\n" +
 		"  b.go:G:CONDITIONALS_BOUNDARY#1\n" +
 		"\n" +
-		"Check one after adding a test, without a full rerun:\n" +
-		"  gomutants --run-mutant-id '<id>' --threshold-efficacy 100 ./...\n" +
-		"  (exit 0 = killed, 10 = still alive; repeat any other flags this run used, such as --integration)\n" +
+		"Re-check one: re-run the same command, adding before the packages\n" +
+		"  --run-mutant-id '<id>' --threshold-efficacy 100\n" +
 		"\n"
 	if got := buf.String(); got != want {
 		t.Errorf("Survivors output mismatch:\n got: %q\nwant: %q", got, want)
@@ -282,7 +281,7 @@ func TestSurvivorsNone(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			var buf bytes.Buffer
-			NewTerminal(&buf, 0, false, false).Survivors(r, "report.json", []string{"./..."})
+			NewTerminal(&buf, 0, false, false).Survivors(r, "report.json")
 			if buf.Len() != 0 {
 				t.Errorf("want no output, got %q", buf.String())
 			}
@@ -295,7 +294,7 @@ func TestSurvivorsNone(t *testing.T) {
 func TestSurvivorsCapBoundary(t *testing.T) {
 	t.Run("at cap", func(t *testing.T) {
 		var buf bytes.Buffer
-		NewTerminal(&buf, 0, false, false).Survivors(livedReport(maxListedSurvivors), "out/r.json", []string{"./..."})
+		NewTerminal(&buf, 0, false, false).Survivors(livedReport(maxListedSurvivors), "out/r.json")
 		got := buf.String()
 		if !strings.Contains(got, "  a.go:F:T#10\n\n") {
 			t.Errorf("want the 10th id followed by the blank line, got %q", got)
@@ -306,7 +305,7 @@ func TestSurvivorsCapBoundary(t *testing.T) {
 	})
 	t.Run("over cap", func(t *testing.T) {
 		var buf bytes.Buffer
-		NewTerminal(&buf, 0, false, false).Survivors(livedReport(maxListedSurvivors+1), "out/r.json", []string{"./..."})
+		NewTerminal(&buf, 0, false, false).Survivors(livedReport(maxListedSurvivors+1), "out/r.json")
 		got := buf.String()
 		if !strings.Contains(got, "Surviving mutants (11):\n") {
 			t.Errorf("want the full count in the heading, got %q", got)
@@ -318,16 +317,6 @@ func TestSurvivorsCapBoundary(t *testing.T) {
 			t.Errorf("want the 11th id left to the report, got %q", got)
 		}
 	})
-}
-
-// TestSurvivorsMultiplePackages: the command carries every package
-// argument of the run, space-separated.
-func TestSurvivorsMultiplePackages(t *testing.T) {
-	var buf bytes.Buffer
-	NewTerminal(&buf, 0, false, false).Survivors(livedReport(1), "report.json", []string{"./a", "./b"})
-	if want := "--threshold-efficacy 100 ./a ./b\n"; !strings.Contains(buf.String(), want) {
-		t.Errorf("want %q in output, got %q", want, buf.String())
-	}
 }
 
 // TestSummaryTTYLeadingNewline covers the `t.isTTY && !t.verbose` branch

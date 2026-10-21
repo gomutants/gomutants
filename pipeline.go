@@ -754,7 +754,7 @@ func (mr *mutationRun) writeReports() (*report.Report, error) {
 	// Under --run-mutant-id the command line already names the one
 	// mutant, so listing it with a command to re-run it says nothing new.
 	if mr.cfg.RunMutantID == "" {
-		mr.progress.Survivors(r, mr.cfg.Output, mr.opts.packages)
+		mr.progress.Survivors(r, mr.cfg.Output)
 	}
 
 	if err := report.WriteJSON(r, mr.cfg.Output); err != nil {
