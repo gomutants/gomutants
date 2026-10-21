@@ -80,7 +80,11 @@ import (
 //	    mutant that removed the last use of an import or local variable
 //	    failed on Go's unused checks instead, so v9 NOT_VIABLE entries can
 //	    be mutants that now compile (see patch.ApplyMutant) and must run.
-const SchemaVersion = 10
+//	v11: Likewise for a replacement that fused with the token next to it in
+//	    unformatted source (`return!ok` → `returnok`, `a<0` → `a<-1`), now
+//	    spaced off from it, so v10 NOT_VIABLE entries can again be mutants
+//	    that compile.
+const SchemaVersion = 11
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path

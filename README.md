@@ -943,7 +943,7 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 - [zizmor](https://github.com/zizmorcore/zizmor) — GitHub Actions workflow security scanning
 - [golangci-lint](https://golangci-lint.run/) — multi-linter static analysis
 
-**Test quality.** Unit + integration test suite (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end). Mutation testing gated per-PR (no LIVED mutant on changed lines), with 96.01% efficacy on the full `./internal/...` library tree — the tool is dogfooded on itself, gated by its own CI gate.
+**Test quality.** Unit, integration and fuzz test suites (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end; the fuzz targets check, among other things, that every mutant of any parseable Go file still parses). Mutation testing gated per-PR (no LIVED mutant on changed lines), with 96.01% efficacy on the full `./internal/...` library tree — the tool is dogfooded on itself, gated by its own CI gate.
 
 **Reporting vulnerabilities.** Open a [private GitHub Security Advisory](https://github.com/gomutants/gomutants/security/advisories/new).
 

@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("package A\nfunc A(A0[0])A{for 0%00=range A0{switch 0{case 0:;default:}}}")

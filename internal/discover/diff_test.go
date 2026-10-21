@@ -247,10 +247,11 @@ func TestParseUnifiedDiffEmpty(t *testing.T) {
 func TestParseHunkHeaderMalformed(t *testing.T) {
 	cases := []string{
 		"@@ no plus marker @@",
-		"@@+10",               // "+" present but no space after the range token
-		"@@ -1,2 +abc,def @@", // non-numeric start
-		"@@ -1,2 +1,abc @@",   // non-numeric count
-		"@@ -1,2 +0,1 @@",     // start <= 0
+		"@@+10",                           // "+" present but no space after the range token
+		"@@ -1,2 +abc,def @@",             // non-numeric start
+		"@@ -1,2 +1,abc @@",               // non-numeric count
+		"@@ -1,2 +0,1 @@",                 // start <= 0
+		"@@ -1 +9223372036854775807,2 @@", // end overflows; found by FuzzParseUnifiedDiff
 	}
 	for _, c := range cases {
 		if _, ok := parseHunkHeader(c); ok {
