@@ -48,7 +48,7 @@ faster than Mutago on that target. On the tiny matched target the ordering was
 effectively tied: all three completed within 8%.
 
 Pinned Gremlins v0.6.0 panics when executing these targets under Go 1.26.x,
-while the current gomutants module itself requires Go 1.26.1. The isolated Go
+while the current gomutants module itself requires Go 1.26.10. The isolated Go
 1.25.7 fixture is therefore necessary to put all three tools on one working
 toolchain. Gooze v1.0.1 remains excluded because the audited tag does not
 compile. See the [generated result](../benchmarks/results.md) and
