@@ -3,9 +3,12 @@ name: Mutation Testing
 permissions:
   contents: read
 
+# Only cancel superseded PR runs (fast, --changed-since). Post-merge runs on
+# main are full-tree (~2.5 h) and must run to completion — cancelling them
+# skips the Stryker Dashboard upload and leaves the badge stale.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 on:
   pull_request:
@@ -13,13 +16,36 @@ on:
     branches: [main]
 
 jobs:
-  mutation:
+  changes:
     runs-on: ubuntu-latest
-    # 30 min covers internal/... at -workers=2 on a GitHub-hosted
-    # Linux runner. main is excluded (see "Run mutation testing"
-    # comment below), so we don't need the longer integration-test
-    # budget that ./... required.
-    timeout-minutes: 30
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            code:
+              - '**/*.go'
+              - 'go.mod'
+              - 'go.sum'
+              - '.github/workflows/mutation.yml'
+
+  mutation:
+    needs: changes
+    # On push to main, always run (catches coverage rot in untouched code).
+    # On PRs, only run when Go source / module / workflow files changed —
+    # the gate emits a visible "skipped" status so branch protection can
+    # require this check.
+    if: github.event_name == 'push' || needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    # No timeout-minutes: the full-tree run on main (~4300 mutants at
+    # -workers=2, ~2.5 h) needs GitHub's 6 h default. PR runs are scoped
+    # by --changed-since and finish well inside it.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,13 +84,19 @@ jobs:
           # --changed-since value (`fatal: ambiguous argument '"origin/main"'`).
           args: -workers=2 -verbose --changed-since origin/${{ github.base_ref }} ./internal/...
 
-      # Post-merge full-tree run on the same internal/... scope. Same
-      # threshold-efficacy=100 gate (action default). --stryker-output
-      # writes the dashboard report consumed by the upload step below.
+      # Post-merge full-tree run on the same internal/... scope; gate on
+      # the absolute test_efficacy floor (catches coverage rot in code no
+      # PR happens to touch). The action's default of 100 can't hold on
+      # the full tree: the last completed runs (2026-07) measured
+      # 97.18–97.37%. Floor set to 95.0% to leave margin for run-to-run
+      # variance and the mutant population growing since. Ratchet up as
+      # tests improve. --stryker-output writes the dashboard report
+      # consumed by the upload step below.
       - name: Run mutation testing (full tree, post-merge)
         if: github.event_name == 'push'
         uses: gomutants/gomutants@00cee107527a0b5ea79f966babca731ff85bbb01 # v0.7.0
         with:
+          threshold-efficacy: "95.0"
           args: -workers=2 -verbose --stryker-output stryker-report.json ./internal/...
 
       # Push the Stryker-format report to the public dashboard so the
@@ -83,3 +115,19 @@ jobs:
             -H "Content-Type: application/json" \
             --data @stryker-report.json \
             "https://dashboard.stryker-mutator.io/api/reports/github.com/gomutants/gomutants/main"
+
+      - name: Upload mutation report
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: mutation-report
+          path: mutation-report.json
+          retention-days: 30
+
+      - name: Upload Stryker report
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stryker-report
+          path: stryker-report.json
+          retention-days: 30
