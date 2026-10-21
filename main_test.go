@@ -3161,3 +3161,35 @@ func TestSuiteDirs(t *testing.T) {
 		t.Errorf("suiteDirs = %v, want %v", got, want)
 	}
 }
+
+// TestWriteReportsRecheckHint: when a mutant lived, the summary is
+// followed by the flags that re-check one — except under --run-mutant-id,
+// whose command line already is the re-check.
+func TestWriteReportsRecheckHint(t *testing.T) {
+	for name, tc := range map[string]struct {
+		runMutantID string
+		want        bool
+	}{
+		"full run":        {want: true},
+		"--run-mutant-id": {runMutantID: "add.go:Add:ARITHMETIC_BASE#1"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			mr := &mutationRun{
+				cfg: config.Config{Output: filepath.Join(t.TempDir(), "report.json"), RunMutantID: tc.runMutantID},
+				mutants: []mutator.Mutant{{
+					StableID: "add.go:Add:ARITHMETIC_BASE#1", RelFile: "add.go", Status: mutator.StatusLived,
+				}},
+				term:     report.NewTerminal(&buf, 0, false, true),
+				progress: report.NewTerminal(&buf, 0, false, true),
+			}
+			if _, err := mr.writeReports(); err != nil {
+				t.Fatal(err)
+			}
+			got := buf.String()
+			if hint := strings.Contains(got, "Re-check a survivor: re-run the same command, adding before the packages\n"); hint != tc.want {
+				t.Errorf("hint=%v, want %v; output:\n%s", hint, tc.want, got)
+			}
+		})
+	}
+}

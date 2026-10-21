@@ -751,6 +751,11 @@ func (mr *mutationRun) writeReports() (*report.Report, error) {
 	// suppression sources share one bucket everywhere else.
 	r.MutantsSuppressedByCalls = len(mr.callSuppressed)
 	mr.progress.Summary(r)
+	// Under --run-mutant-id the command line already is the re-check, so
+	// the hint would say nothing new.
+	if mr.cfg.RunMutantID == "" {
+		mr.progress.RecheckHint(r)
+	}
 
 	if err := report.WriteJSON(r, mr.cfg.Output); err != nil {
 		return nil, fmt.Errorf("writing report: %w", err)

@@ -263,6 +263,21 @@ func (t *Terminal) Summary(r *Report) {
 	fmt.Fprintln(t.w)
 }
 
+// RecheckHint tells the reader how to re-check one LIVED mutant after
+// adding a test, without a full rerun. It names the flags to add to the
+// reader's own command rather than printing one: only that command
+// carries every flag the verdict depends on (--integration, --config,
+// --only, ...), quoted for their shell. The flags must go before the
+// packages, where flag parsing stops. Prints nothing when no mutant lived.
+func (t *Terminal) RecheckHint(r *Report) {
+	if r.MutantsLived == 0 {
+		return
+	}
+	fmt.Fprintln(t.w, "Re-check a survivor: re-run the same command, adding before the packages")
+	fmt.Fprintln(t.w, "  --run-mutant-id '<id>' --threshold-efficacy 100")
+	fmt.Fprintln(t.w)
+}
+
 // suppressedSources labels the Suppressed line with where the mutants
 // went. One source names itself; both split the count, so a reader can
 // tell how much of the drop came from a project-wide --exclude-calls
