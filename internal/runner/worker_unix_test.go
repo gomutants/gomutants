@@ -942,7 +942,7 @@ func TestWorkerTestRunDeadline(t *testing.T) {
 			}
 			// The re-check of a survivor gets a deadline of its own; only
 			// the routed run is under test.
-			if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, w.computeTimeout(m)); got != tc.want {
+			if got, _ := w.runGroups(context.Background(), m, w.routeGroups(m), false, w.computeTimeout(m)); got != tc.want {
 				t.Errorf("runGroups = %v, want %v", got, tc.want)
 			}
 		})
@@ -997,7 +997,7 @@ func TestWorkerTestRunFailures(t *testing.T) {
 			}
 			var got mutator.MutantStatus
 			captured := captureStderr(t, func() {
-				got = w.runGroups(context.Background(), m, w.routeGroups(m), false, tc.timeout)
+				got, _ = w.runGroups(context.Background(), m, w.routeGroups(m), false, tc.timeout)
 			})
 			if got != tc.want {
 				t.Errorf("runGroups = %v, want %v", got, tc.want)
@@ -1030,7 +1030,7 @@ func runPastDeadlineWithHeldOutput(t *testing.T, want string) {
 	fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} })
 	start := time.Now()
-	if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, 300*time.Millisecond); got != mutator.StatusTimedOut {
+	if got, _ := w.runGroups(context.Background(), m, w.routeGroups(m), false, 300*time.Millisecond); got != mutator.StatusTimedOut {
 		t.Errorf("runGroups = %v, want TIMED OUT", got)
 	}
 	if took := time.Since(start); took > 2*time.Second {
@@ -1051,7 +1051,7 @@ func TestWorkerTestBuildDeadline(t *testing.T) {
 	fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 3 & sleep 3"} },
 		func(string) []string { return []string{"true"} })
 	start := time.Now()
-	if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, time.Minute); got != mutator.StatusInfraError {
+	if got, _ := w.runGroups(context.Background(), m, w.routeGroups(m), false, time.Minute); got != mutator.StatusInfraError {
 		t.Errorf("runGroups = %v, want INFRA ERROR", got)
 	}
 	if took := time.Since(start); took > 2*time.Second {
@@ -1082,7 +1082,7 @@ func TestWorkerTestRunOutputIsNoBuild(t *testing.T) {
 		func(string) []string {
 			return []string{"sh", "-c", `printf 'FAIL\tm [build failed]\nresource temporarily unavailable\n'; exit 1`}
 		})
-	if got := w.runGroups(context.Background(), m, w.routeGroups(m), false, time.Minute); got != mutator.StatusKilled {
+	if got, _ := w.runGroups(context.Background(), m, w.routeGroups(m), false, time.Minute); got != mutator.StatusKilled {
 		t.Errorf("runGroups = %v, want KILLED: the output is the test's, not a build's", got)
 	}
 }
@@ -1132,6 +1132,96 @@ func TestWorkerTestRecheckStopsAtKill(t *testing.T) {
 	if want := []string{"m/app", "m/calc"}; !slices.Equal(*started, want) {
 		t.Errorf("runs = %v, want %v: nothing after m/calc's kill", *started, want)
 	}
+}
+
+// TestWorkerTestRecheckMemKillStaysLived: a survivor whose re-check goes
+// over the memory cap stays LIVED (#124). The re-check runs whole suites,
+// and the cap sums the whole group, so a suite whose tests start a linter
+// or an analyzer goes over it with any mutant at all, not this one's
+// runaway. As TIMED OUT the survivor drops out of the efficacy
+// denominator, and --threshold-efficacy passes on survivors.
+func TestWorkerTestRecheckMemKillStaysLived(t *testing.T) {
+	overCap := stubMemCap(t)
+	runs := 0
+	w, m, started := recheckWorker(t, 30*time.Second, func(string) []string {
+		// The routed run passes; the re-check's runs go over the cap.
+		runs++
+		if runs == 1 {
+			return []string{"true"}
+		}
+		overCap.Store(true)
+		return []string{"sleep", "0.5"}
+	})
+	var got mutator.Mutant
+	stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
+	if got.Status != mutator.StatusLived || !got.Rechecked {
+		t.Errorf("Status=%v Rechecked=%v, want a re-checked LIVED: the routed run passed, and the cap stopped only the re-check", got.Status, got.Rechecked)
+	}
+	if want := []string{"m/app", "m/calc", "m/app"}; !slices.Equal(*started, want) {
+		t.Errorf("runs = %v, want %v: each package of the re-check run", *started, want)
+	}
+	want := "gomutants: worker 0: testing m/calc went over the 2 MiB memory cap and was killed, skipping it in the re-check\n" +
+		"gomutants: worker 0: testing m/app went over the 2 MiB memory cap and was killed, skipping it in the re-check\n"
+	if stderr != want {
+		t.Errorf("stderr = %q, want %q", stderr, want)
+	}
+}
+
+// TestWorkerTestRecheckKillsAfterMemKill: a package of the re-check the
+// cap stopped is skipped, not the rest of the re-check, so a later
+// package's suite still kills the mutant.
+func TestWorkerTestRecheckKillsAfterMemKill(t *testing.T) {
+	overCap := stubMemCap(t)
+	runs := 0
+	w, m, started := recheckWorker(t, 30*time.Second, func(string) []string {
+		// The routed run passes, m/calc's re-check goes over the cap, and
+		// m/app's fails.
+		runs++
+		overCap.Store(runs == 2)
+		switch runs {
+		case 1:
+			return []string{"true"}
+		case 2:
+			return []string{"sleep", "0.5"}
+		}
+		return []string{"false"}
+	})
+	var got mutator.Mutant
+	captureStderr(t, func() { got = w.Test(context.Background(), m) })
+	if got.Status != mutator.StatusKilled || !got.Rechecked {
+		t.Errorf("Status=%v Rechecked=%v, want KILLED by m/app's re-check", got.Status, got.Rechecked)
+	}
+	if want := []string{"m/app", "m/calc", "m/app"}; !slices.Equal(*started, want) {
+		t.Errorf("runs = %v, want %v: m/app re-checked after m/calc's memory kill", *started, want)
+	}
+}
+
+// stubMemCap lowers the memory cap to 2 MiB, polled every 50ms, stubs out
+// the monitor's kill, and makes the probe read a group under the cap until
+// the returned switch is on, and way over it while it is.
+func stubMemCap(t *testing.T) *atomic.Bool {
+	t.Helper()
+	origCap := maxSubprocRSSBytes
+	origPoll := monitorPollInterval
+	origRSS := groupRSSFunc
+	origKill := syscallKillFunc
+	t.Cleanup(func() {
+		maxSubprocRSSBytes = origCap
+		monitorPollInterval = origPoll
+		groupRSSFunc = origRSS
+		syscallKillFunc = origKill
+	})
+	maxSubprocRSSBytes = 2 << 20
+	monitorPollInterval = 50 * time.Millisecond
+	overCap := new(atomic.Bool)
+	groupRSSFunc = func(int) (int64, error) {
+		if overCap.Load() {
+			return 999999 * 1024, nil
+		}
+		return 1024, nil
+	}
+	syscallKillFunc = func(int, syscall.Signal) error { return nil }
+	return overCap
 }
 
 // slowLinkDelay is how long slowLinkGoflags makes each test binary's link

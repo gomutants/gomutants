@@ -535,7 +535,10 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 	short := ShortFlagFromEnv()
 	defer w.removeBins()
 	routed := w.routeGroups(m)
-	status := w.runGroups(ctx, m, routed, short, w.computeTimeout(m))
+	status, killed := w.runGroups(ctx, m, routed, short, w.computeTimeout(m))
+	if killed != nil {
+		w.reportMemKill(killed, "treating as "+mutator.StatusTimedOut.String())
+	}
 	rechecked := false
 	if status == mutator.StatusLived {
 		if full := w.recheckGroups(m, routed); len(full) > 0 {
@@ -575,25 +578,27 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 //
 // A failed build or start ends the run like any other terminal outcome.
 // So does a cancelled ctx, which kills the build or run in flight or
-// fails the next one's start; the caller discards that outcome.
-func (w *Worker) runGroups(ctx context.Context, m mutator.Mutant, groups map[string][]string, short bool, timeout time.Duration) mutator.MutantStatus {
+// fails the next one's start; the caller discards that outcome. A build or
+// run the RSS monitor stopped ends it TimedOut, and is returned too, for
+// the caller to report (see reportMemKill).
+func (w *Worker) runGroups(ctx context.Context, m mutator.Mutant, groups map[string][]string, short bool, timeout time.Duration) (mutator.MutantStatus, *memKill) {
 	left := timeout
 	for _, run := range invocations(groups, m.Pkg) {
-		bin, status := w.buildBin(ctx, run.pkg)
+		bin, status, killed := w.buildBin(ctx, run.pkg)
 		if status != mutator.StatusLived {
-			return status
+			return status, killed
 		}
 		// A package without tests has no binary to run: its `go test`
 		// reports "no test files" and passes.
 		if bin != "" {
-			status, ran := w.runBin(ctx, m, run, bin, short, left)
+			status, ran, killed := w.runBin(ctx, m, run, bin, short, left)
 			if status != mutator.StatusLived {
-				return status
+				return status, killed
 			}
 			left -= ran
 		}
 	}
-	return mutator.StatusLived
+	return mutator.StatusLived, nil
 }
 
 // recheck runs each package in full in turn (see recheckGroups), the
@@ -604,9 +609,19 @@ func (w *Worker) runGroups(ctx context.Context, m mutator.Mutant, groups map[str
 // would run out on a mutant many suites link, turning a survivor
 // TIMED_OUT, which drops it from the efficacy denominator. A package the
 // routed run built a binary of runs that binary again.
+//
+// A package the RSS monitor stops is skipped, not TIMED_OUT, for the same
+// reason (#124): the cap sums every process its whole suite starts, so a
+// suite whose tests run a linter or an analyzer goes over it whatever the
+// mutant is, and the covering tests already passed.
 func (w *Worker) recheck(ctx context.Context, m mutator.Mutant, full map[string][]string, short bool) mutator.MutantStatus {
 	for _, pkg := range orderRoutePackages(full, m.Pkg) {
-		if status := w.runGroups(ctx, m, map[string][]string{pkg: nil}, short, w.policy.Global); status != mutator.StatusLived {
+		status, killed := w.runGroups(ctx, m, map[string][]string{pkg: nil}, short, w.policy.Global)
+		if killed != nil {
+			w.reportMemKill(killed, "skipping it in the re-check")
+			continue
+		}
+		if status != mutator.StatusLived {
 			return status
 		}
 	}
@@ -622,10 +637,11 @@ func (w *Worker) recheck(ctx context.Context, m mutator.Mutant, full map[string]
 // monitor stops a runaway compile or link, and buildTimeout one that
 // hangs: it kills the build's whole process group, so a tool `go` started
 // goes with it, and reads as InfraError, as a hung build is the host's
-// failure, not the mutant's verdict. ctx still cancels the build.
-func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.MutantStatus) {
+// failure, not the mutant's verdict. ctx still cancels the build. A build
+// the monitor stopped is returned as the kill.
+func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.MutantStatus, *memKill) {
 	if bin, ok := w.bins[pkg]; ok {
-		return bin, mutator.StatusLived
+		return bin, mutator.StatusLived, nil
 	}
 	// A file name flattened from the import path can collide (m/api_v1 and
 	// m/api/v1 both flatten to m_api_v1), so binaries are numbered instead.
@@ -639,19 +655,20 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 	proctree.Bound(cmd)
 	runErr, memKilled, err := w.runMonitored(cmd)
 	if err != nil {
-		return "", w.startFailure(err)
+		return "", w.startFailure(err), nil
 	}
 	// The monitor's kill fails the build too, so a nil error is a build
 	// that finished.
 	if runErr != nil {
 		if buildCtx.Err() == context.DeadlineExceeded {
 			fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s took over %v, treating as %s\n", w.id, pkg, buildTimeout, mutator.StatusInfraError)
-			return "", mutator.StatusInfraError
+			return "", mutator.StatusInfraError, nil
 		}
+		var killed *memKill
 		if memKilled {
-			w.reportMemKill("building", pkg)
+			killed = &memKill{doing: "building", pkg: pkg}
 		}
-		return "", classifyBuildFailure(runErr, memKilled, stdout.String(), stderr.String())
+		return "", classifyBuildFailure(runErr, memKilled, stdout.String(), stderr.String()), killed
 	}
 	if _, err := os.Stat(bin); err != nil {
 		bin = ""
@@ -660,7 +677,7 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 		w.bins = make(map[string]string)
 	}
 	w.bins[pkg] = bin
-	return bin, mutator.StatusLived
+	return bin, mutator.StatusLived, nil
 }
 
 // removeBins removes the current mutant's test binaries; the next mutant
@@ -680,7 +697,8 @@ func (w *Worker) removeBins() {
 // TIMED_OUT after timeout. It returns the run's outcome and how long the
 // run took against timeout: from its deadline's start, after the
 // arguments are read, which can wait on another worker's read and is no
-// time the tests took.
+// time the tests took. A run the RSS monitor stopped is returned as the
+// kill.
 //
 // The binary gets no -test.timeout: it would start its own clock along
 // with the deadline's, and its timeout panic, winning the race, would
@@ -691,16 +709,16 @@ func (w *Worker) removeBins() {
 // Its stderr goes to the same buffer as its stdout, as `go test` merges
 // them: the classifier reads one stream for a test's own failure markers,
 // and a panic is reported on stderr.
-func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) (mutator.MutantStatus, time.Duration) {
+func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) (mutator.MutantStatus, time.Duration, *memKill) {
 	dir, ok := w.pkgDir(m, run.pkg)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: no directory known for package %s, treating as %s\n", w.id, run.pkg, mutator.StatusInfraError)
-		return mutator.StatusInfraError, 0
+		return mutator.StatusInfraError, 0, nil
 	}
 	binArgs, err := w.binArgs.get(ctx, w.projectDir, w.tags, run.pkg, w.binFlags(short))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %v, treating as %s\n", w.id, err, mutator.StatusInfraError)
-		return mutator.StatusInfraError, 0
+		return mutator.StatusInfraError, 0, nil
 	}
 	start := time.Now()
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -714,14 +732,15 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 		// A deadline that ran out by the start (the routed run's earlier
 		// packages took all of it) fails the start with it.
 		if runCtx.Err() == context.DeadlineExceeded {
-			return mutator.StatusTimedOut, time.Since(start)
+			return mutator.StatusTimedOut, time.Since(start), nil
 		}
-		return w.startFailure(err), time.Since(start)
+		return w.startFailure(err), time.Since(start), nil
 	}
+	var killed *memKill
 	if memKilled {
-		w.reportMemKill("testing", run.pkg)
+		killed = &memKill{doing: "testing", pkg: run.pkg}
 	}
-	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), output.truncated), time.Since(start)
+	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), output.truncated), time.Since(start), killed
 }
 
 // pkgDir returns the directory pkg's test binary runs from: the mutated
@@ -745,12 +764,18 @@ func (w *Worker) startFailure(err error) mutator.MutantStatus {
 	return status
 }
 
-// reportMemKill reports that the RSS monitor killed a build or test run of
-// pkg. The mutant reads TIMED OUT either way, the same as one that ran out
-// its deadline, and this line is all that tells the two apart: a longer
-// timeout won't change a mutant the cap stopped.
-func (w *Worker) reportMemKill(doing, pkg string) {
-	fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s %s went over the %d MiB memory cap and was killed, treating as %s\n", w.id, doing, pkg, maxSubprocRSSBytes>>20, mutator.StatusTimedOut)
+// memKill is a build or test run of pkg the RSS monitor stopped at the cap.
+type memKill struct {
+	doing, pkg string
+}
+
+// reportMemKill reports that the RSS monitor killed k's build or test
+// run, and what the mutant's run made of it. Out of the re-check the
+// mutant reads TIMED OUT, the same as one that ran out its deadline, and
+// this line is all that tells the two apart: a longer timeout won't change
+// a mutant the cap stopped.
+func (w *Worker) reportMemKill(k *memKill, verdict string) {
+	fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s %s went over the %d MiB memory cap and was killed, %s\n", w.id, k.doing, k.pkg, maxSubprocRSSBytes>>20, verdict)
 }
 
 // runMonitored runs cmd (see makeCmd) under the RSS monitor and returns

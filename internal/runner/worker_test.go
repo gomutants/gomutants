@@ -744,7 +744,7 @@ func TestWorkerTestStartFailureClassifiesInfrastructureErrors(t *testing.T) {
 
 			var got mutator.MutantStatus
 			captured := captureStderr(t, func() {
-				_, got = w.buildBin(context.Background(), "p")
+				_, got, _ = w.buildBin(context.Background(), "p")
 			})
 			if got != mutator.StatusInfraError {
 				t.Errorf("Status=%v, want InfraError", got)
