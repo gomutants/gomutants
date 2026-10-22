@@ -591,11 +591,11 @@ func (w *Worker) runGroups(ctx context.Context, m mutator.Mutant, groups map[str
 		// A package without tests has no binary to run: its `go test`
 		// reports "no test files" and passes.
 		if bin != "" {
-			status, ran, killed := w.runBin(ctx, m, run, bin, short, left)
-			if status != mutator.StatusLived {
-				return status, killed
+			r := w.runBin(ctx, m, run, bin, short, left)
+			if r.status != mutator.StatusLived {
+				return r.status, r.killed
 			}
-			left -= ran
+			left -= r.ran
 		}
 	}
 	return mutator.StatusLived, nil
@@ -691,14 +691,22 @@ func (w *Worker) removeBins() {
 	w.bins = nil
 }
 
+// binRun is how a run of a test binary ended (see runBin).
+type binRun struct {
+	status mutator.MutantStatus
+	// ran is how long the run took against its deadline, for a run that
+	// finished: from the deadline's start, after the arguments are read,
+	// which can wait on another worker's read and is no time the tests
+	// took. A run that didn't finish ends the mutant's, so it has none.
+	ran time.Duration
+	// killed is set for a run the RSS monitor stopped.
+	killed *memKill
+}
+
 // runBin runs bin, the test binary of run.pkg, as `go test` runs it: from
 // the package's directory, filtered to run.tests, with the arguments `go
 // test` passes for the run's flags (see binArgsCache). The run is cut off
-// TIMED_OUT after timeout. It returns the run's outcome and how long the
-// run took against timeout: from its deadline's start, after the
-// arguments are read, which can wait on another worker's read and is no
-// time the tests took. A run the RSS monitor stopped is returned as the
-// kill.
+// TIMED_OUT after timeout.
 //
 // The binary gets no -test.timeout: it would start its own clock along
 // with the deadline's, and its timeout panic, winning the race, would
@@ -709,16 +717,16 @@ func (w *Worker) removeBins() {
 // Its stderr goes to the same buffer as its stdout, as `go test` merges
 // them: the classifier reads one stream for a test's own failure markers,
 // and a panic is reported on stderr.
-func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) (mutator.MutantStatus, time.Duration, *memKill) {
+func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) binRun {
 	dir, ok := w.pkgDir(m, run.pkg)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: no directory known for package %s, treating as %s\n", w.id, run.pkg, mutator.StatusInfraError)
-		return mutator.StatusInfraError, 0, nil
+		return binRun{status: mutator.StatusInfraError}
 	}
 	binArgs, err := w.binArgs.get(ctx, w.projectDir, w.tags, run.pkg, w.binFlags(short))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %v, treating as %s\n", w.id, err, mutator.StatusInfraError)
-		return mutator.StatusInfraError, 0, nil
+		return binRun{status: mutator.StatusInfraError}
 	}
 	start := time.Now()
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -732,15 +740,15 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 		// A deadline that ran out by the start (the routed run's earlier
 		// packages took all of it) fails the start with it.
 		if runCtx.Err() == context.DeadlineExceeded {
-			return mutator.StatusTimedOut, time.Since(start), nil
+			return binRun{status: mutator.StatusTimedOut}
 		}
-		return w.startFailure(err), time.Since(start), nil
+		return binRun{status: w.startFailure(err)}
 	}
-	var killed *memKill
+	r := binRun{status: classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), output.truncated), ran: time.Since(start)}
 	if memKilled {
-		killed = &memKill{doing: "testing", pkg: run.pkg}
+		r.killed = &memKill{doing: "testing", pkg: run.pkg}
 	}
-	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), output.truncated), time.Since(start), killed
+	return r
 }
 
 // pkgDir returns the directory pkg's test binary runs from: the mutated
