@@ -50,13 +50,13 @@ jobs:
 
       - name: Run mutation testing (PR, changed-since)
         if: github.event_name == 'pull_request'
-        uses: gomutants/gomutants@00cee107527a0b5ea79f966babca731ff85bbb01 # v0.7.0
+        uses: gomutants/gomutants@05a4b33ec0faacc1e36d259c4238aef860e40751 # v0.7.2
         with:
           args: -workers=2 -verbose --changed-since origin/${{ github.base_ref }} ./internal/...
 
       - name: Run mutation testing (full tree, post-merge)
         if: github.event_name == 'push'
-        uses: gomutants/gomutants@00cee107527a0b5ea79f966babca731ff85bbb01 # v0.7.0
+        uses: gomutants/gomutants@05a4b33ec0faacc1e36d259c4238aef860e40751 # v0.7.2
         with:
           threshold-efficacy: "95.0"
           args: -workers=2 -verbose --stryker-output stryker-report.json ./internal/...
