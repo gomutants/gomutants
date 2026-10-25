@@ -25,5 +25,5 @@ jobs:
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
-          SONAR_PROJECT_KEY: szhekpisov_gomutants
+          SONAR_PROJECT_KEY: gomutants_gomutants
         run: .github/scripts/check-sonarqube-findings.sh

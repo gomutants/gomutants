@@ -52,7 +52,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.10"
 
       - name: Build
         run: go build ./...
@@ -65,6 +65,42 @@ jobs:
 
       - name: Integration tests
         run: go test -run TestIntegration -v -timeout 5m .
+
+  fuzz:
+    needs: changes
+    if: |
+      always() &&
+      (github.event_name != 'pull_request' || needs.changes.outputs.code == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26.10"
+
+      - name: Run fuzz tests
+        # go test -fuzz takes one target in one package per run, so each
+        # entry is package:target.
+        run: |
+          set -euo pipefail
+          for spec in \
+            mutator:FuzzMutatorsKeepSourceParseable \
+            patch:FuzzApplyMutant \
+            coverage:FuzzParseBytes \
+            discover:FuzzParseUnifiedDiff \
+            discover:FuzzParseDirective \
+            discover:FuzzCallExcluder \
+            report:FuzzEscapeProperty \
+            report:FuzzEscapeMessage; do
+            pkg="${spec%%:*}"
+            target="${spec##*:}"
+            echo "=== Fuzzing $target for 30s ==="
+            go test -fuzz="^${target}$" -fuzztime=30s -run='^$' "./internal/${pkg}/"
+          done
 
   coverage:
     needs: changes
@@ -80,7 +116,7 @@ jobs:
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26.1"
+          go-version: "1.26.10"
 
       - name: Run tests with coverage
         # Scope to internal/ to match where mutation testing runs and to
@@ -91,7 +127,7 @@ jobs:
         run: go test -short -coverprofile=coverage.out ./internal/...
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           files: coverage.out
           token: ${{ secrets.CODECOV_TOKEN }}

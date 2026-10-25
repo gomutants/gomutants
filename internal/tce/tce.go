@@ -36,8 +36,8 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
-	"github.com/szhekpisov/gomutants/internal/patch"
+	"github.com/gomutants/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/patch"
 )
 
 // execCommandContext, writeFileFunc, and marshalFunc are package-level
@@ -105,7 +105,8 @@ func (d *Detector) referenceHash(ctx context.Context, importPath string) (string
 }
 
 // Check reports whether mutant m is equivalent to the original. It applies
-// m's byte patch to tmpSrcPath, writes an overlay mapping the original
+// m's byte patch to tmpSrcPath, through patch.ApplyMutant as the test run
+// does so both compile the same bytes, writes an overlay mapping the original
 // source path to that temp file, compiles the package with the same -S
 // flag plus -overlay, and compares the normalized assembly to the package
 // reference. tmpSrcPath and overlayPath are the caller's stable temp files
@@ -117,7 +118,7 @@ func (d *Detector) Check(ctx context.Context, m mutator.Mutant, tmpSrcPath, over
 	if !ok {
 		return false, fmt.Errorf("tce: source not cached: %s", m.File)
 	}
-	patched, err := patch.Apply(original, m.StartOffset, m.EndOffset, m.Replacement)
+	patched, err := patch.ApplyMutant(m.File, original, m.StartOffset, m.EndOffset, m.Replacement)
 	if err != nil {
 		return false, err
 	}

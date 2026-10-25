@@ -4,7 +4,7 @@ import (
 	"bytes"
 	_ "embed"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // htmlBundleJS is the vendored mutation-testing-elements UMD bundle. Embedded

@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // discoverFixture writes src as the only file of a temp package and runs
@@ -84,6 +84,19 @@ func TestNewCallExcluderRejectsMatchAllPattern(t *testing.T) {
 		if ce != nil {
 			t.Errorf("spec %q: want nil CallExcluder on error, got %+v", spec, ce)
 		}
+	}
+}
+
+// TestNewCallExcluderRejectsInvalidUTF8 covers a spec regexp can't compile:
+// QuoteMeta leaves an invalid byte as it is, so MustCompile would panic.
+// Found by FuzzCallExcluder.
+func TestNewCallExcluderRejectsInvalidUTF8(t *testing.T) {
+	ce, err := NewCallExcluder([]string{"log.Print*", "log.\x80"})
+	if err == nil {
+		t.Error("want error, got nil")
+	}
+	if ce != nil {
+		t.Errorf("want nil CallExcluder on error, got %+v", ce)
 	}
 }
 

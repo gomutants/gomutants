@@ -48,7 +48,7 @@ faster than Mutago on that target. On the tiny matched target the ordering was
 effectively tied: all three completed within 8%.
 
 Pinned Gremlins v0.6.0 panics when executing these targets under Go 1.26.x,
-while the current gomutants module itself requires Go 1.26.1. The isolated Go
+while the current gomutants module itself requires Go 1.26.10. The isolated Go
 1.25.7 fixture is therefore necessary to put all three tools on one working
 toolchain. Gooze v1.0.1 remains excluded because the audited tag does not
 compile. See the [generated result](../benchmarks/results.md) and
@@ -748,7 +748,7 @@ A future enhancement worth tracking: memoize the coverage profile on
 the cache so warm-cache no-op runs skip the `-count=1` step entirely.
 That would drop the single-package targets below ~1 s and the tsdb-4
 target to single-digit seconds. Filed as
-[issue #38](https://github.com/szhekpisov/gomutants/issues/38).
+[issue #38](https://github.com/gomutants/gomutants/issues/38).
 
 ## Property-based suites: `--test-flags`
 
@@ -767,28 +767,24 @@ whatever flag the framework exposes for its own iteration count:
 gomutants --changed-since main --test-flags '-short' ./...
 ```
 
-The flags reach the per-mutant runs, the coverage run, and the baseline
-run — never `go list` or the build steps, which is what makes this safe
-where `GOFLAGS=-short` is not. The trade is explicit: fewer checks means
+The flags reach the per-mutant runs, the coverage run, the baseline run,
+and the per-test coverage map — never package resolution, which is what
+makes this safe where `GOFLAGS=-short` is not. (Their build flags, such as
+`-tags` or `-race`, also reach the map's `go list -test`, which reads what
+each test binary links, so it sees the test files the runs compile.) The trade is explicit: fewer checks means
 fewer chances to catch a mutant, so this belongs on a fast pre-push gate,
 not on the run whose score you publish. Because the flags are part of the
 cache identity, the two runs keep separate cache generations and neither
 inherits the other's verdicts.
 
-Two things bound the speedup:
+The per-test timing phase applies the flags too: it compiles with the
+build flags among them and passes the rest to the test binary as
+`go test` would. So `-short` shrinks that phase as well, and its
+durations stay usable as adaptive deadlines.
 
-- **The per-test timing phase is not covered.** It compiles with
-  `go test -c` and drives the binary through `-test.*`-namespaced
-  flags, so `-short` would need translating. It runs every test once
-  at full cost no matter what `--test-flags` says. On a suite where
-  that phase is a large share of wall clock, the end-to-end win is
-  well short of the per-mutant ratio. Its durations also stop being
-  usable as deadlines once the flags change what runs, so adaptive
-  timeouts stand down and every mutant falls back to the global
-  `baseline × --timeout-coefficient` ceiling — a second-order cost,
-  since a hung mutant now occupies a worker for longer.
-- **Only the mutant loop scales down.** Discovery, the coverage run,
-  and compilation are unchanged, so the usual Amdahl ceiling applies.
+What bounds the speedup is that only the test runs scale down.
+Discovery and compilation are unchanged, so the usual Amdahl ceiling
+applies.
 
 Not benchmarked here — no target on this page exercises it.
 

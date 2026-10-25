@@ -12,7 +12,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 const directivePrefix = "gomutants:"
@@ -75,6 +75,15 @@ func FilterByDirectives(fset *token.FileSet, mutants []mutator.Mutant) ([]mutato
 // fall back to the read+parse path so this also tolerates partial caches.
 func FilterByDirectivesWithCache(fset *token.FileSet, mutants []mutator.Mutant, files map[string]*ParsedFile) ([]mutator.Mutant, []Suppression, error) {
 	return filterByDirectives(fset, mutants, files, os.Stderr)
+}
+
+// FilterByDirectivesTo is FilterByDirectivesWithCache with its warnings
+// written to warn instead of os.Stderr, for a pre-check whose files a
+// later FilterByDirectivesWithCache call indexes again: it holds them back
+// and prints them only when that later call will not run, so a malformed
+// directive is reported once either way.
+func FilterByDirectivesTo(fset *token.FileSet, mutants []mutator.Mutant, files map[string]*ParsedFile, warn io.Writer) ([]mutator.Mutant, []Suppression, error) {
+	return filterByDirectives(fset, mutants, files, warn)
 }
 
 func filterByDirectives(fset *token.FileSet, mutants []mutator.Mutant, files map[string]*ParsedFile, warn io.Writer) ([]mutator.Mutant, []Suppression, error) {

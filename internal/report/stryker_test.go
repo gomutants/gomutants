@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 func TestStrykerStatusMapping(t *testing.T) {

@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/coverage"
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/coverage"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // ResultCallback is called for each completed mutant.
@@ -21,13 +21,15 @@ type ResultCallback func(m mutator.Mutant)
 
 // ExecOpts bundles the inner `go test` knobs forwarded to each worker:
 // TestCPU (0 omits -cpu, letting go test default to GOMAXPROCS), Tags
-// (empty omits -tags), and TestFlags (user-supplied flags appended
-// verbatim; nil appends nothing). Grouped into one struct so NewPool stays
-// within a sane parameter count.
+// (empty omits -tags), TestFlags (user-supplied flags appended verbatim;
+// nil appends nothing), and GOROOT (the toolchain's, put first on PATH for
+// every test binary as `go test` does; empty leaves PATH alone). Grouped
+// into one struct so NewPool stays within a sane parameter count.
 type ExecOpts struct {
 	TestCPU   int
 	Tags      string
 	TestFlags []string
+	GOROOT    string
 }
 
 // Pool coordinates parallel mutation testing.
@@ -70,6 +72,10 @@ func NewPool(workers int, exec ExecOpts, policy TimeoutPolicy, tmpDir string, sr
 // Run tests all pending mutants in parallel, calling onResult for each
 // completion. Mutant statuses are updated in place on the input slice.
 func (p *Pool) Run(ctx context.Context, mutants []mutator.Mutant, onResult ResultCallback) {
+	// A run starts with a healthy RSS probe. Every monitor of an earlier Run
+	// has exited by now, so nothing can race this.
+	resetRSSProbe()
+
 	// Filter to only pending mutants.
 	var pending []int
 	for i, m := range mutants {
@@ -178,10 +184,12 @@ func failPending(mutants []mutator.Mutant, pending []int, onResult ResultCallbac
 // Run so the loop can be unit-tested directly: with a stub
 // newWorkerFunc, the test sees how many workers were created and what
 // childGOMAXPROCS each ended up with — neither of which is observable
-// through the pool's mutant return value.
+// through the pool's mutant return value. The workers share one read of
+// the arguments their test binaries are run with (see binArgsCache).
 func (p *Pool) createWorkers() []*Worker {
 	workers := make([]*Worker, 0, p.workers)
 	cap := childGOMAXPROCSFor(p.workers)
+	binArgs := &binArgsCache{}
 	for i := range p.workers {
 		w, err := newWorkerFunc(i, p.tmpDir, p.policy, p.srcCache, p.projectDir, p.testMap)
 		if err != nil {
@@ -191,7 +199,9 @@ func (p *Pool) createWorkers() []*Worker {
 		w.childGOMAXPROCS = cap
 		w.testCPU = p.exec.TestCPU
 		w.tags = p.exec.Tags
+		w.goroot = p.exec.GOROOT
 		w.testFlags = p.exec.TestFlags
+		w.binArgs = binArgs
 		workers = append(workers, w)
 	}
 	return workers
@@ -232,8 +242,8 @@ func mutantLess(a, b mutator.Mutant) bool {
 // it is no longer read as a package — it is forwarded to the test binary
 // as a positional argument and `go test` falls back to `.`. A test-binary
 // flag (`-rapid.checks=N`) ahead of the packages therefore measures the
-// working directory instead of them. See buildTestArgs for the same
-// ordering on the mutant runs.
+// working directory instead of them. See Worker.buildArgs for the same
+// ordering on the mutant builds.
 func MeasureBaseline(ctx context.Context, projectDir string, packages []string, tags string, testFlags []string) (time.Duration, error) {
 	args := []string{"test", "-count=1"}
 	if tags != "" {

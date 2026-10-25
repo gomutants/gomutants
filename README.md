@@ -1,9 +1,9 @@
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/szhekpisov/gomutants/badge)](https://scorecard.dev/viewer/?uri=github.com/szhekpisov/gomutants)
-[![codecov](https://codecov.io/gh/szhekpisov/gomutants/graph/badge.svg?token=XNXMEJDGV2)](https://codecov.io/gh/szhekpisov/gomutants)
-[![Mutation testing badge](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fszhekpisov%2Fgomutants%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/szhekpisov/gomutants/main)
-[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=szhekpisov_gomutants&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=szhekpisov_gomutants)
-[![Security & Static Analysis](https://github.com/szhekpisov/gomutants/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/szhekpisov/gomutants/actions/workflows/security.yml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/szhekpisov/gomutants.svg)](https://pkg.go.dev/github.com/szhekpisov/gomutants)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/gomutants/gomutants/badge)](https://scorecard.dev/viewer/?uri=github.com/gomutants/gomutants)
+[![codecov](https://codecov.io/gh/gomutants/gomutants/graph/badge.svg?token=XNXMEJDGV2)](https://codecov.io/gh/gomutants/gomutants)
+[![Mutation testing badge](https://img.shields.io/endpoint?style=flat&url=https%3A%2F%2Fbadge-api.stryker-mutator.io%2Fgithub.com%2Fgomutants%2Fgomutants%2Fmain)](https://dashboard.stryker-mutator.io/reports/github.com/gomutants/gomutants/main)
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=gomutants_gomutants&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=gomutants_gomutants)
+[![Security & Static Analysis](https://github.com/gomutants/gomutants/actions/workflows/security.yml/badge.svg?branch=main)](https://github.com/gomutants/gomutants/actions/workflows/security.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/gomutants/gomutants.svg)](https://pkg.go.dev/github.com/gomutants/gomutants)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # gomutants
@@ -40,7 +40,7 @@ The targeted command bypasses the old cached verdict, runs the tests that cover 
 - **Work on the change, not the repository.** `--changed-since <ref>` uses the merge base and includes uncommitted edits to tracked files, keeping local and pull-request runs focused on the code being developed. A brand-new file is invisible to git diff until it is staged, so `git add` it before trusting the count.
 - **Run only the relevant tests.** Per-test coverage routing maps each mutant to the tests that cover its line; `--integration` extends that routing across importing packages when the real assertion lives downstream.
 - **Verify one fix directly.** Stable mutant IDs and unique prefixes turn “did this test kill it?” into one targeted run rather than another full mutation pass.
-- **Keep completed work.** The default content-addressed cache reuses a verdict only while the mutated source and its relevant tests remain byte-identical. Mid-run checkpoints also let interrupted runs resume instead of starting over.
+- **Keep completed work.** The default content-addressed cache reuses a verdict only while the mutated file, the rest of its package, and the tests that could exercise it all remain byte-identical. Mid-run checkpoints also let interrupted runs resume instead of starting over.
 - **Make the workflow repeatable.** An auto-loaded [`.gomutants.yml`](#configuration-file) keeps operators, exclusions, thresholds, routing, timeouts, and cache behavior with the project; CLI flags can override it for one run.
 - **Keep the working tree clean.** Byte-level overlays preserve Go syntax, including generics, without copying or editing source files.
 - **Get an actionable result.** Terminal diffs, JSON, Stryker, self-contained HTML, GitHub annotations, and the Claude Code plugin put each survivor where a developer or coding agent can act on it.
@@ -55,7 +55,7 @@ On the published Apple M1 Pro benchmark, unchanged out-of-the-box reruns complet
 | prometheus/model/labels | 342 s | **2.8 s** | **~120×** |
 | prometheus tsdb-4 | 2768 s (~46 min) | **19 s** | **~145×** |
 
-These are unchanged-tree reruns, not a claim that all edits are free: changing source or covering tests invalidates the affected cached verdicts. The cold-OOB column runs the full mutator set and is a single run on these targets, so it is not comparable to the matched-operator, 3-run-median engine timings below. Cold-engine ordering also depends on the target; gremlins is faster on the smallest measured external project, while gomutants leads the measured medium single-package targets. See the [benchmark snapshot](#benchmark-snapshot) and [`docs/performance.md`](docs/performance.md) for methodology and reproduction commands.
+These are unchanged-tree reruns, not a claim that all edits are free: editing a package's source or its tests invalidates that package's cached verdicts. The cold-OOB column runs the full mutator set and is a single run on these targets, so it is not comparable to the matched-operator, 3-run-median engine timings below. Cold-engine ordering also depends on the target; gremlins is faster on the smallest measured external project, while gomutants leads the measured medium single-package targets. See the [benchmark snapshot](#benchmark-snapshot) and [`docs/performance.md`](docs/performance.md) for methodology and reproduction commands.
 
 ## Table of Contents
 
@@ -97,7 +97,7 @@ These are unchanged-tree reruns, not a claim that all edits are free: changing s
 ### Go Install
 
 ```bash
-go install github.com/szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
+go install github.com/gomutants/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
 ```
 
 Make sure `$GOPATH/bin` is in your `PATH`:
@@ -116,7 +116,7 @@ gomutants is published as a composite action:
 - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
   with:
     fetch-depth: 0  # required so --changed-since can reach the base ref
-- uses: szhekpisov/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
+- uses: gomutants/gomutants@5741a097e347d75afdd7894464e8c2f612281dd4 # v0.5.0
   with:
     args: --changed-since origin/${{ github.base_ref }} ./...
 ```
@@ -136,13 +136,13 @@ See [`action.yml`](action.yml) for the full composite definition.
 
 ### Direct binary download
 
-Binaries for Linux and macOS (amd64 and arm64) are attached to every [release](https://github.com/szhekpisov/gomutants/releases):
+Binaries for Linux and macOS (amd64 and arm64) are attached to every [release](https://github.com/gomutants/gomutants/releases):
 
 ```bash
 VERSION=0.5.0  # check the releases page for the latest stable
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
-curl -fL "https://github.com/szhekpisov/gomutants/releases/download/v${VERSION}/gomutants_${VERSION}_${OS}_${ARCH}.tar.gz" \
+curl -fL "https://github.com/gomutants/gomutants/releases/download/v${VERSION}/gomutants_${VERSION}_${OS}_${ARCH}.tar.gz" \
   | tar -xz
 sudo mv gomutants /usr/local/bin/
 ```
@@ -152,7 +152,7 @@ See [Verifying Releases](#verifying-releases) below to check signatures and prov
 ### From Source
 
 ```bash
-git clone https://github.com/szhekpisov/gomutants.git
+git clone https://github.com/gomutants/gomutants.git
 cd gomutants
 go build ./...
 ./gomutants --version
@@ -173,9 +173,10 @@ Published release artifacts are append-only and signed. Every release includes:
 **Verify the checksums signature:**
 
 ```bash
+# Releases up to v0.6.1 were signed when the repo lived at szhekpisov/gomutants.
 cosign verify-blob checksums.txt \
   --bundle checksums.txt.sigstore.json \
-  --certificate-identity-regexp 'https://github.com/szhekpisov/gomutants/' \
+  --certificate-identity-regexp '^https://github.com/(szhekpisov|gomutants)/gomutants/' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com'
 
 # Linux
@@ -188,7 +189,7 @@ shasum -a 256 --check checksums.txt --ignore-missing
 
 ```bash
 gh attestation verify gomutants_<VERSION>_linux_amd64.tar.gz \
-  --repo szhekpisov/gomutants
+  --repo gomutants/gomutants
 ```
 
 </details>
@@ -299,7 +300,7 @@ reproduction commands.
 
 - **`--changed-since <ref>`** — scope mutation testing to lines changed vs a git ref. Fast enough to gate every PR.
 - **Per-test coverage routing** — each mutant runs only the tests whose coverage touches the mutated line, not the whole suite.
-- **Incremental cache** — content-addressed; warm reruns skip mutants whose source bytes and tests are byte-identical to the previous run (120–150× speedup on warm reruns).
+- **Incremental cache** — content-addressed; warm reruns skip mutants whose package sources and covering tests are byte-identical to the previous run (120–150× speedup on warm reruns).
 - **Resumable runs** — the cache is checkpointed mid-run, so a run killed by an OOM, a CI timeout, or a double Ctrl-C resumes from the last checkpoint instead of starting over.
 - **Adaptive per-mutant timeouts** — deadlines sized from recorded per-test durations × margin, so fast tests don't wait out a multi-minute global ceiling.
 - **Byte-level patching via `go test -overlay`** — generics and all Go syntax survive intact; source tree never modified.
@@ -350,11 +351,12 @@ It routes each mutant to the covering tests in **any** package that imports it. 
 
 - computes the reverse-dependency closure of the target packages (every package whose imports *or test imports* reach a target) and widens coverage collection and the per-test build to that set;
 - pins `-coverpkg` to the target packages so importing tests record coverage on the mutated code (passing `--coverpkg` as well is an error);
-- runs each covering package's tests in its own `go test` invocation, short-circuiting on the first kill.
+- runs each covering package's tests in its own `go test` invocation, short-circuiting on the first kill;
+- re-checks a mutant those tests don't kill against the full suite of every package whose test binary links the mutant's package.
 
 Trade-offs:
 
-- **Slower.** The per-test coverage build expands to the reverse-dependency closure, and `-coverpkg` instrumentation adds overhead. The closure keeps this bounded to packages that can actually reach a target, but on large modules it's a real cost.
+- **Slower.** The per-test coverage build expands to the reverse-dependency closure, and `-coverpkg` instrumentation adds overhead. The closure keeps this bounded to packages that can actually reach a target, but on large modules it's a real cost. Each survivor also runs the full suites of every package that links its own, and its cache entry is keyed on all of their files, so a test edit in any of them re-runs it.
 - **Scores aren't comparable** to a non-integration run: mutants flip `LIVED`/`NOT COVERED` → `KILLED`, raising efficacy and mutant coverage. Pick one mode per gate.
 - Default (per-package) routing remains the recommended path; reach for `--integration` only when your suite deliberately asserts behavior across package boundaries.
 
@@ -415,7 +417,7 @@ This repo ships a [Claude Code](https://claude.com/claude-code) plugin that expo
 Install:
 
 ```text
-/plugin marketplace add szhekpisov/gomutants
+/plugin marketplace add gomutants/gomutants
 /plugin install gomutants@gomutants
 ```
 
@@ -427,7 +429,7 @@ Use:
 /gomutants:mutants --since HEAD~1     # scope by git ref
 ```
 
-The plugin assumes `gomutants` is on `PATH` (`go install github.com/szhekpisov/gomutants@latest`), and falls back to `go run github.com/szhekpisov/gomutants@latest` otherwise. Plugin sources live under [`plugin/`](plugin/); the marketplace manifest is at [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json).
+The plugin assumes `gomutants` is on `PATH` (`go install github.com/gomutants/gomutants@latest`), and falls back to `go run github.com/gomutants/gomutants@latest` otherwise. Plugin sources live under [`plugin/`](plugin/); the marketplace manifest is at [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json).
 
 ### Inline Ignore Directives
 
@@ -543,7 +545,7 @@ The pattern is matched against the call's selector as written in the source:
 
 ```yaml
 workers: 10
-test-cpu: 0             # 0 = let go test use GOMAXPROCS
+test-cpu: 0             # 0 = let the tests use GOMAXPROCS
 timeout-coefficient: 10
 adaptive-timeout: true  # per-test adaptive sizing; set false for single global timeout
 timeout-margin: 3.0     # multiplier on per-test sums (only when adaptive)
@@ -565,6 +567,20 @@ exclude-calls-defaults: true # false = drop the built-ins and use only the list 
 Priority: built-in defaults < config file < CLI flags. See [`.gomutants.yml.example`](.gomutants.yml.example) for a complete reference.
 
 ### Mutators
+
+`gomutants --list-mutators` prints the authoritative catalog for the installed
+binary, one mutator per line with a description and representative example. It
+does not require a Go module or configuration file, so it can be used anywhere
+to check names before adding them to `--only`, `--disable`, or an inline
+directive:
+
+```console
+$ gomutants --list-mutators | grep RETURN
+RETURN_ERROR_NIL            Swallow a propagated error            return nil, err -> return nil, nil
+RETURN_FALSE                Force a boolean return false          return x > 0 -> return false
+RETURN_TRUE                 Force a boolean return true           return x > 0 -> return true
+RETURN_ZERO                 Return the zero value instead         return count -> return 0
+```
 
 **Token-level:**
 
@@ -625,7 +641,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | LIVED | Tests passed — **test gap** |
 | NOT COVERED | No test covers the mutated line |
 | NOT VIABLE | Mutation causes a compile error (filtered, not counted as a kill) |
-| TIMED OUT | Test execution exceeded the per-mutant timeout |
+| TIMED OUT | Test execution exceeded the per-mutant timeout, or the build or test run went over the 2 GiB memory cap (logged as `went over the 2048 MiB memory cap`; a longer `--timeout-*` won't help those). Not counted as a kill |
 | INFRA ERROR | A recognized host resource or I/O failure prevented a reliable verdict |
 
 ### All Flags
@@ -636,14 +652,14 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | Flag | Short | Default | Description |
 |------|-------|---------|-------------|
 | `--workers` | `-w` | NumCPU | Parallel workers |
-| `--test-cpu` | | 0 (omit) | Value passed to inner `go test -cpu` per mutant; 0 lets go test use `GOMAXPROCS` |
+| `--test-cpu` | | 0 (omit) | `-cpu` value for each mutant's test runs, passed to the test binary as `-test.cpu`; 0 lets the tests use `GOMAXPROCS` |
 | `--timeout-coefficient` | | 10 | Multiplier applied to baseline test time for the **global timeout ceiling** (also the per-mutant timeout when `--adaptive-timeout=false`) |
 | `--adaptive-timeout` | | true | Use the per-test durations recorded during the coverage build to size each mutant's timeout. Pass `=false` to fall back to the single global ceiling. |
-| `--timeout-margin` | | 3.0 | When adaptive: `per-mutant timeout = sum(selected test durations) × this`, clamped to `[--timeout-min, --timeout-coefficient × baseline]` |
+| `--timeout-margin` | | 3.0 | When adaptive: `per-mutant timeout = sum(selected test durations) × this`, clamped to `[--timeout-min, --timeout-coefficient × baseline]`. It bounds running the tests; building their binaries happens first, outside it. |
 | `--timeout-min` | | 2s | Floor for the per-mutant adaptive timeout. Absorbs cold-start, child fork, and GC pause overhead that doesn't scale with the underlying test work. |
 | `--coverpkg` | | | Coverage package pattern (forwarded to `go test -coverpkg`) |
 | `--tags` | | | Comma-separated build tags forwarded as `-tags` to every inner `go list` / `go test` (including `go test -c`/`-list`), so mutation testing reaches code behind `//go:build` constraints (gremlins-compat) |
-| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Part of the cache identity, so changing the value discards cached verdicts rather than replaying them. Setting it also stands adaptive timeouts down to the global ceiling, since the per-test timings are measured without these flags. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
+| `--test-flags` | | | Flags forwarded verbatim to the inner `go test` runs and to nothing else. Whitespace-separated and repeatable. Part of the cache identity, so changing the value discards cached verdicts rather than replaying them. Use it to trade mutation fidelity for speed on property-based suites — see [Speeding up property-based suites](#speeding-up-property-based-suites) |
 | `--output` | `-o` | `mutation-report.json` | JSON report path |
 | `--config` | | `.gomutants.yml` | Config file path |
 | `--disable` | | | Comma-separated mutator types to disable |
@@ -653,7 +669,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--exclude-calls-defaults` | | true | Apply the built-in `--exclude-calls` set for Go's standard-library logging (`log.Print*`, `slog.Info*`, …). Pass `=false` to narrow or fully replace it. |
 | `--changed-since` | | | Only test mutants on lines changed vs the merge base of the given git ref and `HEAD` (e.g. `main`, `HEAD~1`); requires a git repo |
 | `--run-mutant-id` | | | Run only the mutant with this stable `id` (the `id` field of a report entry); a unique prefix is accepted. Skips the incremental cache for that mutant. See [Re-running a single mutant](#re-running-a-single-mutant) |
-| `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source and tests are byte-identical to the cached run. Pass `--cache=off` to disable. |
+| `--cache` | | `.gomutants-cache.json` | Path to incremental-analysis cache file. Skips mutants whose source package and covering tests are byte-identical to the cached run — invalidation is package-scoped, so editing one file re-runs its package. Pass `--cache=off` to disable. |
 | `--checkpoint-interval` | | 10s | How often to flush completed mutant outcomes to the cache mid-run, so a hard kill (OOM, CI timeout, SIGKILL) loses at most this much progress and the next run resumes from the last checkpoint. `0` disables periodic checkpointing (the cache is then written only once, at the end). Ignored when `--cache=off`. |
 | `--detect-equivalent` | | false | After testing, recompile each surviving mutant with package-scoped `-gcflags=-S` and reclassify it as `EQUIVALENT` when the generated assembly is identical to the original (Trivial Compiler Equivalence). Equivalent mutants can't be killed by any test, so they're dropped from the efficacy denominator. Adds one package compile per survivor. |
 | `--integration` | | false | Route each mutant to covering tests in *any* package that imports it, not just its own. Widens coverage and the per-test build to the reverse-dependency closure of the target packages and manages `-coverpkg` itself (passing `--coverpkg` too is an error). Lets a mutant be killed by a cross-package/E2E test. See [Cross-Package Mode](#cross-package-mode). |
@@ -665,6 +681,7 @@ Each return slot is claimed by exactly one of these, based on the type declared 
 | `--dry-run` | | false | List mutants without testing |
 | `--verbose` | `-v` | false | Stream each mutant as tested |
 | `--quiet` | `-q` | false | Suppress header, phase lines, and per-mutant progress; only the final summary lands on stdout (warnings still go to stderr). Mutually exclusive with `--verbose`. |
+| `--list-mutators` | | false | Print every registered mutator type with its description and a representative example, then exit. Requires no module, package argument, or configuration file. |
 | `--version` | | | Print version and exit |
 
 </details>
@@ -687,7 +704,8 @@ gomutants -v ./...
 # Quiet for CI: only the final summary on stdout (exit code still gates).
 gomutants -q --threshold-efficacy 80 ./...
 
-# Limit to specific mutators (or exclude some).
+# Inspect, select, or exclude mutators.
+gomutants --list-mutators
 gomutants --only ARITHMETIC_BASE,CONDITIONALS_NEGATION ./...
 gomutants --disable BRANCH_IF,BRANCH_ELSE ./...
 
@@ -725,8 +743,15 @@ gomutants --changed-since main --test-flags '-short' ./...
 Four things to know:
 
 - **`go test` only.** The flags reach the per-mutant runs, the coverage run,
-  and the baseline run — never `go list` or the build steps. This is why
-  `GOFLAGS` is not a workaround. Go applies a GOFLAGS entry only "when the
+  the baseline run, and the per-test coverage map — never package
+  resolution. The one `go list` they reach is the map's `go list -test`
+  under `--integration` or `--coverpkg`, which reads what each test binary
+  links, and only their build flags reach it, so it sees the test files the
+  runs compile. The map and the per-mutant runs compile test binaries with
+  `go test -c` and run them directly, so gomutants splits your flags as
+  `go test` would:
+  build flags such as `-race` or `-tags` go to the compile, the rest to
+  the binary. This is why `GOFLAGS` is not a workaround. Go applies a GOFLAGS entry only "when the
   given flag is known by the current command" (`go help environment`), so
   you cannot say which invocations a flag reaches: `-short` is silently
   ignored by `go list` and `go test -c`, while `-race` is honored by them.
@@ -746,19 +771,10 @@ Four things to know:
   Whitespace-only differences don't count as a change. Flag order does:
   arbitrary test-binary flags can interact while they are parsed, so the
   cache conservatively keeps `-race -short` and `-short -race` separate.
-- **The per-test timing phase does not see the flags,** so adaptive timeouts
-  stand down. That phase compiles with `go test -c` and runs the binary
-  directly with `-test.*`-namespaced flags, where `-short` would need
-  translating. Its durations therefore describe a run your flags have
-  changed, which is unusable as a deadline in either direction — under
-  `-race` a deadline measured without it would fire early, turning survivors
-  into `TIMED_OUT` and quietly dropping them out of the efficacy
-  denominator. With `--test-flags` set, every mutant gets the global
-  `baseline × --timeout-coefficient` ceiling instead (the baseline *is*
-  measured with your flags), exactly as under `--adaptive-timeout=false`.
-  This also caps the speedup: the timing phase runs each test once at full
-  cost regardless, so a suite dominated by it improves less than the
-  per-mutant arithmetic suggests.
+- **Adaptive timeouts keep working.** The per-test timings come from the
+  coverage map's runs, which apply the same flags, so they describe the
+  runs they size: a `-race` deadline is measured under `-race`, and
+  `-short` shrinks the timing phase along with the mutant runs.
 
 Your flags are placed **after** the package argument, which is what lets
 flags belonging to the *test binary* rather than to `go test` work at all.
@@ -804,26 +820,27 @@ so `--test-flags '-race -args -x'` works either way.
 2. **Collect coverage** with `go test -coverprofile`. Mutants on uncovered lines are filtered upfront as `NOT_COVERED`.
 3. **Measure baseline test time** to set the global timeout ceiling (`baseline × --timeout-coefficient`). With `--adaptive-timeout=false` this also becomes every mutant's deadline.
 4. **Discover mutants** by walking the AST and emitting byte-level patches. Address-of `&` is recognised and skipped; unary `-` is emitted by exactly one mutator.
-5. **Build per-test coverage map.** Test binaries are compiled once; each test runs in isolation with `-test.run=<one>` to record the lines it covers — and its wall-time, used for adaptive per-mutant timeouts.
+5. **Build per-test coverage map.** Test binaries are compiled once; each test runs in isolation with `-test.run=<one>` to record the lines it covers — and its wall-time, used for adaptive per-mutant timeouts. Like every run of a test binary, it gets the environment `go test` gives one: `$GOROOT/bin` first on `PATH`, so a test that runs `go` gets the toolchain that built it.
 6. **Test mutants** in parallel:
    - Each worker owns a stable temp source file + overlay JSON.
    - Mutations are applied as byte-level patches; the original tree is never written to.
-   - The mutant's covered tests are looked up; only those run via `go test -overlay -run=<regex>`.
-   - Each `go test` child runs in its own process group with a 2 GiB RSS cap; output is capped at 1 MiB per stream.
+   - The mutant's covered tests are looked up. The test binary of each package they are in is built with the mutant in place (`go test -c -overlay`), then run from the package's directory with `$GOROOT/bin` first on `PATH`, as `go test` runs it, and `-test.run=<regex>`, so only those tests run. The per-mutant deadline starts once the binary is built: it bounds the tests, not the compile and link, which on a heavy package under `--workers` contention can take longer than any deadline sized from a fast test.
+   - A mutant they don't kill is re-checked against its whole package (with `--integration` or `--coverpkg`, every package whose tests link it) before it is reported `LIVED`. The coverage map records each test run alone, so a test that only reaches a line after another test has set something up — it fails, skips or hangs alone — is missing from it; the re-check runs the suites in their normal order. Killed mutants keep the speed of routing; only survivors pay for a full run. The summary's `Re-checked` line counts them, and how many the re-check killed. A test that fails or times out when run alone is left out of the map, since routing a mutant to it alone would fail whatever the mutant does. For the same reason, every group of two or more tests that covers a mutated line is run together once, without any mutant, while the map is built: tests that each pass alone can still fail together, when one leaves state behind that breaks another and the full suite resets it in between. A group that fails is no longer routed to — its lines run their package's whole suite — and a warning names the first such group.
+   - Each build and each test binary runs in its own process group with a 2 GiB RSS cap; output is capped at 1 MiB per stream. A group over the cap is killed and the mutant reported `TIMED OUT`, like one past its deadline, since both are the mutant running away; a line on stderr (`gomutants: worker N: testing <pkg> went over the 2048 MiB memory cap and was killed, treating as TIMED OUT`, or `building <pkg>` for a compile or link) tells the two apart. The cap is checked once a second, so a container or cgroup limit not far above it can still OOM-kill first (see `INFRA ERROR` below). Windows has no RSS cap; the deadline is the only backstop there. A test binary cut off at its deadline is killed with its whole process group, so a process a test started can't outlive it. A build gets no per-mutant deadline, only a 10-minute stop for one that hangs (on a module proxy, a stuck `-toolexec`): it is killed with its process group and reported as `INFRA ERROR`.
    - Recognized resource and I/O failures in test output, command startup, or gomutants' per-mutant temp-file writes are reported as `INFRA ERROR`, not as false kills. Detection is scoped by how far the input can be trusted, so a real kill is never laundered into a non-result:
      - gomutants' own failed syscalls are matched on the errno (`ENOSPC`, `ENOMEM`, `EMFILE`, …), which survives a wrapper rewriting the message and can't be produced by the code under test.
      - If any test reported a failure of its own (`--- FAIL:`), or the binary aborted on a `panic:`, the mutation was detected: `KILLED`, whatever else the output holds. The panic case is what catches a mutation that provokes a host error indirectly — dropping a `defer f.Close()` until a background goroutine panics with `too many open files`.
-     - Otherwise the phase decides which wordings count. Before the test binary runs, `[build failed]`/`[setup failed]` output is entirely toolchain-authored, so generic phrasings are unambiguous there (`go: fork/exec …/compile: resource temporarily unavailable`, `ld: out of memory allocating …`). Once tests are running, `go test` merges their output into the same stream, so only phrasings a test is unlikely to print itself count — `fatal error: out of memory`, never a bare `out of memory`.
-     - A `signal: killed` gomutants did not send is `INFRA ERROR`: the RSS monitor's own kill and the per-mutant deadline are both classified as `TIMED OUT` before this is reached, so what is left is an outside hand — typically a cgroup limit below the monitor's 2 GiB ceiling, which the kernel enforces before the monitor's 1s poll ever sees it. It is read both from the process exit error (the `go` process was signalled) and from a `signal: killed` line on stdout (only the test binary was, so `go test` survived to report it and exited 1). The stdout reading counts at the start of a line only, where `go test` writes it.
+     - Otherwise the phase decides which wordings count. A failed build's output is entirely toolchain-authored, so generic phrasings are unambiguous there (`go: fork/exec …/compile: resource temporarily unavailable`, `ld: out of memory allocating …`), and a compile diagnostic makes the mutant `NOT VIABLE`. Once tests are running, the binary's stdout and stderr are read as one stream, as `go test` merges them, so only phrasings a test is unlikely to print itself count — `fatal error: out of memory`, never a bare `out of memory`.
+     - A `signal: killed` gomutants did not send is `INFRA ERROR`: the RSS monitor's own kill and the per-mutant deadline are both classified as `TIMED OUT` before this is reached, so what is left is an outside hand — typically a cgroup limit below the monitor's 2 GiB ceiling, which the kernel enforces before the monitor's 1s poll ever sees it. It is read from the exit error of the test binary, or of the `go` process building it, from a `signal: killed` line at the start of a line on the test binary's output, and from anywhere on the build's stderr, where `go` reports a compiler or linker the kernel killed (`pkg.test: …/link: signal: killed`).
 7. **Detect equivalent mutants** (only with `--detect-equivalent`). Each surviving mutant is recompiled with package-scoped `-gcflags=-S` under the same overlay mechanism; the reference (original) package is compiled once per package. When the normalized assembly matches the original, the mutation was folded away by the compiler and is reclassified `EQUIVALENT` — provably unkillable, so it leaves the efficacy denominator rather than failing the gate. The comparison is one-sided: any real difference in generated code diverges the hash, so a killable mutant is never marked equivalent.
 
 Performance optimizations layered on top:
 
-- **Per-mutant adaptive timeout.** Each mutant's deadline is `clamp(sum(selected test durations) × --timeout-margin, --timeout-min, global ceiling)`. A 50ms unit test gets a 2s floor instead of waiting out a multi-minute whole-suite ceiling, so infinite-loop mutants on fast packages trip in seconds rather than minutes. Falls back to the per-package sum when no per-test set is known, then to the global ceiling. Disable with `--adaptive-timeout=false`.
+- **Per-mutant adaptive timeout.** Each mutant's deadline is `clamp(sum(selected test durations) × --timeout-margin, --timeout-min, global ceiling)`, and it bounds running those tests: the mutant's test binaries are built before it starts, so a slow compile or link can't turn a mutant its tests kill or survive into `TIMED OUT`. A 50ms unit test gets a 2s floor instead of waiting out a multi-minute whole-suite ceiling, so infinite-loop mutants on fast packages trip in seconds rather than minutes. A mutant no test covers runs its whole package under the global ceiling, as does each package in the re-check of a survivor: the map's timings don't describe those runs, and such mutants rarely hang. Each package the re-check runs gets the ceiling to itself, since the ceiling is sized from one `go test` of every package at once, and reuses a binary the routed run already built. With adaptive sizing on, the ceiling is never below `--timeout-min`. Disable with `--adaptive-timeout=false`.
 - **`GOMAXPROCS=NumCPU/workers` per child.** Without this, `--workers=10` on a 10-core box would have each child also assume 10 cores, oversubscribing 100×. With it, each child compiles + tests within its share.
 - **Sort pending mutants by `(Pkg, File, Offset)` before dispatch.** The first mutant in a package pays the cold compile; subsequent ones reuse the build cache for deps and stdlib. This sort alone was a 17% wall-clock reduction.
-- **`-vet=off` on the inner `go test`.** Vet runs in the user's CI on clean source; re-running it for every mutant is wasted work. Measured 17–39% per-mutant wall-clock reduction on representative packages.
-- **Incremental cache.** Mutants whose source byte range and the surrounding tests are byte-identical to a prior run are skipped and their previous classifications reused. `INFRA ERROR` is never written to or reused from the cache, so transient host failures are retried. CI runs that touch one file pay for that file only.
+- **`-vet=off` on each mutant's `go test -c` build.** Vet runs in the user's CI on clean source; re-running it for every mutant is wasted work. Measured 17–39% per-mutant wall-clock reduction on representative packages.
+- **Incremental cache.** A verdict is reused only while everything that could change it is byte-identical to the prior run: the mutated file; every other non-test file in its package, plus that package's `//go:embed` inputs; every test file in its package; and, when the run instruments beyond the package under test (`--integration`, or an explicit `--coverpkg`) and another package's tests can reach the mutant — the coverage map places a covering test there, or that package's test binary links the mutant's package, so the survivor re-check runs it — that package's test and production sources too. Without such a scope a foreign package is left alone: the coverage map's test names carry no package, so a name two packages happen to share would otherwise drag an unrelated package's sources into the key. Invalidation is package-scoped on purpose — a mutant compiles as part of its whole package, and tests share their package's helpers and fixtures, so file-level invalidation would replay stale verdicts. A CI run that touches one file therefore pays for that file's package, not the repository. The memoized coverage profile is keyed the same way, embedded data included, so a fixture edit that changes which lines are covered re-runs `go test -coverprofile` instead of replaying a stale profile. The one gap left is a change in a package the mutant's package *imports*; closing it needs the forward import closure, whose churn would invalidate most of a repository whenever a widely imported package changes. `INFRA ERROR` is never written to or reused from the cache, so transient host failures are retried.
 
 ### JSON report
 
@@ -896,7 +913,7 @@ jq -r '.files[].mutations[] | select(.status == "LIVED") | .id' report.json
 gomutants --run-mutant-id 'internal/cli/cli.go:parseArgs:CONDITIONALS_BOUNDARY#2' ./...
 ```
 
-A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. So is naming a mutant that another filter then drops — a `// gomutants:disable` directive, [`--exclude-calls`](#call-site-exclusion), or a `--changed-since` range that excludes its line — because the alternative is a run that tests nothing and exits 0. So is combining it with `--dry-run`, which returns before anything is compiled or tested. All of those exit **2**, the same as any other bad invocation. The flag is CLI-only: there is no `run-mutant-id` config key, since a committed one would pin every later run to a single mutant.
+A unique prefix works too, so you rarely need the whole string. An exact `id` always wins over a prefix — necessary because `#1` is a prefix of `#10`. A prefix matching more than one mutant is an error that lists the candidates; an `id` matching none is an error too. So is naming a mutant that another filter then drops — a `// gomutants:disable` directive, [`--exclude-calls`](#call-site-exclusion), or a `--changed-since` range that excludes its line — because the alternative is a run that tests nothing and exits 0. So is combining it with `--dry-run`, which returns before anything is compiled or tested. All of those exit **2**, the same as any other bad invocation. The id is checked against the source before coverage and the baseline, and again after; if an edit saved in between makes the second check fail, or makes the id name a different mutant, the run exits **1** instead — the command line was fine, and running again is the fix. The flag is CLI-only: there is no `run-mutant-id` config key, since a committed one would pin every later run to a single mutant.
 
 Pair it with a threshold to get a scriptable answer:
 
@@ -918,7 +935,7 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 
 ## Security & Code Quality
 
-**Supply chain.** Releases are signed with [cosign](https://docs.sigstore.dev/) (keyless Sigstore), ship [SPDX](https://spdx.dev/) SBOMs for every artifact, and carry [SLSA Level 3](https://slsa.dev/spec/v1.0/levels#build-l3) build provenance. Published tags are immutable. Release candidates (`v0.5.1-rc0`) go through the identical signing, SBOM, and provenance pipeline and are marked as pre-releases. See [Verifying Releases](#verifying-releases) for verification commands. The repo is tracked by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/szhekpisov/gomutants) (badge above).
+**Supply chain.** Releases are signed with [cosign](https://docs.sigstore.dev/) (keyless Sigstore), ship [SPDX](https://spdx.dev/) SBOMs for every artifact, and carry [SLSA Level 3](https://slsa.dev/spec/v1.0/levels#build-l3) build provenance. Published tags are immutable. Release candidates (`v0.5.1-rc0`) go through the identical signing, SBOM, and provenance pipeline and are marked as pre-releases. See [Verifying Releases](#verifying-releases) for verification commands. The repo is tracked by [OpenSSF Scorecard](https://scorecard.dev/viewer/?uri=github.com/gomutants/gomutants) (badge above).
 
 **Continuous checks.** Every push and PR is scanned by:
 
@@ -926,13 +943,13 @@ The `main` package is excluded from mutation testing. Its mutants exercise the i
 - [zizmor](https://github.com/zizmorcore/zizmor) — GitHub Actions workflow security scanning
 - [golangci-lint](https://golangci-lint.run/) — multi-linter static analysis
 
-**Test quality.** Unit + integration test suite (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end). Mutation testing gated per-PR (no LIVED mutant on changed lines), with 96.01% efficacy on the full `./internal/...` library tree — the tool is dogfooded on itself, gated by its own CI gate.
+**Test quality.** Unit, integration and fuzz test suites (the integration suite forks gomutants subprocesses to test mutated overlays end-to-end; the fuzz targets check, among other things, that every mutant of any parseable Go file still parses). Mutation testing gated per-PR (no LIVED mutant on changed lines), with 96.01% efficacy on the full `./internal/...` library tree — the tool is dogfooded on itself, gated by its own CI gate.
 
-**Reporting vulnerabilities.** Open a [private GitHub Security Advisory](https://github.com/szhekpisov/gomutants/security/advisories/new).
+**Reporting vulnerabilities.** Open a [private GitHub Security Advisory](https://github.com/gomutants/gomutants/security/advisories/new).
 
 ## Contributing
 
-Found a bug or have a feature request? [Open an issue](https://github.com/szhekpisov/gomutants/issues/new).
+Found a bug or have a feature request? [Open an issue](https://github.com/gomutants/gomutants/issues/new).
 
 Maintainers: see [RELEASING.md](RELEASING.md) for the release process.
 
@@ -942,7 +959,7 @@ Maintainers: see [RELEASING.md](RELEASING.md) for the release process.
 **Prerequisites:** Go 1.26+
 
 ```bash
-git clone https://github.com/szhekpisov/gomutants.git
+git clone https://github.com/gomutants/gomutants.git
 cd gomutants
 go build ./...
 ```

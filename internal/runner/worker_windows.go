@@ -9,13 +9,19 @@ import (
 )
 
 // pgroupRSSBytes is a best-effort no-op on Windows. The Unix RSS monitor
-// queries `ps -o rss= -g <pgid>`, which has no portable Windows equivalent.
+// reads /proc on Linux and `ps -A -o pgid=,rss=` elsewhere; neither has a
+// portable Windows equivalent.
 // Returning 0 means the `pgroupRSSBytes(pgid) > maxSubprocRSSBytes` check
 // in Worker.Test never fires, so runaway mutants on Windows are bounded
 // only by the per-mutant context timeout. A future port could use job
 // objects via golang.org/x/sys/windows; for now the timeout backstop is
 // the contract.
 func pgroupRSSBytes(_ int) int64 { return 0 }
+
+// resetRSSProbe starts a run with a healthy RSS probe; see worker_unix.go.
+func resetRSSProbe() {
+	// No-op: Windows has no probe, so no outage to carry between runs.
+}
 
 // killPgroup terminates the child process by PID. On Windows there is no
 // portable concept of a POSIX process group; applyProcessGroup puts the

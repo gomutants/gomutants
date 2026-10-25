@@ -1,18 +1,20 @@
 // Package cache implements PIT-style incremental analysis: per-mutant
-// outcomes are persisted keyed by content hashes of the production file
-// and the test files that cover the mutant. On the next run, mutants
-// whose hashes still match are skipped.
+// outcomes are persisted keyed by content hashes of the mutated file, the
+// rest of its package's production sources (its //go:embed inputs
+// included), and the files that decide what the covering tests assert. On
+// the next run, mutants whose hashes still match are skipped.
 //
 // The cache is a single JSON file (default .gomutants-cache.json), opt-in
 // via the --cache flag. NOT_COVERED is intentionally not cached — coverage
 // is recomputed every run by discover.FilterByCoverage, which keeps "no
 // longer covered" reclassifications correct.
 //
-// tests_hash is computed from the union of test files identified by the
+// tests_hash is computed from the union of files identified by the
 // TestFilesForFn callback (typically backed by the per-test coverage map
 // + TestIndex). This handles cross-package -coverpkg correctly: tests in
 // package B that exercise code in package A invalidate A's mutants when
-// edited.
+// edited — and so do B's own helpers and production sources, which is
+// where an end-to-end test keeps most of what it asserts.
 package cache
 
 import (
@@ -23,13 +25,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // SchemaVersion is the on-disk format version. Bump when Entry shape or
@@ -50,7 +54,37 @@ import (
 //	v6: TestFlags cache identity preserves argv order. v5 sorted distinct
 //	    flag names, but arbitrary test-binary flags can interact even when
 //	    their names differ, so old keys can describe a different run.
-const SchemaVersion = 6
+//	v7: pkg_hash joins the per-mutant key. Through v6 the key covered only
+//	    the mutated file and the covering tests, so editing a *sibling*
+//	    file in the same package replayed a stale verdict — a KILLED mutant
+//	    whose kill depended on a constant next door stayed KILLED after that
+//	    constant changed, without executing anything. v6 entries carry no
+//	    pkg_hash and must not be replayed. The coverage key gained an
+//	    //go:embed dimension in the same version: a v7 profile recorded
+//	    before it simply mismatches and is recomputed, which is why this
+//	    framing change rides on v7 rather than a bump of its own.
+//	v8: LIVED means the mutant survived every test suite that can kill it,
+//	    not just the tests the coverage map routed it to, which could miss
+//	    a test that covers the line only after another test has run. v7
+//	    LIVED entries can be such false survivors. With -coverpkg the
+//	    tests dimension now spans every package whose tests link the
+//	    mutant's, as all of them decide a LIVED verdict. Entries record
+//	    whether the mutant was re-checked, so a cache hit counts in the
+//	    report's re-check totals as the run that tested it did.
+//	v9: KILLED means the mutant failed tests that pass together without it.
+//	    Through v8 a mutant could be routed to covering tests that each
+//	    pass alone but fail together on unmutated code — one leaves state
+//	    behind that breaks another — so v8 KILLED entries can be such
+//	    false kills.
+//	v10: NOT_VIABLE means the mutation itself doesn't compile. Through v9 a
+//	    mutant that removed the last use of an import or local variable
+//	    failed on Go's unused checks instead, so v9 NOT_VIABLE entries can
+//	    be mutants that now compile (see patch.ApplyMutant) and must run.
+//	v11: Likewise for a replacement that fused with the token next to it in
+//	    unformatted source (`return!ok` → `returnok`, `a<0` → `a<-1`), now
+//	    spaced off from it, so v10 NOT_VIABLE entries can again be mutants
+//	    that compile.
+const SchemaVersion = 11
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path
@@ -143,9 +177,19 @@ type Entry struct {
 	Original    string `json:"original"`
 	Replacement string `json:"replacement"`
 	ProdHash    string `json:"prod_hash"`
-	TestsHash   string `json:"tests_hash"`
-	Status      string `json:"status"`
-	DurationMs  int64  `json:"duration_ms"`
+	// PkgHash (v7+) fingerprints the non-test .go files in the mutant's
+	// own package directory — see Hasher.HashPkgFiles. ProdHash alone
+	// describes the mutated file; a mutant's verdict is decided by the
+	// whole package that file compiles into, so this is the dimension
+	// that catches a sibling file changing underneath a byte-identical
+	// mutated file. It gates every reusable status, NOT_VIABLE included.
+	PkgHash    string `json:"pkg_hash,omitempty"`
+	TestsHash  string `json:"tests_hash"`
+	Status     string `json:"status"`
+	DurationMs int64  `json:"duration_ms"`
+	// Rechecked (v8+) is the mutant's Rechecked, restored on a hit so the
+	// report's re-check counts don't depend on how many mutants hit.
+	Rechecked bool `json:"rechecked,omitempty"`
 }
 
 // key returns the identity tuple used for cache lookups.
@@ -202,8 +246,10 @@ func HashFile(absPath string) (string, error) {
 // Hasher memoizes per-file hashes within a single run. Not safe for
 // concurrent use — the pipeline calls Lookup/Update sequentially.
 type Hasher struct {
-	files    map[string]string // absPath → hex sha256
-	srcCache map[string][]byte // optional in-memory source files (from discover.PreReadFiles)
+	files    map[string]string   // absPath → hex sha256
+	dirs     map[string]string   // package dir → hex sha256 over its non-test .go files
+	srcCache map[string][]byte   // optional in-memory source files (from discover.PreReadFiles)
+	embeds   map[string][]string // package dir → dir-relative //go:embed file paths
 }
 
 // NewHasher returns an empty per-run hasher. If srcCache is non-nil, it
@@ -212,6 +258,7 @@ type Hasher struct {
 func NewHasher(srcCache map[string][]byte) *Hasher {
 	return &Hasher{
 		files:    make(map[string]string),
+		dirs:     make(map[string]string),
 		srcCache: srcCache,
 	}
 }
@@ -220,10 +267,60 @@ func NewHasher(srcCache map[string][]byte) *Hasher {
 // discover.PreReadFiles) after the hasher was constructed. Used by
 // callers that need a Hasher before pre-read completes (e.g. the
 // coverage-key calc runs before discovery) and want subsequent File()
-// calls to skip the disk read. Already-memoized hashes in h.files are
-// preserved.
+// calls to skip the disk read.
+//
+// Every package input is hashed again here, at the moment srcCache froze
+// the bytes the mutants are measured on. The memos the coverage-key calc
+// left behind were read from disk before coverage and the baseline ran, so
+// every non-test file memo is dropped: not just srcCache's own files, but a
+// sibling srcCache leaves out (--exclude-files, a build tag) and an
+// embedded file, both of which the mutants still compile from disk. A
+// verdict measured on an edit saved in between must not be keyed on the
+// version before it, or reverting the edit would replay that verdict.
+//
+// The pkg_hash of every directory srcCache has a file in is then taken
+// right away rather than on first use. A --run-mutant-id run skips Lookup,
+// so first use would be Update, after the mutant ran — and a sibling
+// edited during the run would be recorded against a verdict measured on
+// the old one. A directory that fails to hash memoizes nothing; Lookup and
+// Update try again and treat a failure as a miss.
+//
+// Test-file memos are kept. srcCache holds production sources only, so a
+// test file's hash taken by the coverage-key calc stays the one the cache
+// entries are stored under: a snapshot from before any mutant ran, which an
+// edit to the test mid-run can only turn into a miss on the next run. A
+// re-hash at write time would instead record the edited test against a
+// verdict measured on the old one, and replay that verdict.
 func (h *Hasher) SetSrcCache(srcCache map[string][]byte) {
 	h.srcCache = srcCache
+	maps.DeleteFunc(h.files, func(p, _ string) bool {
+		return !strings.HasSuffix(p, "_test.go")
+	})
+	for p := range srcCache {
+		delete(h.dirs, filepath.Dir(p))
+	}
+	for p := range srcCache {
+		_, _ = h.HashPkgFiles(filepath.Dir(p))
+	}
+}
+
+// SetEmbedFiles attaches the //go:embed inputs of each package, keyed by
+// absolute package directory and valued by the dir-relative slash paths
+// `go list` resolved the patterns to. HashPkgFiles folds them into
+// pkg_hash, so editing an embedded file invalidates the mutants of the
+// package that embeds it.
+//
+// Called after package resolution, which happens later than the Hasher's
+// construction (the coverage-key calc needs a Hasher first) — hence a
+// setter rather than a constructor argument. Directories absent from the
+// map contribute no embed inputs, which is the correct answer for the
+// packages that have none.
+//
+// There is no memo to invalidate here: HashPkgFiles is reached only from
+// Lookup and Update, both of which run well after package resolution, so
+// no directory hash predates this call.
+func (h *Hasher) SetEmbedFiles(embeds map[string][]string) {
+	h.embeds = embeds
 }
 
 // File returns the hash of absPath, computing it on first call.
@@ -288,7 +385,17 @@ func (h *Hasher) HashTestFiles(absPaths []string) (string, error) {
 // (non-recursive), deduped and sorted so the result is independent of input
 // ordering or repeats. Extracted from HashCoverageInputs to keep that
 // method's cognitive complexity within the linter's threshold.
-func goFilesIn(pkgDirs []string) ([]string, error) {
+//
+// skipTests drops _test.go files. HashCoverageInputs wants them (a test file
+// decides which lines the profile marks covered); HashPkgFiles does not,
+// because folding them in here would invalidate a package's NOT_VIABLE
+// entries — whose reuse is explicitly test-independent — on every test edit.
+// Test content is instead carried by tests_hash, and carried at package
+// granularity: TestIndex.CoveringFiles always includes every _test.go in the
+// mutant's own directory, not just the files declaring its covering tests,
+// so a package-level test helper that declares no test entry point (and that
+// therefore no coverage-derived name can resolve to) still gates reuse.
+func goFilesIn(pkgDirs []string, skipTests bool) ([]string, error) {
 	seen := make(map[string]bool, len(pkgDirs))
 	var files []string
 	for _, dir := range pkgDirs {
@@ -304,11 +411,123 @@ func goFilesIn(pkgDirs []string) ([]string, error) {
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") {
 				continue
 			}
+			if skipTests && strings.HasSuffix(e.Name(), "_test.go") {
+				continue
+			}
 			files = append(files, filepath.Join(dir, e.Name()))
 		}
 	}
 	slices.Sort(files)
 	return files, nil
+}
+
+// embedFrames returns one length-prefixed hash frame per //go:embed input
+// of the given package directories, in an order that depends only on the
+// set of directories and not on how the caller ordered or repeated them.
+// A directory the caller never described via SetEmbedFiles contributes no
+// frames — the right answer for the packages with no embed directives, and
+// the pre-embed behavior for any directory outside the resolved set.
+//
+// Frames are the shared piece of pkg_hash and the coverage key: embedded
+// data decides both a mutant's verdict (a test asserting on a parsed
+// schema.json) and which lines the coverage profile marks covered (a test
+// iterating an embedded table calls into code that an empty table never
+// reaches), so both dimensions have to carry it.
+//
+// Inputs are framed by their dir-relative slash path rather than their
+// basename: they can sit in subdirectories, where two files may share a
+// basename (data/a/x.json, data/b/x.json) that a basename-only framing
+// would alias together. Directories are sorted rather than emitted in
+// call order so the same package set hashes identically however it was
+// enumerated, and a directory named twice contributes its frames once;
+// within a directory the rel paths are sorted and deduped too.
+//
+// A read error is propagated — callers treat it as a cache miss, never as
+// a match.
+func (h *Hasher) embedFrames(pkgDirs []string) ([]string, error) {
+	dirs := slices.Clone(pkgDirs)
+	slices.Sort(dirs)
+
+	var frames []string
+	for i, dir := range dirs {
+		// Sorted, so a repeat sits next to its twin. Skipped here rather
+		// than compacted away: slices.Compact zeroes the tail it drops, and
+		// an empty directory name carries no embed inputs, so keeping or
+		// dropping the `dirs = slices.Compact(dirs)` assignment hashed the
+		// same — an unobservable statement. The rel-path Compact below is
+		// observable for the opposite reason: an empty rel path resolves to
+		// the directory itself, which fails to read.
+		if i > 0 && dir == dirs[i-1] {
+			continue
+		}
+		rels := slices.Clone(h.embeds[dir])
+		slices.Sort(rels)
+		rels = slices.Compact(rels)
+		for _, rel := range rels {
+			fileHex, err := h.File(filepath.Join(dir, filepath.FromSlash(rel)))
+			if err != nil {
+				return nil, err
+			}
+			frames = append(frames, fmt.Sprintf("%d:%s|%s|", len(rel), rel, fileHex))
+		}
+	}
+	return frames, nil
+}
+
+// HashPkgFiles returns a stable hex-encoded sha256 over every non-test .go
+// file directly inside dir, followed by every file the package's production
+// //go:embed directives pull in. It is the per-mutant key's dependency
+// dimension: a mutant's verdict is decided by the whole package it compiles
+// into, not just the file the mutation lives in, so a sibling file changing
+// must invalidate that mutant even when its own file is byte-identical.
+//
+// Embedded files count as package inputs for the same reason. A mutant
+// killed by a test that asserts on a parsed schema.json survives once that
+// schema changes, with every .go file byte-identical — the same stale-KILLED
+// shape a sibling .go edit produces. They are hashed only when the caller
+// supplied them via SetEmbedFiles; a package with no embed directives (the
+// overwhelming majority) writes nothing extra and hashes exactly as before.
+//
+// Framing matches HashTestFiles — sorted, deduped, length-prefixed — so no
+// STATEMENT_REMOVE or boundary-alias mutation against the writes can go
+// unobserved. The embed half is framed by embedFrames, which the coverage
+// key shares.
+//
+// Results are memoized per directory for the lifetime of the Hasher, so a
+// package is listed and hashed once per run rather than once per mutant.
+// The memo is keyed on dir alone. SetSrcCache retakes it for the mutants'
+// packages once their sources are frozen, so the hash a verdict is stored
+// under is that snapshot, not one from before coverage ran.
+//
+// A read or listing error is propagated — callers treat it as a cache miss
+// for that mutant, never as a match.
+func (h *Hasher) HashPkgFiles(dir string) (string, error) {
+	if v, ok := h.dirs[dir]; ok {
+		return v, nil
+	}
+	files, err := goFilesIn([]string{dir}, true)
+	if err != nil {
+		return "", err
+	}
+	hh := sha256.New()
+	for _, p := range files {
+		fileHex, err := h.File(p)
+		if err != nil {
+			return "", err
+		}
+		base := filepath.Base(p)
+		fmt.Fprintf(hh, "%d:%s|%s|", len(base), base, fileHex)
+	}
+	frames, err := h.embedFrames([]string{dir})
+	if err != nil {
+		return "", err
+	}
+	for _, f := range frames {
+		fmt.Fprint(hh, f)
+	}
+	v := hex.EncodeToString(hh.Sum(nil))
+	h.dirs[dir] = v
+	return v, nil
 }
 
 // HashCoverageInputs returns a stable fingerprint of every input that
@@ -340,7 +559,7 @@ func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags
 	// is independent of pkgDir ordering. Extracted into goFilesIn to keep
 	// this method's cognitive complexity in check. h.File is used below so
 	// the per-run sha256 memo is shared with HashTestFiles and Lookup.
-	files, err := goFilesIn(pkgDirs)
+	files, err := goFilesIn(pkgDirs, false)
 	if err != nil {
 		return "", err
 	}
@@ -357,7 +576,30 @@ func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags
 		fmt.Fprintf(hh, "%d:%s|%s|", len(base), base, fileHex)
 	}
 
-	// 2. Hash go.mod (required) and go.sum (optional).
+	// 2. Fold in the //go:embed inputs of those same directories. A test
+	// that iterates an embedded table decides which lines the profile
+	// marks covered exactly as its .go source does — add a case that
+	// reaches a previously untouched branch and every .go file is still
+	// byte-identical, so without this the stale profile would be replayed
+	// and the mutants on those lines would stay NOT_COVERED, untested.
+	// Frames carry an "embed:" prefix so an embedded x.go can't alias the
+	// production x.go framed above.
+	//
+	// Only directories the caller described via SetEmbedFiles contribute;
+	// with a coverage scope wider than the resolved target packages (the
+	// --integration closure, a broader -coverpkg) the extra directories'
+	// embed inputs stay outside the key, as do //go:embed directives in
+	// _test.go files, which go list reports separately and discover does
+	// not collect.
+	frames, err := h.embedFrames(pkgDirs)
+	if err != nil {
+		return "", fmt.Errorf("hashing embedded files: %w", err)
+	}
+	for _, f := range frames {
+		fmt.Fprintf(hh, "embed:%s", f)
+	}
+
+	// 3. Hash go.mod (required) and go.sum (optional).
 	modHex, err := h.File(filepath.Join(projectDir, "go.mod"))
 	if err != nil {
 		return "", fmt.Errorf("hashing go.mod: %w", err)
@@ -372,7 +614,7 @@ func (h *Hasher) HashCoverageInputs(pkgDirs []string, projectDir, coverPkg, tags
 	}
 	fmt.Fprintf(hh, "gosum:%d:%s|", len(sumHex), sumHex)
 
-	// 3. Mix in the configuration / toolchain dimensions with the same
+	// 4. Mix in the configuration / toolchain dimensions with the same
 	// length-prefixed framing so adjacent values can't alias.
 	fmt.Fprintf(hh, "coverpkg:%d:%s|", len(coverPkg), coverPkg)
 	fmt.Fprintf(hh, "tags:%d:%s|", len(tags), tags)
@@ -474,29 +716,73 @@ func Save(c *Cache, path string) error {
 
 // TestFilesForFn resolves a mutant to the set of absolute test-file
 // paths whose contents gate cache reuse for that mutant. The integrator
-// typically wires this through the per-test coverage map + TestIndex,
-// falling back to "all _test.go in the mutant's package directory" when
-// coverage information is unavailable.
+// wires this through TestIndex.CoveringFiles: every _test.go in the
+// mutant's package directory, plus the files declaring whichever tests
+// the per-test coverage map attributes to the mutant (those can live in
+// another package under -coverpkg, and that package is then hashed whole).
+// The package-wide halves are what keep an edit to a test helper — which
+// declares no test entry point, so no coverage-derived name names it —
+// from replaying a stale verdict.
 type TestFilesForFn func(m mutator.Mutant) []string
 
 // Lookup applies cache hits to the mutants slice in place. For each
 // pending mutant whose identity key + content hashes match a cached
-// entry, sets Status, Duration, and FromCache so the runner's
+// entry, sets Status, Duration, Rechecked and FromCache so the runner's
 // Pending-only filter naturally skips it. Returns the number of hits.
 //
-// Skip rules:
+// Skip rules — pkg_hash gates every reusable status:
 //
-//	prior=KILLED      + prod_hash match + tests_hash match → reuse
-//	prior=LIVED       + prod_hash match + tests_hash match → reuse
-//	prior=TIMED_OUT   + prod_hash match + tests_hash match → reuse
-//	prior=NOT_VIABLE  + prod_hash match (compile failure — tests irrelevant) → reuse
+//	prior=KILLED      + prod_hash + pkg_hash + tests_hash match → reuse
+//	prior=LIVED       + prod_hash + pkg_hash + tests_hash match → reuse
+//	prior=TIMED_OUT   + prod_hash + pkg_hash + tests_hash match → reuse
+//	prior=EQUIVALENT  + prod_hash + pkg_hash + tests_hash match → reuse
+//	prior=NOT_VIABLE  + prod_hash + pkg_hash match (compile failure — tests irrelevant) → reuse
 //	otherwise → leave Pending
 //
 // TIMED_OUT is gated on tests because adding a faster killer test could
 // legitimately turn a prior timeout into KILLED on the next run; without
-// the gate we'd silently skip a now-killable mutant. NOT_VIABLE is the
-// only outcome that depends purely on the mutated source (it failed to
-// compile), so it's safe to reuse on prod_hash alone.
+// the gate we'd silently skip a now-killable mutant. NOT_VIABLE is the one
+// outcome independent of *test* content (it failed to compile), so it
+// alone skips the tests_hash check — but it is not independent of the rest
+// of the package: a sibling file supplying a missing symbol turns a prior
+// NOT_VIABLE into a real, testable mutant, so pkg_hash still gates it.
+//
+// pkg_hash exists because prod_hash describes only the mutated file. A
+// mutant compiles as part of its whole package, so its verdict can flip
+// when a *sibling* file changes while the mutated file and the covering
+// tests stay byte-identical — a KILLED mutant whose kill depends on a
+// constant defined next door survives once that constant changes. Without
+// this dimension the cache replays the stale KILLED without executing
+// anything, which is the dangerous direction to be wrong in: silent false
+// confidence.
+//
+// Scope, stated plainly. Between them the three dimensions cover: the
+// mutated file, every other non-test .go file in its package, that
+// package's //go:embed inputs, every _test.go file in its package, and —
+// for a covering test the coverage map places in another package, which
+// takes an instrumentation scope wider than the package under test
+// (--integration, or an explicit --coverpkg) — that package's test *and*
+// production sources.
+//
+// That last half is conditional on the wider scope for a reason: the
+// coverage map's test names carry no package, so without one a foreign
+// declaring directory is a name collision rather than a dependency, and
+// expanding on it would fold unrelated packages' sources into tests_hash.
+// See TestIndex.CoveringFiles.
+//
+// What is left: an edit in a package the mutant's package *imports*. That
+// mutant still replays a stale verdict. Closing it needs the forward import
+// closure, and the churn it would add is real — a change to a widely
+// imported package would invalidate most of the repository's cache. The
+// --integration direction is not in that bucket even though it looks
+// similar: the reverse-dependency closure is already computed for that mode
+// and the covering package is named for us by the coverage map, so it costs
+// nothing to hash.
+//
+// Also outside the key: //go:embed inputs of *test* files (go list's
+// TestEmbedFiles/XTestEmbedFiles). A golden file embedded by a test and
+// edited to expect a looser value replays a stale KILLED, the same shape as
+// the production-embed case that is closed above.
 //
 // Hash failures (unreadable file/dir) are silently treated as a miss
 // for that mutant so a transient I/O error never produces a wrong skip.
@@ -529,6 +815,10 @@ func (c *Cache) Lookup(mutants []mutator.Mutant, h *Hasher, testFilesFor TestFil
 		if err != nil || prodHash != entry.ProdHash {
 			continue
 		}
+		pkgHash, err := h.HashPkgFiles(filepath.Dir(m.File))
+		if err != nil || pkgHash != entry.PkgHash {
+			continue
+		}
 		if needsTestsHash(status) {
 			testsHash, err := h.HashTestFiles(testFilesFor(*m))
 			if err != nil || testsHash != entry.TestsHash {
@@ -538,6 +828,7 @@ func (c *Cache) Lookup(mutants []mutator.Mutant, h *Hasher, testFilesFor TestFil
 
 		m.Status = status
 		m.Duration = time.Duration(entry.DurationMs) * time.Millisecond
+		m.Rechecked = entry.Rechecked
 		m.FromCache = true
 		hits++
 	}
@@ -561,9 +852,11 @@ func canReuse(s mutator.MutantStatus) bool {
 }
 
 // needsTestsHash reports whether a cacheable status's reuse depends on
-// the test files matching, in addition to the production file. Only
-// NOT_VIABLE is purely a function of the mutated source (compile
-// failure), so its reuse is safe on prod_hash alone.
+// the test files matching, in addition to the production source. Only
+// NOT_VIABLE is independent of test content (it failed to compile, so no
+// test ever ran), which exempts it from this check alone — prod_hash and
+// pkg_hash still gate it, since a sibling file can turn an uncompilable
+// mutant into a compilable one.
 //
 // EQUIVALENT is compiler-proven from the source alone, but we still stamp
 // and gate its tests_hash: an equivalent mutant is also a LIVED one, and
@@ -597,11 +890,13 @@ func parseStatus(s string) mutator.MutantStatus {
 	return mutator.StatusPending
 }
 
-// Update merges this run's results into c and drops entries for files
-// whose prod_hash no longer matches the current file content. Entries
+// Update merges this run's results into c and drops entries whose
+// prod_hash or pkg_hash no longer matches the current source. Entries
 // for files outside this run's mutant set (e.g. excluded by
 // --changed-since) are preserved when their file still exists with
-// matching content.
+// matching content *and* their package still hashes the same — a
+// carried-over entry is reused by the next run's Lookup, so it has to
+// clear the same two gates Lookup applies.
 //
 // projectDir lets us resolve a stored RelFile back to an absolute path
 // for re-hashing prior entries.
@@ -622,6 +917,13 @@ func (c *Cache) Update(mutants []mutator.Mutant, h *Hasher, projectDir string, t
 		if err != nil {
 			continue
 		}
+		// pkg_hash gates every reusable status, so an entry we cannot
+		// stamp it on is unusable — skip rather than write a hit that
+		// Lookup would have to reject.
+		pkgHash, err := h.HashPkgFiles(filepath.Dir(m.File))
+		if err != nil {
+			continue
+		}
 		entry := Entry{
 			RelFile:     m.RelFile,
 			Line:        m.Line,
@@ -631,8 +933,10 @@ func (c *Cache) Update(mutants []mutator.Mutant, h *Hasher, projectDir string, t
 			Original:    m.Original,
 			Replacement: m.Replacement,
 			ProdHash:    prodHash,
+			PkgHash:     pkgHash,
 			Status:      m.Status.String(),
 			DurationMs:  m.Duration.Milliseconds(),
+			Rechecked:   m.Rechecked,
 		}
 		// tests_hash is only meaningful for statuses where it gates
 		// reuse. Stamp it for KILLED/LIVED/TIMED_OUT so future
@@ -646,21 +950,44 @@ func (c *Cache) Update(mutants []mutator.Mutant, h *Hasher, projectDir string, t
 		newByKey[entry.key()] = entry
 	}
 
-	// 2. Carry over prior entries whose file still hashes the same and
-	//    that this run did not overwrite. h.File returning an error
-	//    leaves curHash="" — distinct from any real (non-empty) hex
-	//    digest, so the curHash-mismatch check below subsumes the
-	//    "file gone" case without an extra branch.
+	// 2. Carry over prior entries whose source still hashes the same and
+	//    that this run did not overwrite. Both dimensions are re-checked,
+	//    not just prod: an entry whose package moved on is one Lookup
+	//    would reject anyway, so keeping it only grows the file with
+	//    weight no run can spend.
+	//
+	//    This step is garbage collection, not a safety gate — Lookup
+	//    re-verifies both hashes on the next run and treats its own hash
+	//    errors as a miss — so the three outcomes below are chosen for
+	//    what they do to the *file*, not to correctness:
+	//
+	//      source gone      → drop; it can never match again, and keeping
+	//                         it would grow the file without bound
+	//      unreadable       → keep; we cannot tell whether it is stale,
+	//                         and Update runs on every checkpoint, so
+	//                         dropping would discard a package's warm
+	//                         cache over one transient EMFILE/EIO
+	//      readable         → keep only on a full match
+	//
+	//    Errors never reach the comparisons, which is what keeps a failed
+	//    hash's "" from matching an entry that carries an empty hash —
+	//    the laundering TestLookup_PkgHashErrorIsAMiss locks out on the
+	//    Lookup side.
 	for _, prior := range c.Entries {
 		if _, overwritten := newByKey[prior.key()]; overwritten {
 			continue
 		}
 		abs := filepath.Join(projectDir, prior.RelFile)
-		curHash, _ := h.File(abs)
-		if curHash != prior.ProdHash {
+		curHash, fileErr := h.File(abs)
+		curPkgHash, pkgErr := h.HashPkgFiles(filepath.Dir(abs))
+		switch {
+		case errors.Is(fileErr, fs.ErrNotExist) || errors.Is(pkgErr, fs.ErrNotExist):
 			continue
+		case fileErr != nil || pkgErr != nil:
+			newByKey[prior.key()] = prior
+		case curHash == prior.ProdHash && curPkgHash == prior.PkgHash:
+			newByKey[prior.key()] = prior
 		}
-		newByKey[prior.key()] = prior
 	}
 
 	// 3. Emit entries in deterministic order so the on-disk file

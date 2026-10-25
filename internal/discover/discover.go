@@ -15,7 +15,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // Package holds resolved package info from go list. Imports/TestImports/
@@ -25,12 +25,19 @@ import (
 // target).
 type Package struct {
 	Dir          string   // Absolute directory path.
-	ImportPath   string   // e.g. "github.com/szhekpisov/gomutants/internal/discover"
+	ImportPath   string   // e.g. "github.com/gomutants/gomutants/internal/discover"
 	GoFiles      []string // .go source files (base names).
 	TestGoFiles  []string // _test.go files (base names).
 	Imports      []string // production imports.
 	TestImports  []string // imports of in-package (_test.go) test files.
 	XTestImports []string // imports of external (foo_test) test files.
+	// EmbedFiles lists the files the package's production //go:embed
+	// directives pull in, as Dir-relative slash paths (go list resolves the
+	// patterns for us, so `all:`, globs and directory trees need no
+	// reimplementation here). The incremental cache hashes them alongside
+	// the package's .go files: embedded data decides test outcomes exactly
+	// as source does.
+	EmbedFiles []string
 }
 
 // goListJSON mirrors the fields we need from `go list -json`.
@@ -42,6 +49,7 @@ type goListJSON struct {
 	Imports      []string `json:"Imports"`
 	TestImports  []string `json:"TestImports"`
 	XTestImports []string `json:"XTestImports"`
+	EmbedFiles   []string `json:"EmbedFiles"`
 	Error        *struct {
 		Err string `json:"Err"`
 	} `json:"Error"`
@@ -90,6 +98,7 @@ func decodeGoListJSON(r io.Reader) ([]Package, error) {
 			Imports:      p.Imports,
 			TestImports:  p.TestImports,
 			XTestImports: p.XTestImports,
+			EmbedFiles:   p.EmbedFiles,
 		})
 	}
 	return pkgs, nil
@@ -117,6 +126,14 @@ type Result struct {
 // moduleRoot is the absolute path to the project root (for computing absolute paths).
 // goModule is the Go module name (for computing gremlins-compatible relative paths).
 func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, moduleRoot, goModule string) *Result {
+	return DiscoverTo(fset, pkgs, mutators, moduleRoot, goModule, os.Stderr)
+}
+
+// DiscoverTo is Discover with its warnings written to warn instead of
+// os.Stderr, for a pre-check that parses files a later Discover parses
+// again: it holds them back and prints them only when that later call
+// will not run.
+func DiscoverTo(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, moduleRoot, goModule string, warn io.Writer) *Result {
 	var allCandidates []mutator.MutantCandidate
 	files := make(map[string]*ParsedFile)
 	// Function spans per file, for resolving each candidate's stable-ID
@@ -131,7 +148,7 @@ func Discover(fset *token.FileSet, pkgs []Package, mutators []mutator.Mutator, m
 			if err != nil {
 				// Soft failure: skip unparseable files. Log so silent
 				// skips don't hide classifier-blindspots in reports.
-				fmt.Fprintf(os.Stderr, "gomutants: skipping unparseable %s: %v\n", absPath, err)
+				fmt.Fprintf(warn, "gomutants: skipping unparseable %s: %v\n", absPath, err)
 				continue
 			}
 			files[absPath] = &ParsedFile{Src: src, File: file}

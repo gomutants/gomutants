@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // barWidth is the width of the progress bar in cells. Shared between
@@ -85,6 +85,15 @@ func (t *Terminal) PhaseDone(msg string) {
 		return
 	}
 	fmt.Fprintf(t.w, " %s\n", msg)
+}
+
+// Info prints one informational line, such as a report path. Like the
+// phase lines it is silenced by quiet; the summary is not.
+func (t *Terminal) Info(format string, args ...any) {
+	if t.quiet {
+		return
+	}
+	fmt.Fprintf(t.w, format+"\n", args...)
 }
 
 // StartHeartbeat begins painting an idle progress line every
@@ -241,6 +250,9 @@ func (t *Terminal) Summary(r *Report) {
 	if r.MutantsCached > 0 {
 		fmt.Fprintf(t.w, "  Cached:       %d  (skipped)\n", r.MutantsCached)
 	}
+	if r.MutantsRechecked > 0 {
+		fmt.Fprintf(t.w, "  Re-checked:   %d  (%d killed by tests the coverage map missed)\n", r.MutantsRechecked, r.MutantsRecheckKilled)
+	}
 	if r.MutantsSuppressed > 0 {
 		fmt.Fprintf(t.w, "  Suppressed:   %d  (%s)\n", r.MutantsSuppressed, suppressedSources(r))
 	}
@@ -248,6 +260,21 @@ func (t *Terminal) Summary(r *Report) {
 		fmt.Fprintf(t.w, "  Equivalent:   %d  (compiler-proven)\n", r.MutantsEquivalent)
 	}
 	fmt.Fprintf(t.w, "  Efficacy:     %.2f%%\n", r.TestEfficacy)
+	fmt.Fprintln(t.w)
+}
+
+// RecheckHint tells the reader how to re-check one LIVED mutant after
+// adding a test, without a full rerun. It names the flags to add to the
+// reader's own command rather than printing one: only that command
+// carries every flag the verdict depends on (--integration, --config,
+// --only, ...), quoted for their shell. The flags must go before the
+// packages, where flag parsing stops. Prints nothing when no mutant lived.
+func (t *Terminal) RecheckHint(r *Report) {
+	if r.MutantsLived == 0 {
+		return
+	}
+	fmt.Fprintln(t.w, "Re-check a survivor: re-run the same command, adding before the packages")
+	fmt.Fprintln(t.w, "  --run-mutant-id '<id>' --threshold-efficacy 100")
 	fmt.Fprintln(t.w)
 }
 

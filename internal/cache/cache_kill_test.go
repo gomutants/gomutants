@@ -9,12 +9,13 @@ package cache
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // --- Hasher.File memoization (cache.go:138, 145) -----------------------------
@@ -174,6 +175,10 @@ func TestLookup_ContinueAdvancesAcrossSkippedMutants(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pkgHash, err := NewHasher(nil).HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	// Known-good entry at line=2 — every subtest below adds a mutant
 	// that triggers a different skip path at line=1, then a pending
@@ -181,7 +186,7 @@ func TestLookup_ContinueAdvancesAcrossSkippedMutants(t *testing.T) {
 	goodEntry := Entry{
 		RelFile: "x.go", Line: 2, Col: 1, Type: "ARITHMETIC_BASE",
 		Original: "+", Replacement: "-",
-		ProdHash: prodHash, TestsHash: testsHash, Status: "KILLED",
+		ProdHash: prodHash, PkgHash: pkgHash, TestsHash: testsHash, Status: "KILLED",
 	}
 	mkPending := func(line int) mutator.Mutant {
 		return mutator.Mutant{
@@ -215,47 +220,35 @@ func TestLookup_ContinueAdvancesAcrossSkippedMutants(t *testing.T) {
 		}
 	})
 
-	t.Run("non-reusable status precedes hit", func(t *testing.T) {
-		c := &Cache{Entries: []Entry{
-			{RelFile: "x.go", Line: 1, Col: 1, Type: "ARITHMETIC_BASE",
-				Original: "+", Replacement: "-",
-				ProdHash: prodHash, TestsHash: testsHash,
-				Status: "PENDING"}, // not reusable
-			goodEntry,
-		}}
-		mutants := []mutator.Mutant{mkPending(1), mkPending(2)}
-		if hits := c.Lookup(mutants, NewHasher(nil), pkgDirTestFilesFor); hits != 1 {
-			t.Errorf("hits=%d, want 1 — Lookup did not continue past non-reusable status", hits)
+	// The remaining four skips differ only in which field of the line-1
+	// entry is wrong, so they run as one table rather than four subtests
+	// that repeat the same cache, the same two mutants and the same
+	// single-hit assertion.
+	blocker := func(prod, pkg, tests, status string) Entry {
+		return Entry{
+			RelFile: "x.go", Line: 1, Col: 1, Type: "ARITHMETIC_BASE",
+			Original: "+", Replacement: "-",
+			ProdHash: prod, PkgHash: pkg, TestsHash: tests, Status: status,
 		}
-	})
-
-	t.Run("prod-hash mismatch precedes hit", func(t *testing.T) {
-		c := &Cache{Entries: []Entry{
-			{RelFile: "x.go", Line: 1, Col: 1, Type: "ARITHMETIC_BASE",
-				Original: "+", Replacement: "-",
-				ProdHash: "stale-prod", TestsHash: testsHash,
-				Status: "KILLED"},
-			goodEntry,
-		}}
-		mutants := []mutator.Mutant{mkPending(1), mkPending(2)}
-		if hits := c.Lookup(mutants, NewHasher(nil), pkgDirTestFilesFor); hits != 1 {
-			t.Errorf("hits=%d, want 1 — Lookup did not continue past prod-hash mismatch", hits)
-		}
-	})
-
-	t.Run("tests-hash mismatch precedes hit", func(t *testing.T) {
-		c := &Cache{Entries: []Entry{
-			{RelFile: "x.go", Line: 1, Col: 1, Type: "ARITHMETIC_BASE",
-				Original: "+", Replacement: "-",
-				ProdHash: prodHash, TestsHash: "stale-tests",
-				Status: "KILLED"},
-			goodEntry,
-		}}
-		mutants := []mutator.Mutant{mkPending(1), mkPending(2)}
-		if hits := c.Lookup(mutants, NewHasher(nil), pkgDirTestFilesFor); hits != 1 {
-			t.Errorf("hits=%d, want 1 — Lookup did not continue past tests-hash mismatch", hits)
-		}
-	})
+	}
+	skips := []struct {
+		name  string
+		entry Entry
+	}{
+		{"non-reusable status", blocker(prodHash, pkgHash, testsHash, "PENDING")},
+		{"prod-hash mismatch", blocker("stale-prod", pkgHash, testsHash, "KILLED")},
+		{"pkg-hash mismatch", blocker(prodHash, "stale-pkg", testsHash, "KILLED")},
+		{"tests-hash mismatch", blocker(prodHash, pkgHash, "stale-tests", "KILLED")},
+	}
+	for _, tc := range skips {
+		t.Run(tc.name+" precedes hit", func(t *testing.T) {
+			c := &Cache{Entries: []Entry{tc.entry, goodEntry}}
+			mutants := []mutator.Mutant{mkPending(1), mkPending(2)}
+			if hits := c.Lookup(mutants, NewHasher(nil), pkgDirTestFilesFor); hits != 1 {
+				t.Errorf("hits=%d, want 1 — Lookup did not continue past %s", hits, tc.name)
+			}
+		})
+	}
 }
 
 // TestLookup_ZeroEntriesShortCircuits asserts the early return when
@@ -306,19 +299,29 @@ func TestUpdate_ContinueAdvancesAcrossSkippedEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run("missing-file precedes intact entry", func(t *testing.T) {
-		// First entry's file does not exist (h.File errors); second
-		// entry's file exists and matches.
-		c := &Cache{
+	// Both drop paths below need the same two-entry cache: a doomed entry
+	// followed by the intact one whose survival proves the carry-over loop
+	// continued. Only the doomed entry's file and recorded hash differ, so
+	// the literal is built once here.
+	doomedThenIntact := func(relFile, prodHash, pkgHash string) *Cache {
+		return &Cache{
 			Entries: []Entry{
-				{RelFile: "gone.go", Line: 1, Type: "ARITHMETIC_BASE",
+				{RelFile: relFile, Line: 1, Type: "ARITHMETIC_BASE",
 					Original: "+", Replacement: "-",
-					ProdHash: "stale", Status: "KILLED"},
+					ProdHash: prodHash, PkgHash: pkgHash, Status: "KILLED"},
 				{RelFile: "intact.go", Line: 1, Type: "ARITHMETIC_BASE",
 					Original: "+", Replacement: "-",
-					ProdHash: intactHash, Status: "KILLED"},
+					ProdHash: intactHash, PkgHash: pkgHash, Status: "KILLED"},
 			},
 		}
+	}
+
+	t.Run("missing-file precedes intact entry", func(t *testing.T) {
+		// First entry's file does not exist (h.File errors); second
+		// entry's file exists and matches. pkgHash is recomputed per
+		// subtest — a later subtest adds stale.go to root, which changes
+		// the directory's fingerprint.
+		c := doomedThenIntact("gone.go", "stale", mustPkgHash(t, root))
 		c.Update(nil, NewHasher(nil), root, pkgDirTestFilesFor)
 
 		if len(c.Entries) != 1 || c.Entries[0].RelFile != "intact.go" {
@@ -331,16 +334,7 @@ func TestUpdate_ContinueAdvancesAcrossSkippedEntries(t *testing.T) {
 		// second entry is intact.
 		stale := filepath.Join(root, "stale.go")
 		mustWrite(t, stale, "package x\n// changed\n")
-		c := &Cache{
-			Entries: []Entry{
-				{RelFile: "stale.go", Line: 1, Type: "ARITHMETIC_BASE",
-					Original: "+", Replacement: "-",
-					ProdHash: "old-hash", Status: "KILLED"},
-				{RelFile: "intact.go", Line: 1, Type: "ARITHMETIC_BASE",
-					Original: "+", Replacement: "-",
-					ProdHash: intactHash, Status: "KILLED"},
-			},
-		}
+		c := doomedThenIntact("stale.go", "old-hash", mustPkgHash(t, root))
 		c.Update(nil, NewHasher(nil), root, pkgDirTestFilesFor)
 
 		gotIntact := false
@@ -360,14 +354,15 @@ func TestUpdate_ContinueAdvancesAcrossSkippedEntries(t *testing.T) {
 	t.Run("overwritten precedes intact entry", func(t *testing.T) {
 		// A run mutant overwrites the first prior entry's key; the
 		// second prior entry should still carry over.
+		pkgHash := mustPkgHash(t, root)
 		c := &Cache{
 			Entries: []Entry{
 				{RelFile: "intact.go", Line: 1, Col: 1,
 					Type: "ARITHMETIC_BASE", Original: "+", Replacement: "-",
-					ProdHash: intactHash, Status: "LIVED"},
+					ProdHash: intactHash, PkgHash: pkgHash, Status: "LIVED"},
 				{RelFile: "intact.go", Line: 99, Col: 1,
 					Type: "ARITHMETIC_BASE", Original: "*", Replacement: "/",
-					ProdHash: intactHash, Status: "KILLED"},
+					ProdHash: intactHash, PkgHash: pkgHash, Status: "KILLED"},
 			},
 		}
 		// Run mutant overwrites the line=1 entry only.
@@ -466,6 +461,13 @@ func TestUpdate_SortPrecedence(t *testing.T) {
 	mustWrite(t, filepath.Join(root, "y.go"), "package y\n")
 	yHash, _ := HashFile(filepath.Join(root, "y.go"))
 	c.Entries[len(c.Entries)-1].ProdHash = yHash
+
+	// pkg_hash is stamped after the y.go write, since adding a file to
+	// root changes the directory fingerprint every entry must match.
+	pkgHash := mustPkgHash(t, root)
+	for i := range c.Entries {
+		c.Entries[i].PkgHash = pkgHash
+	}
 
 	c.Update(nil, NewHasher(nil), root, pkgDirTestFilesFor)
 
@@ -990,6 +992,627 @@ func TestReal(t *testing.T) {}
 	}
 }
 
+// --- HashPkgFiles (v7 pkg_hash dimension) ------------------------------------
+
+// TestHashPkgFiles_SkipsTestFilesAndKeepsGoing locks two branches in
+// goFilesIn's skipTests path at once, using a directory whose _test.go
+// file sorts *between* two production files:
+//
+//   - drop the `skipTests && _test.go` guard and the test file joins the
+//     hash, so editing a test would invalidate the package's NOT_VIABLE
+//     entries — whose reuse is deliberately test-independent;
+//   - turn its `continue` into a `break` and z.go is silently dropped, so
+//     a package would hash identically with or without its last file.
+//
+// Both are caught by comparing against the same package minus its test
+// file, which must hash identically.
+func TestHashPkgFiles_SkipsTestFilesAndKeepsGoing(t *testing.T) {
+	withTests := t.TempDir()
+	mustWrite(t, filepath.Join(withTests, "a.go"), "package x\n")
+	mustWrite(t, filepath.Join(withTests, "a_test.go"), "package x\n// a test\n")
+	mustWrite(t, filepath.Join(withTests, "z.go"), "package x\n// z\n")
+
+	withoutTests := t.TempDir()
+	mustWrite(t, filepath.Join(withoutTests, "a.go"), "package x\n")
+	mustWrite(t, filepath.Join(withoutTests, "z.go"), "package x\n// z\n")
+
+	got := mustPkgHash(t, withTests)
+	want := mustPkgHash(t, withoutTests)
+	if got != want {
+		t.Errorf("pkg hash differs with a _test.go present:\n got=%s\nwant=%s\n"+
+			"either the test file was folded in, or the loop broke early and dropped z.go", got, want)
+	}
+}
+
+// TestHashPkgFiles_SiblingContentChangesHash is the property the whole v7
+// bump rests on: two packages whose file *names* match but whose contents
+// differ must not share a fingerprint. Without it, pkg_hash would gate
+// nothing.
+func TestHashPkgFiles_SiblingContentChangesHash(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "a.go"), "package x\n")
+	mustWrite(t, filepath.Join(dir, "b.go"), "package x\n\nconst Offset = 5\n")
+	before := mustPkgHash(t, dir)
+
+	mustWrite(t, filepath.Join(dir, "b.go"), "package x\n\nconst Offset = 0\n")
+	after := mustPkgHash(t, dir)
+
+	if before == after {
+		t.Error("editing a sibling file left the package hash unchanged")
+	}
+}
+
+// TestHashPkgFiles_ListingErrorPropagates locks the error return after
+// goFilesIn. Swallowing it would hand Lookup a hash for a package it could
+// not even list — an empty-input digest that any other unlistable package
+// would also produce, turning an I/O failure into a spurious cache hit.
+func TestHashPkgFiles_ListingErrorPropagates(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "no-such-dir")
+	if _, err := NewHasher(nil).HashPkgFiles(missing); err == nil {
+		t.Fatal("expected an error for a directory that cannot be listed")
+	}
+}
+
+// TestHashPkgFiles_UnreadableFilePropagates locks the error return inside
+// the per-file loop. A .go file ReadDir surfaced but File cannot read must
+// fail the hash rather than be skipped — skipping would produce the exact
+// digest of the same package minus that file, so an unreadable sibling
+// would silently stop gating.
+func TestHashPkgFiles_UnreadableFilePropagates(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file-mode permissions; chmod 000 does not block reads")
+	}
+	dir := t.TempDir()
+	bad := filepath.Join(dir, "a.go")
+	mustWrite(t, bad, "package x\n")
+	if err := os.Chmod(bad, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	// Restore so t.TempDir() cleanup can remove the file.
+	defer func() { _ = os.Chmod(bad, 0o644) }()
+
+	if _, err := NewHasher(nil).HashPkgFiles(dir); err == nil {
+		t.Fatal("expected an error from an unreadable .go file")
+	}
+}
+
+// TestHashPkgFiles_MemoizesPerDirectory locks the memo write. Dropping it
+// costs no correctness on its own — the recomputed value is the same — but
+// it silently turns one listing-plus-hash per package into one per mutant,
+// on the hot path of the feature whose whole point is speed. The memo is
+// observable as staleness: a run never edits its own sources mid-flight, so
+// a second call must replay the first answer rather than re-read the disk.
+func TestHashPkgFiles_MemoizesPerDirectory(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "a.go"), "package x\n")
+
+	h := NewHasher(nil)
+	first, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Add a file the memoized answer must not notice.
+	mustWrite(t, filepath.Join(dir, "b.go"), "package x\n// added\n")
+
+	second, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Errorf("second call recomputed (%s != %s) — the per-directory memo was not written", second, first)
+	}
+	if len(h.dirs) != 1 {
+		t.Errorf("h.dirs holds %d entries, want 1", len(h.dirs))
+	}
+}
+
+// --- pkg_hash error paths in Lookup / Update ---------------------------------
+
+// srcCacheHasher returns a Hasher whose in-memory source map satisfies
+// File(path) without touching the disk, mirroring what
+// discover.PreReadFiles hands the production pipeline. It is what lets the
+// tests below drive HashPkgFiles to an error while File still succeeds —
+// otherwise File fails first and the pkg_hash branch is never reached.
+func srcCacheHasher(path, body string) *Hasher {
+	return NewHasher(map[string][]byte{path: []byte(body)})
+}
+
+// TestLookup_PkgHashErrorIsAMiss locks the `err != nil` half of Lookup's
+// pkg_hash gate. Drop it and an entry stamped with an empty pkg_hash
+// matches the empty string HashPkgFiles returns alongside its error — so an
+// I/O failure would be laundered into a cache hit, which is the one
+// direction this gate must never fail in.
+func TestLookup_PkgHashErrorIsAMiss(t *testing.T) {
+	// The package directory does not exist, so HashPkgFiles errors; the
+	// mutated file's bytes come from the in-memory source map, so the
+	// prod_hash check ahead of it still passes.
+	prodPath := filepath.Join(t.TempDir(), "no-such-dir", "x.go")
+	h := srcCacheHasher(prodPath, "package x\n")
+	prodHash, err := h.File(prodPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := &Cache{Entries: []Entry{{
+		RelFile: "x.go", Line: 1, Col: 1, Type: "ARITHMETIC_BASE",
+		Original: "+", Replacement: "-",
+		ProdHash: prodHash, PkgHash: "", TestsHash: "",
+		// NOT_VIABLE skips the tests_hash check, isolating the pkg_hash
+		// gate as the only thing between this entry and a hit.
+		Status: mutator.StatusNotViable.String(),
+	}}}
+	mutants := []mutator.Mutant{{
+		ID: 1, Type: mutator.ArithmeticBase,
+		File: prodPath, RelFile: "x.go", Line: 1, Col: 1,
+		Original: "+", Replacement: "-",
+		Status: mutator.StatusPending,
+	}}
+
+	if hits := c.Lookup(mutants, h, pkgDirTestFilesFor); hits != 0 {
+		t.Errorf("hits=%d, want 0 — a pkg_hash error must be a miss, never a hit", hits)
+	}
+}
+
+// TestUpdate_SkipsRunMutantWhenPkgHashFails locks the matching guard in
+// Update, and that it skips with `continue` rather than `break`. An entry
+// we cannot stamp a pkg_hash on is one Lookup would always reject, so
+// writing it is pure noise — and writing it with an empty pkg_hash is worse
+// than noise, since an empty stored value is what a future failed hash
+// compares equal to. The good mutant that follows the failing one is what
+// catches a `break`: it would abandon every remaining result of the run.
+func TestUpdate_SkipsRunMutantWhenPkgHashFails(t *testing.T) {
+	root := t.TempDir()
+	badPath := filepath.Join(root, "no-such-dir", "x.go")
+	goodPath := filepath.Join(root, "good.go")
+	mustWrite(t, goodPath, "package x\n")
+
+	// The bad mutant's bytes come from the in-memory source map, so File
+	// succeeds and execution reaches the pkg_hash guard; its directory does
+	// not exist, so HashPkgFiles fails there.
+	h := srcCacheHasher(badPath, "package x\n")
+
+	c := &Cache{SchemaVersion: SchemaVersion, GoModule: testModule, ToolVersion: testVersion}
+	mutants := []mutator.Mutant{
+		{
+			ID: 1, Type: mutator.ArithmeticBase,
+			File: badPath, RelFile: filepath.Join("no-such-dir", "x.go"),
+			Line: 1, Col: 1, Original: "+", Replacement: "-",
+			Status: mutator.StatusKilled, Duration: time.Millisecond,
+		},
+		{
+			ID: 2, Type: mutator.ArithmeticBase,
+			File: goodPath, RelFile: "good.go",
+			Line: 2, Col: 1, Original: "*", Replacement: "/",
+			Status: mutator.StatusKilled, Duration: time.Millisecond,
+		},
+	}
+
+	c.Update(mutants, h, root, pkgDirTestFilesFor)
+
+	if len(c.Entries) != 1 || c.Entries[0].RelFile != "good.go" {
+		t.Errorf("entries=%+v, want only good.go — the unstampable mutant must be skipped, "+
+			"and the loop must continue past it rather than break", c.Entries)
+	}
+}
+
+// TestUpdate_PkgHashMismatchContinuesCarryOver asserts the carry-over
+// loop's pkg_hash skip uses `continue`, not `break`. The two entries live
+// in different packages so only the first is stale; a `break` would take
+// the intact second entry down with it, silently emptying the cache of
+// every package that happens to sort after an edited one.
+func TestUpdate_PkgHashMismatchContinuesCarryOver(t *testing.T) {
+	root := t.TempDir()
+	dirStale := filepath.Join(root, "stalepkg")
+	dirIntact := filepath.Join(root, "intactpkg")
+	if err := os.MkdirAll(dirStale, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dirIntact, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(dirStale, "a.go"), "package s\n")
+	mustWrite(t, filepath.Join(dirIntact, "a.go"), "package i\n")
+
+	staleHash, _ := HashFile(filepath.Join(dirStale, "a.go"))
+	intactHash, _ := HashFile(filepath.Join(dirIntact, "a.go"))
+
+	c := &Cache{
+		Entries: []Entry{
+			{ // prod_hash matches, pkg_hash does not — must be skipped.
+				RelFile: filepath.Join("stalepkg", "a.go"), Line: 1, Col: 1,
+				Type: "ARITHMETIC_BASE", Original: "+", Replacement: "-",
+				ProdHash: staleHash, PkgHash: "stale-pkg", Status: "KILLED",
+			},
+			{ // fully intact — must survive.
+				RelFile: filepath.Join("intactpkg", "a.go"), Line: 1, Col: 1,
+				Type: "ARITHMETIC_BASE", Original: "+", Replacement: "-",
+				ProdHash: intactHash, PkgHash: mustPkgHash(t, dirIntact), Status: "KILLED",
+			},
+		},
+	}
+
+	c.Update(nil, NewHasher(nil), root, pkgDirTestFilesFor)
+
+	relIntact := filepath.Join("intactpkg", "a.go")
+	if len(c.Entries) != 1 || c.Entries[0].RelFile != relIntact {
+		t.Errorf("entries=%+v, want only %s — carry-over did not continue past the pkg_hash mismatch",
+			c.Entries, relIntact)
+	}
+}
+
 // Compile-time sanity for unused helpers.
 var _ = withFailingOp
 var _ = fmt.Sprintf
+
+// --- pkg_hash: //go:embed inputs ---------------------------------------------
+
+// embedDir builds a package directory holding one .go file plus the named
+// embed inputs (relative slash paths → contents) and returns its path.
+func embedDir(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "a.go"), "package x\n")
+	for rel, body := range files {
+		p := filepath.Join(dir, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatalf("mkdir for %s: %v", rel, err)
+		}
+		mustWrite(t, p, body)
+	}
+	return dir
+}
+
+// embedHash hashes dir with the given embed inputs declared, on a fresh
+// Hasher so the per-directory memo never carries across cases.
+func embedHash(t *testing.T, dir string, embeds []string) string {
+	t.Helper()
+	h := NewHasher(nil)
+	h.SetEmbedFiles(map[string][]string{dir: embeds})
+	v, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatalf("HashPkgFiles(%s): %v", dir, err)
+	}
+	return v
+}
+
+// TestHashPkgFiles_EmbeddedContentChangesHash is the regression: a mutant
+// killed by a test asserting on embedded data survives once that data
+// changes, with every .go file byte-identical. Without the embed dimension
+// pkg_hash cannot see it and the cache replays the stale KILLED.
+func TestHashPkgFiles_EmbeddedContentChangesHash(t *testing.T) {
+	dir := embedDir(t, map[string]string{"data/schema.json": `{"max":5}`})
+
+	before := embedHash(t, dir, []string{"data/schema.json"})
+	mustWrite(t, filepath.Join(dir, "data", "schema.json"), `{"max":9}`)
+	after := embedHash(t, dir, []string{"data/schema.json"})
+
+	if before == after {
+		t.Error("pkg_hash unchanged after the embedded file's content changed")
+	}
+}
+
+// TestHashPkgFiles_EmbedsAreOptional pins the other side: a package that
+// declares no embed inputs must hash exactly as it did before the dimension
+// existed, so warm caches for the overwhelming majority of packages survive.
+// It also covers a directory absent from the map, which is how
+// embedFilesByDir represents "embeds nothing".
+func TestHashPkgFiles_EmbedsAreOptional(t *testing.T) {
+	dir := embedDir(t, map[string]string{"data/schema.json": `{"max":5}`})
+
+	plain, err := NewHasher(nil).HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaredEmpty := embedHash(t, dir, nil)
+
+	h := NewHasher(nil)
+	h.SetEmbedFiles(map[string][]string{"/some/other/pkg": {"x.json"}})
+	otherDir, err := h.HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if plain != declaredEmpty || plain != otherDir {
+		t.Errorf("hashes diverged with no embeds in play: plain=%s empty=%s otherDir=%s",
+			plain, declaredEmpty, otherDir)
+	}
+
+	// And the embedded file really is invisible without the declaration —
+	// otherwise the test above would pass for the wrong reason.
+	mustWrite(t, filepath.Join(dir, "data", "schema.json"), `{"max":9}`)
+	edited, err := NewHasher(nil).HashPkgFiles(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if edited != plain {
+		t.Error("an undeclared file under the package dir changed pkg_hash")
+	}
+}
+
+// TestHashPkgFiles_EmbedFramingUsesRelativePath covers the choice of
+// dir-relative path over basename for the embed framing. Two packages that
+// embed byte-identical content under the same basename in different
+// subdirectories must not collide: `data/a/x.json` and `data/b/x.json` are
+// different inputs, and a basename-only framing would write the same bytes
+// for both.
+func TestHashPkgFiles_EmbedFramingUsesRelativePath(t *testing.T) {
+	inA := embedDir(t, map[string]string{"data/a/x.json": "same"})
+	inB := embedDir(t, map[string]string{"data/b/x.json": "same"})
+
+	if embedHash(t, inA, []string{"data/a/x.json"}) == embedHash(t, inB, []string{"data/b/x.json"}) {
+		t.Error("same basename in different subdirectories hashed identically — " +
+			"the embed framing is not path-aware")
+	}
+}
+
+// TestHashPkgFiles_EmbedListIsOrderIndependent pins the sort + dedup: go
+// list's ordering is not part of the contract we want to hash, and a
+// pattern set can name the same file twice (`data/*.json data/schema.json`).
+func TestHashPkgFiles_EmbedListIsOrderIndependent(t *testing.T) {
+	dir := embedDir(t, map[string]string{
+		"data/a.json": "1",
+		"data/b.json": "2",
+	})
+
+	sorted := embedHash(t, dir, []string{"data/a.json", "data/b.json"})
+	reversed := embedHash(t, dir, []string{"data/b.json", "data/a.json"})
+	duped := embedHash(t, dir, []string{"data/b.json", "data/a.json", "data/b.json"})
+
+	if sorted != reversed {
+		t.Errorf("input order changed the hash: %s vs %s", sorted, reversed)
+	}
+	if sorted != duped {
+		t.Errorf("a repeated entry changed the hash: %s vs %s", sorted, duped)
+	}
+}
+
+// TestHashPkgFiles_MissingEmbedFileIsAnError locks the error return in the
+// embed loop. A declared input we cannot read leaves us unable to say
+// whether the package changed, and Lookup must see that as a miss rather
+// than hash the package as if the file were not there.
+func TestHashPkgFiles_MissingEmbedFileIsAnError(t *testing.T) {
+	dir := embedDir(t, nil)
+
+	h := NewHasher(nil)
+	h.SetEmbedFiles(map[string][]string{dir: {"data/vanished.json"}})
+	if _, err := h.HashPkgFiles(dir); err == nil {
+		t.Error("HashPkgFiles succeeded with an unreadable embed input")
+	}
+}
+
+// --- coverage key: //go:embed inputs -----------------------------------------
+
+// coverHash hashes dirs as a coverage scope with the given embed inputs
+// declared, on a fresh Hasher so no memo carries across cases.
+func coverHash(t *testing.T, dirs []string, projectDir string, embeds map[string][]string) string {
+	t.Helper()
+	h := NewHasher(nil)
+	h.SetEmbedFiles(embeds)
+	v, err := h.HashCoverageInputs(dirs, projectDir, "", "", "", "go1.26", "env")
+	if err != nil {
+		t.Fatalf("HashCoverageInputs(%v): %v", dirs, err)
+	}
+	return v
+}
+
+// coverEmbedDir builds embedDir's layout plus the go.mod HashCoverageInputs
+// requires, so the directory can serve as both project root and package.
+func coverEmbedDir(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := embedDir(t, files)
+	mustWrite(t, filepath.Join(dir, "go.mod"), "module testmod\n\ngo 1.26\n")
+	return dir
+}
+
+// TestHashCoverageInputs_EmbeddedContentChangesKey is the coverage-side half
+// of the embed regression. A test that iterates an embedded table decides
+// which lines the profile marks covered: add a case that reaches a branch
+// nothing reached before and every .go file is still byte-identical, so a
+// key blind to embeds matches, the stale profile is replayed, and the
+// mutants on those newly covered lines stay NOT_COVERED — never tested.
+func TestHashCoverageInputs_EmbeddedContentChangesKey(t *testing.T) {
+	dir := coverEmbedDir(t, map[string]string{"data/cases.json": `[1]`})
+	embeds := map[string][]string{dir: {"data/cases.json"}}
+
+	before := coverHash(t, []string{dir}, dir, embeds)
+	mustWrite(t, filepath.Join(dir, "data", "cases.json"), `[1,2]`)
+	after := coverHash(t, []string{dir}, dir, embeds)
+
+	if before == after {
+		t.Error("coverage key unchanged after the embedded file's content changed")
+	}
+}
+
+// TestHashCoverageInputs_EmbedsAreOptional mirrors the pkg_hash side: a
+// scope whose packages declare no embed inputs must hash exactly as it did
+// before the dimension existed, so warm coverage caches survive. A
+// directory absent from the map is how embedFilesByDir says "embeds
+// nothing" — and is also what a coverage scope wider than the resolved
+// packages leaves behind.
+func TestHashCoverageInputs_EmbedsAreOptional(t *testing.T) {
+	dir := coverEmbedDir(t, map[string]string{"data/cases.json": `[1]`})
+
+	plain := coverHash(t, []string{dir}, dir, nil)
+	declaredEmpty := coverHash(t, []string{dir}, dir, map[string][]string{dir: nil})
+	otherDir := coverHash(t, []string{dir}, dir, map[string][]string{"/some/other/pkg": {"x.json"}})
+
+	if plain != declaredEmpty || plain != otherDir {
+		t.Errorf("keys diverged with no embeds in play: plain=%s empty=%s otherDir=%s",
+			plain, declaredEmpty, otherDir)
+	}
+
+	// And the embedded file really is invisible without the declaration —
+	// otherwise the test above would pass for the wrong reason.
+	mustWrite(t, filepath.Join(dir, "data", "cases.json"), `[1,2]`)
+	if coverHash(t, []string{dir}, dir, nil) != plain {
+		t.Error("an undeclared file under a package dir changed the coverage key")
+	}
+}
+
+// TestHashCoverageInputs_EmbedsAcrossDirectories covers embedFrames on a
+// multi-directory scope, which is the shape pkg_hash never sees: every
+// directory's inputs have to land, and neither the caller's ordering nor a
+// repeated entry may change the result. Callers build that list in whatever
+// order go list or the integration closure produced, so an order-sensitive
+// key would hash the same repository differently from one run to the next.
+func TestHashCoverageInputs_EmbedsAcrossDirectories(t *testing.T) {
+	root := coverEmbedDir(t, map[string]string{"data/a.json": "1"})
+	other := embedDir(t, map[string]string{"data/b.json": "2"})
+	embeds := map[string][]string{root: {"data/a.json"}, other: {"data/b.json"}}
+
+	forward := coverHash(t, []string{root, other}, root, embeds)
+	reversed := coverHash(t, []string{other, root}, root, embeds)
+	// Both directories are repeated, so whichever sorts first, one repeat
+	// lands mid-list rather than at the end. A repeat in the last position
+	// hides most of the ways the skip can be wrong: stopping at the repeat
+	// and skipping past it are the same thing there, and so are "this
+	// equals its predecessor" and "always equal". Mid-list, each of those
+	// drops a directory's frames or emits them twice.
+	duped := coverHash(t, []string{root, other, root, other}, root, embeds)
+
+	if forward != reversed {
+		t.Errorf("pkgDirs order changed the key: %s vs %s", forward, reversed)
+	}
+	if forward != duped {
+		t.Errorf("a repeated pkgDir changed the key: %s vs %s", forward, duped)
+	}
+
+	// Each directory's inputs must actually reach the key, asserted by
+	// dropping one declaration at a time. The three comparisons above
+	// cannot see this on their own: a skip that swallowed every directory
+	// after the first would swallow the same one in all three, leaving them
+	// equal to each other and the bug invisible. Which directory sorts
+	// first depends on the temp-dir names, so both drops are checked.
+	onlyRoot := coverHash(t, []string{root, other}, root, map[string][]string{root: {"data/a.json"}})
+	onlyOther := coverHash(t, []string{root, other}, root, map[string][]string{other: {"data/b.json"}})
+	if forward == onlyRoot {
+		t.Error("dropping the second directory's embed declaration left the key unchanged")
+	}
+	if forward == onlyOther {
+		t.Error("dropping the first directory's embed declaration left the key unchanged")
+	}
+}
+
+// TestHashCoverageInputs_MissingEmbedFileIsAnError locks the error return.
+// A declared input we cannot read leaves us unable to say whether the
+// coverage inputs changed, and the caller must re-run coverage rather than
+// key a profile as if the file were not there.
+//
+// The cause is asserted through errors.Is, not just for a non-nil error:
+// the wrap has to keep the underlying fs.ErrNotExist reachable, or Update's
+// "gone vs. merely unreadable" classification — which is exactly that
+// errors.Is check — cannot tell the two apart.
+func TestHashCoverageInputs_MissingEmbedFileIsAnError(t *testing.T) {
+	dir := coverEmbedDir(t, nil)
+
+	h := NewHasher(nil)
+	h.SetEmbedFiles(map[string][]string{dir: {"data/vanished.json"}})
+	_, err := h.HashCoverageInputs([]string{dir}, dir, "", "", "", "go1.26", "env")
+	if err == nil {
+		t.Fatal("HashCoverageInputs succeeded with an unreadable embed input")
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("err = %v, want one unwrapping to fs.ErrNotExist", err)
+	}
+}
+
+// --- Update's carry-over: gone vs. merely unreadable --------------------------
+
+// carryOver runs Update with no results of its own, so every prior entry
+// takes the carry-over path, and reports whether the entry survived.
+func carryOver(t *testing.T, c *Cache, h *Hasher, projectDir string) bool {
+	t.Helper()
+	c.Update(nil, h, projectDir, pkgDirTestFilesFor)
+	return len(c.Entries) == 1
+}
+
+// priorEntry returns a carry-over candidate for relFile stamped with the
+// given hashes.
+func priorEntry(relFile, prodHash, pkgHash string) *Cache {
+	return &Cache{Entries: []Entry{{
+		RelFile: relFile, Line: 1, Col: 1, Type: "ARITHMETIC_BASE",
+		Original: "+", Replacement: "-",
+		ProdHash: prodHash, PkgHash: pkgHash,
+		Status: mutator.StatusKilled.String(),
+	}}}
+}
+
+// TestUpdate_DropsPriorEntryWhenSourceDeleted covers the fs.ErrNotExist
+// branch on the prod side. A deleted file can never hash back to the stored
+// value, so keeping the entry would grow the cache file without bound.
+// Without the branch the entry falls into "unreadable → keep" and survives.
+func TestUpdate_DropsPriorEntryWhenSourceDeleted(t *testing.T) {
+	root := t.TempDir()
+	c := priorEntry("gone.go", "abc123", "def456")
+
+	if carryOver(t, c, NewHasher(nil), root) {
+		t.Error("entry for a deleted file was carried over")
+	}
+}
+
+// TestUpdate_DropsPriorEntryWhenPackageDirDeleted covers the same branch on
+// the pkg side, which needs the mutated file to still hash: its bytes come
+// from the in-memory source map while its directory does not exist.
+//
+// The stored PkgHash is deliberately empty — the value a failed hash used to
+// be compared against. Before the rewrite this entry was *kept*, which is
+// the same laundering TestLookup_PkgHashErrorIsAMiss locks out on the
+// Lookup side.
+func TestUpdate_DropsPriorEntryWhenPackageDirDeleted(t *testing.T) {
+	root := t.TempDir()
+	abs := filepath.Join(root, "no-such-dir", "x.go")
+	h := srcCacheHasher(abs, "package x\n")
+	prodHash, err := h.File(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := priorEntry(filepath.Join("no-such-dir", "x.go"), prodHash, "")
+
+	if carryOver(t, c, h, root) {
+		t.Error("entry whose package directory is gone was carried over")
+	}
+}
+
+// TestUpdate_KeepsPriorEntryWhenSourceUnreadable covers the "cannot verify"
+// branch on the prod side. Update runs on every checkpoint, so treating a
+// transient read failure as staleness would discard a package's warm cache
+// over one blip. Keeping is safe because Lookup re-verifies both hashes and
+// treats its own errors as a miss.
+//
+// The unreadable file is a *directory* named like one, which yields EISDIR
+// — an error that is not fs.ErrNotExist, and needs no permission games that
+// a root-running CI would defeat.
+func TestUpdate_KeepsPriorEntryWhenSourceUnreadable(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "weird.go"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	c := priorEntry("weird.go", "abc123", "def456")
+
+	if !carryOver(t, c, NewHasher(nil), root) {
+		t.Error("entry was dropped over an unreadable (not missing) source file")
+	}
+}
+
+// TestUpdate_KeepsPriorEntryWhenPackageDirUnreadable covers the same branch
+// on the pkg side: the mutated file reads out of the source map, while its
+// "directory" is a regular file, so ReadDir fails with ENOTDIR rather than
+// fs.ErrNotExist.
+func TestUpdate_KeepsPriorEntryWhenPackageDirUnreadable(t *testing.T) {
+	root := t.TempDir()
+	notADir := filepath.Join(root, "pkg")
+	mustWrite(t, notADir, "not a directory\n")
+
+	abs := filepath.Join(notADir, "x.go")
+	h := srcCacheHasher(abs, "package x\n")
+	prodHash, err := h.File(abs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := priorEntry(filepath.Join("pkg", "x.go"), prodHash, "def456")
+
+	if !carryOver(t, c, h, root) {
+		t.Error("entry was dropped over an unreadable (not missing) package directory")
+	}
+}

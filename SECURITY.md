@@ -17,7 +17,7 @@ are not supported — report issues found in them, but run stable tags in CI.
 Please **do not** open a public GitHub issue for security vulnerabilities.
 
 Instead, report them privately via GitHub's
-[Security Advisories](https://github.com/szhekpisov/gomutants/security/advisories/new)
+[Security Advisories](https://github.com/gomutants/gomutants/security/advisories/new)
 form. This creates a private channel between you and the maintainers.
 
 Include as much of the following as you can:

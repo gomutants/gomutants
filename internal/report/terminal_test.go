@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // TestHeaderExact asserts the exact bytes produced by Header.
@@ -232,6 +232,28 @@ func TestSummaryInfraErrorsNonZero(t *testing.T) {
 	}
 }
 
+// TestRecheckHint pins the hint's text when a mutant lived, and its
+// absence when none did.
+func TestRecheckHint(t *testing.T) {
+	for name, tc := range map[string]struct {
+		lived int
+		want  string
+	}{
+		"lived": {lived: 2, want: "Re-check a survivor: re-run the same command, adding before the packages\n" +
+			"  --run-mutant-id '<id>' --threshold-efficacy 100\n" +
+			"\n"},
+		"none lived": {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var buf bytes.Buffer
+			NewTerminal(&buf, 0, false, false).RecheckHint(&Report{MutantsLived: tc.lived})
+			if got := buf.String(); got != tc.want {
+				t.Errorf("RecheckHint output mismatch:\n got: %q\nwant: %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestSummaryTTYLeadingNewline covers the `t.isTTY && !t.verbose` branch
 // that prints a newline before the summary to clear the progress line.
 func TestSummaryTTYLeadingNewline(t *testing.T) {
@@ -315,6 +337,21 @@ func TestSummaryHidesCachedLineWhenZero(t *testing.T) {
 	}
 }
 
+// TestSummaryRecheckLine: the re-check line shows only when a mutant was
+// re-checked, with how many the re-check killed.
+func TestSummaryRecheckLine(t *testing.T) {
+	var buf bytes.Buffer
+	NewTerminal(&buf, 0, false, false).Summary(&Report{MutantsKilled: 5, MutantsLived: 1, MutantsRechecked: 1, MutantsRecheckKilled: 1})
+	if !strings.Contains(buf.String(), "Re-checked:   1  (1 killed by tests the coverage map missed)\n") {
+		t.Errorf("expected Re-checked line, got %q", buf.String())
+	}
+	buf.Reset()
+	NewTerminal(&buf, 0, false, false).Summary(&Report{MutantsKilled: 5})
+	if strings.Contains(buf.String(), "Re-checked:") {
+		t.Errorf("expected no Re-checked line without re-checks, got %q", buf.String())
+	}
+}
+
 func TestSummaryShowsSuppressedLineWhenNonZero(t *testing.T) {
 	var buf bytes.Buffer
 	term := NewTerminal(&buf, 0, false, false)
@@ -353,6 +390,20 @@ func TestQuietSuppressesHeaderPhaseAndOnResult(t *testing.T) {
 
 	if buf.Len() != 0 {
 		t.Errorf("quiet mode should produce no output for Header/Phase/OnResult, got %q", buf.String())
+	}
+}
+
+func TestInfoPrintsLineUnlessQuiet(t *testing.T) {
+	var buf bytes.Buffer
+	NewTerminal(&buf, 0, false, false).Info("Report: %s", "r.json")
+	if got := buf.String(); got != "Report: r.json\n" {
+		t.Errorf("Info = %q, want %q", got, "Report: r.json\n")
+	}
+
+	buf.Reset()
+	NewTerminal(&buf, 0, false, true).Info("Report: %s", "r.json")
+	if buf.Len() != 0 {
+		t.Errorf("quiet Info should print nothing, got %q", buf.String())
 	}
 }
 

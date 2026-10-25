@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 func TestGenerate(t *testing.T) {
@@ -174,6 +174,32 @@ func TestGenerateCountsMutantsCached(t *testing.T) {
 	}
 	if r.MutantsKilled != 2 {
 		t.Errorf("MutantsKilled=%d, want 2 (FromCache must not change status counts)", r.MutantsKilled)
+	}
+}
+
+// TestGenerateCountsRechecks: re-checked mutants are counted whatever
+// their status, and those of them killed separately; neither count
+// changes the status counts.
+func TestGenerateCountsRechecks(t *testing.T) {
+	mutants := []mutator.Mutant{
+		{ID: 1, Type: mutator.ArithmeticBase, RelFile: "a.go", Line: 1, Col: 1, Status: mutator.StatusKilled, Rechecked: true},
+		{ID: 2, Type: mutator.ArithmeticBase, RelFile: "a.go", Line: 2, Col: 1, Status: mutator.StatusLived, Rechecked: true},
+		{ID: 3, Type: mutator.ArithmeticBase, RelFile: "a.go", Line: 3, Col: 1, Status: mutator.StatusTimedOut, Rechecked: true},
+		{ID: 4, Type: mutator.ArithmeticBase, RelFile: "a.go", Line: 4, Col: 1, Status: mutator.StatusKilled},
+	}
+	r := Generate(mutants, "mod", time.Second, 0)
+	if r.MutantsRechecked != 3 || r.MutantsRecheckKilled != 1 {
+		t.Errorf("MutantsRechecked=%d MutantsRecheckKilled=%d, want 3 and 1", r.MutantsRechecked, r.MutantsRecheckKilled)
+	}
+	if r.MutantsKilled != 2 || r.MutantsLived != 1 {
+		t.Errorf("MutantsKilled=%d MutantsLived=%d, want 2 and 1", r.MutantsKilled, r.MutantsLived)
+	}
+	data, err := json.Marshal(Generate(mutants[3:], "mod", time.Second, 0))
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if strings.Contains(string(data), `"mutants_rechecked"`) || strings.Contains(string(data), `"mutants_recheck_killed"`) {
+		t.Errorf("re-check counts should be omitted when 0, got: %s", data)
 	}
 }
 

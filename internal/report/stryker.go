@@ -7,7 +7,7 @@ import (
 	"slices"
 	"sort"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // Stryker schema v2 — https://github.com/stryker-mutator/mutation-testing-elements

@@ -135,36 +135,6 @@ output: mutation-report.json
 # exclude-calls entries you list (or none at all). Default: true.
 # exclude-calls-defaults: true
 
-# Available mutator types (28 total):
-#   Token-level:
-#     ARITHMETIC_BASE             — swap +/-, */%, etc.
-#     CONDITIONALS_BOUNDARY       — swap </<=, >/>=
-#     CONDITIONALS_NEGATION       — swap ==/!=, </>=, >/<=
-#     INCREMENT_DECREMENT         — swap ++/--
-#     INVERT_NEGATIVES            — swap -/+ (unary and binary)
-#     INVERT_ASSIGNMENTS          — swap arithmetic compound assignments (+=/-=, etc.)
-#     INVERT_BITWISE              — swap bitwise binary ops (&/|, ^, <<, >>)
-#     INVERT_BITWISE_ASSIGNMENTS  — swap bitwise compound assignments (&=/|=, etc.)
-#     INVERT_LOGICAL              — swap &&/||
-#     INVERT_LOOP_CTRL            — swap break/continue
-#     REMOVE_SELF_ASSIGNMENTS     — drop op from compound assignment (`x += y` → `x = y`)
-#     REMOVE_LOGICAL_NOT          — drop `!` from a logical negation (`if !ok` → `if ok`)
-#     ERRORF_WRAP                 — downgrade `%w` to `%v` in an Errorf format string
-#     INTEGER_INCREMENT           — integer literal n → n+1
-#     INTEGER_DECREMENT           — integer literal n → n-1
-#     FLOAT_INCREMENT             — float literal f → f+1.0
-#     FLOAT_DECREMENT             — float literal f → f-1.0
-#   Block-level:
-#     BRANCH_IF                   — empty if/else-if body
-#     BRANCH_ELSE                 — empty else body
-#     BRANCH_CASE                 — empty case clause body
-#     EXPRESSION_REMOVE           — replace &&/|| operand with true/false
-#     STATEMENT_REMOVE            — remove assignment/expression/increment side-effects
-#     LOOP_CONDITION              — replace `for ...; cond; ... {}` condition with `false`
-#     RANGE_BREAK                 — insert `break` as the first statement of a `for…range` body
-#   Return values (each return slot is claimed by exactly one of these,
-#   based on the type declared in the function's signature):
-#     RETURN_ERROR_NIL            — `error` slot → nil (swallow a propagated error)
-#     RETURN_ZERO                 — any other slot → its zero value (0, "", nil, *new(T))
-#     RETURN_TRUE                 — `bool` slot → true
-#     RETURN_FALSE                — `bool` slot → false
+# Run `gomutants --list-mutators` to print every valid mutator type with its
+# description and a representative example. The command reads directly from
+# the built-in registry and works without a Go module or configuration file.

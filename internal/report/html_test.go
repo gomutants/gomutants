@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // reportScriptOpenTag is the opening tag of the <script> block that carries

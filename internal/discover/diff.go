@@ -11,7 +11,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/szhekpisov/gomutants/internal/mutator"
+	"github.com/gomutants/gomutants/internal/mutator"
 )
 
 // diffMaxBufSize is both the initial allocation and the maximum line size
@@ -176,7 +176,12 @@ func parseHunkHeader(line string) (LineRange, bool) {
 	if count <= 0 {
 		return LineRange{}, false
 	}
-	return LineRange{Start: start, End: start + count - 1}, true
+	// With count > 0, end < start only where start+count overflowed.
+	end := start + count - 1
+	if end < start {
+		return LineRange{}, false
+	}
+	return LineRange{Start: start, End: end}, true
 }
 
 // FilterByDiff returns the subset of mutants whose (file, line) falls
