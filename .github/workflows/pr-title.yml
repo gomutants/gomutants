@@ -15,7 +15,7 @@ jobs:
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          if [[ ! "$PR_TITLE" =~ ^(feat|bug|fix|doc|chore|test):\ .+ ]]; then
+          if [[ ! "$PR_TITLE" =~ ^(feat|bug|fix|doc|chore|test)(\([a-zA-Z0-9_.-]+\))?:\ .+ ]]; then
             echo "::error::PR title must start with: feat: / bug: / fix: / doc: / chore: / test:"
             echo ""
             echo "Examples:"
