@@ -1114,11 +1114,18 @@ func TestWorkerTestHeavySuiteRaisesCap(t *testing.T) {
 	w, m := fakeWorker(t, nil, 30*time.Second)
 	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sleep", "0.3"} })
+	// Every build and run is bounded like a mutant's (see proctree.Bound),
+	// and every run gets the environment `go test` gives a test binary.
 	var overlays []bool
 	fake := startCommandFunc
 	startCommandFunc = func(cmd *exec.Cmd) error {
+		if cmd.WaitDelay != proctree.DrainDelay {
+			t.Errorf("%v: WaitDelay = %v, want proctree.DrainDelay", cmd.Args, cmd.WaitDelay)
+		}
 		if _, ok := builtBin(cmd.Args); ok {
 			overlays = append(overlays, slices.ContainsFunc(cmd.Args, func(a string) bool { return strings.HasPrefix(a, "-overlay=") }))
+		} else if cmd.Env == nil {
+			t.Errorf("%v: Env is nil, want the test binary's", cmd.Args)
 		}
 		return fake(cmd)
 	}
@@ -1237,6 +1244,80 @@ func TestWorkerTestSuiteMeasureFailureNotKept(t *testing.T) {
 	}
 	if want := []string{"m/calc", "m/calc", "m/calc", "m/calc"}; !slices.Equal(runs.builds, want) {
 		t.Errorf("builds = %v, want %v: each mutant's, and an unmutated one for each", runs.builds, want)
+	}
+}
+
+// TestMeasureSuiteFails: a suite whose binary can't be built or started,
+// or whose run ctx cancels, measures nothing, and says why unless ctx was
+// cancelled, as the run's result is thrown away then. The binary it built
+// is gone either way.
+func TestMeasureSuiteFails(t *testing.T) {
+	const why = "gomutants: worker 0: can't measure the memory m/calc's tests use without a mutant: "
+	startErr := errors.New("inject")
+	cases := []struct {
+		name string
+		// start replaces the nth start (1 for the build, 2 for the run)
+		// with a failure; 0 replaces none.
+		start      int
+		build, run []string
+		cancel     time.Duration // cancels ctx this long into the run, if set
+		want       string
+	}{
+		{name: "build fails to start", start: 1, build: []string{"true"}, run: []string{"true"}, want: why + "inject\n"},
+		{name: "run fails to start", start: 2, build: []string{"true"}, run: []string{"true"}, want: why + "inject\n"},
+		{name: "build fails", build: []string{"sh", "-c", "echo 'undefined: x' >&2; exit 1"}, run: []string{"true"},
+			want: why + "building it: exit status 1\nundefined: x\n"},
+		{name: "run cancelled", build: []string{"true"}, run: []string{"sleep", "5"}, cancel: 100 * time.Millisecond},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubMemCap(t, 2<<20)
+			w, _ := fakeWorker(t, nil, 30*time.Second)
+			fakeBuildsAndRuns(t, func(string) []string { return tc.build }, func(string) []string { return tc.run })
+			fake := startCommandFunc
+			n := 0
+			startCommandFunc = func(cmd *exec.Cmd) error {
+				n++
+				if n == tc.start {
+					return startErr
+				}
+				return fake(cmd)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tc.cancel > 0 {
+				time.AfterFunc(tc.cancel, cancel)
+			}
+			var got int64
+			stderr := captureStderr(t, func() { got = w.measureSuite(ctx, "m/calc", t.TempDir(), nil) })
+			if got != 0 {
+				t.Errorf("measureSuite = %d, want 0 for a failure", got)
+			}
+			if stderr != tc.want {
+				t.Errorf("stderr = %q, want %q", stderr, tc.want)
+			}
+			if _, err := os.Stat(filepath.Join(w.binDir, "worker-0-suite.test")); !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("the suite's binary is left behind: %v", err)
+			}
+		})
+	}
+}
+
+// TestWorkerTestDeadlineMeasuresNothing: a run past its deadline reads
+// TIMED OUT without the monitor having stopped it, so its package's suite
+// isn't measured, and no memory kill is reported.
+func TestWorkerTestDeadlineMeasuresNothing(t *testing.T) {
+	stubMemCap(t, 2<<20)
+	w, m := fakeWorker(t, nil, 200*time.Millisecond)
+	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
+		func(string) []string { return []string{"sleep", "5"} })
+	var got mutator.Mutant
+	stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
+	if got.Status != mutator.StatusTimedOut {
+		t.Errorf("Status=%v, want TimedOut", got.Status)
+	}
+	if len(runs.runs) != 1 || stderr != "" {
+		t.Errorf("runs = %v, stderr = %q, want the mutant's run alone, and nothing said", runs.runs, stderr)
 	}
 }
 
