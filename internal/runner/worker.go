@@ -453,23 +453,21 @@ func (c *suiteCaps) entry(pkg string) *suiteCap {
 
 // get returns pkg's cap: maxSubprocRSSBytes until its suite is measured.
 func (c *suiteCaps) get(pkg string) int64 {
-	if n := c.entry(pkg).rssCap.Load(); n > 0 {
+	if n := c.entry(pkg).rssCap.Load(); n != 0 {
 		return n
 	}
 	return maxSubprocRSSBytes
 }
 
 // measure returns pkg's cap, measuring its suite with measure on first
-// use. A failed measurement isn't kept, so the next run that goes over
-// the cap tries again.
-func (c *suiteCaps) measure(pkg string, measure func() (int64, bool)) int64 {
+// use. measure returns 0 for a failed measurement, which leaves the suite
+// unmeasured, so the next run that goes over the cap tries again.
+func (c *suiteCaps) measure(pkg string, measure func() int64) int64 {
 	e := c.entry(pkg)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.rssCap.Load() == 0 {
-		if n, ok := measure(); ok {
-			e.rssCap.Store(n)
-		}
+		e.rssCap.Store(measure())
 	}
 	return c.get(pkg)
 }
@@ -805,7 +803,7 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 	rssCap := w.suiteCaps.get(run.pkg)
 	r := w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
 	if r.memKilled && r.status == mutator.StatusTimedOut {
-		raised := w.suiteCaps.measure(run.pkg, func() (int64, bool) { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
+		raised := w.suiteCaps.measure(run.pkg, func() int64 { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
 		if raised > rssCap {
 			rssCap = raised
 			r = w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
@@ -846,21 +844,20 @@ func (w *Worker) runBinOnce(ctx context.Context, run pkgRun, bin, dir string, bi
 // binary built without the overlay, and returns the memory cap its test
 // runs get (see suiteCaps): twice the most the run was seen to use, or
 // maxSubprocRSSBytes if that is higher. A run that fails its tests or its
-// deadline still shows what the suite uses. It is false when the suite
+// deadline still shows what the suite uses. It is 0 when the suite
 // couldn't be built or run, or ctx was cancelled.
 //
 // The run is stopped at suiteRSSCeilingFactor times maxSubprocRSSBytes. A
 // suite that goes over that alone keeps maxSubprocRSSBytes, so its
 // mutants that go over it read TIMED OUT, as before.
-func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []string) (int64, bool) {
-	fail := func(err error) (int64, bool) {
+func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []string) int64 {
+	fail := func(why string) int64 {
 		if ctx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "gomutants: worker %d: can't measure the memory %s's tests use without a mutant: %v\n", w.id, pkg, err)
+			fmt.Fprintf(os.Stderr, "gomutants: worker %d: can't measure the memory %s's tests use without a mutant: %s\n", w.id, pkg, why)
 		}
-		return 0, false
+		return 0
 	}
 	bin := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-suite.test", w.id))
-	_ = os.Remove(bin)
 	defer os.Remove(bin)
 	buildCtx, cancelBuild := context.WithTimeout(ctx, buildTimeout)
 	defer cancelBuild()
@@ -868,14 +865,14 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 	proctree.Bound(cmd)
 	build, err := w.runMonitored(cmd, maxSubprocRSSBytes)
 	if err != nil {
-		return fail(err)
+		return fail(err.Error())
 	}
 	if build.runErr != nil {
-		err := fmt.Errorf("building it: %w", build.runErr)
+		why := "building it: " + build.runErr.Error()
 		if out := strings.TrimSpace(stderr.String()); out != "" {
-			err = fmt.Errorf("%w\n%s", err, out)
+			why += "\n" + out
 		}
-		return fail(err)
+		return fail(why)
 	}
 	runCtx, cancelRun := context.WithTimeout(ctx, w.policy.Global)
 	defer cancelRun()
@@ -885,20 +882,20 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 	ceiling := suiteRSSCeilingFactor * maxSubprocRSSBytes
 	res, err := w.runMonitored(cmd, ceiling)
 	if err != nil {
-		return fail(err)
+		return fail(err.Error())
 	}
 	if ctx.Err() != nil {
-		return 0, false
+		return 0
 	}
 	if res.memKilled {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests go over %d MiB without a mutant, so they keep the %d MiB memory cap\n", w.id, pkg, ceiling>>20, maxSubprocRSSBytes>>20)
-		return maxSubprocRSSBytes, true
+		return maxSubprocRSSBytes
 	}
 	rssCap := max(maxSubprocRSSBytes, 2*res.peak)
 	if rssCap > maxSubprocRSSBytes {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests use %d MiB without a mutant, so their memory cap is raised to %d MiB\n", w.id, pkg, res.peak>>20, rssCap>>20)
 	}
-	return rssCap, true
+	return rssCap
 }
 
 // pkgDir returns the directory pkg's test binary runs from: the mutated
