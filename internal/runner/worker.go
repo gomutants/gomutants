@@ -858,7 +858,7 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 		return 0
 	}
 	bin := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-suite.test", w.id))
-	defer os.Remove(bin)
+	defer func() { _ = os.Remove(bin) }()
 	buildCtx, cancelBuild := context.WithTimeout(ctx, buildTimeout)
 	defer cancelBuild()
 	cmd, _, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, false))
