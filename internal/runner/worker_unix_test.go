@@ -1274,15 +1274,7 @@ func TestMeasureSuiteFails(t *testing.T) {
 			stubMemCap(t, 2<<20)
 			w, _ := fakeWorker(t, nil, 30*time.Second)
 			fakeBuildsAndRuns(t, func(string) []string { return tc.build }, func(string) []string { return tc.run })
-			fake := startCommandFunc
-			n := 0
-			startCommandFunc = func(cmd *exec.Cmd) error {
-				n++
-				if n == tc.start {
-					return startErr
-				}
-				return fake(cmd)
-			}
+			failStart(tc.start, startErr)
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			if tc.cancel > 0 {
@@ -1300,6 +1292,21 @@ func TestMeasureSuiteFails(t *testing.T) {
 				t.Errorf("the suite's binary is left behind: %v", err)
 			}
 		})
+	}
+}
+
+// failStart makes the nth command a worker starts fail with err, on top of
+// fakeBuildsAndRuns' stand-ins, whose cleanup restores startCommandFunc;
+// 0 fails none.
+func failStart(nth int, err error) {
+	fake := startCommandFunc
+	n := 0
+	startCommandFunc = func(cmd *exec.Cmd) error {
+		n++
+		if n == nth {
+			return err
+		}
+		return fake(cmd)
 	}
 }
 
