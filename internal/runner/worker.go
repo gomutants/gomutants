@@ -268,9 +268,10 @@ func hasLineWithPrefix(s, prefix string) bool {
 //     bare "exit status 1" with all of the evidence on stdout.
 //
 // The second is the failure issue #79 reported, and it is the one the RSS
-// monitor cannot see: the monitor SIGKILLs at its own 2 GiB ceiling on a 1 s
-// poll, so a container whose limit is lower is always killed by the kernel
-// first, well before memKilled is ever set. Classified as KILLED it would be
+// monitor cannot see: the monitor SIGKILLs at the memory cap (--memory-cap,
+// 2 GiB by default) on a 1 s poll, so a container whose limit is lower is
+// killed by the kernel first, well before memKilled is ever set; a cap set
+// under the limit lets the monitor get there first. Classified as KILLED it would be
 // cached, and cached kills are never revisited — the false score outlives the
 // bad host.
 //
@@ -1070,12 +1071,16 @@ type monitored struct {
 
 // runMonitored runs cmd (see makeCmd) under the RSS monitor, which kills
 // its process group over rssCap, and returns how it ended. An rssCap of 0
-// or less is no cap: the monitor still records the peak, and kills
-// nothing. A failure to
-// start is returned as an error, with nothing run (see startFailure).
+// or less is no cap: nothing polls, so peak reads 0. Only a run over the
+// cap is ever measured (see measureSuite), and with none there is no such
+// run. A failure to start is returned as an error, with nothing run (see
+// startFailure).
 func (w *Worker) runMonitored(cmd *exec.Cmd, rssCap int64) (monitored, error) {
 	if err := startCommandFunc(cmd); err != nil {
 		return monitored{}, err
+	}
+	if rssCap <= 0 {
+		return monitored{runErr: cmd.Wait()}, nil
 	}
 
 	// Resolve the process-group "handle" we'll later kill if RSS runs away.
@@ -1113,7 +1118,7 @@ func (w *Worker) runMonitored(cmd *exec.Cmd, rssCap int64) (monitored, error) {
 			case <-t.C:
 				rss := pgroupRSSBytes(pgid)
 				peak = max(peak, rss)
-				if rssCap > 0 && rss > rssCap {
+				if rss > rssCap {
 					killed.Store(true)
 					killPgroup(pgid)
 					return
