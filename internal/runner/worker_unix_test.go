@@ -640,27 +640,132 @@ func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 
 // TestWorkerTestRSSKillsRunawayBuild is TestWorkerTestRSSKillsRunaway for
 // a build: the monitor's kill of a compile or link reads TIMED OUT too, and
-// says which it stopped. The stand-in build fails on its own after the
-// monitor has polled it, as one the stubbed-out kill had stopped would. A
-// build keeps the default cap whatever its tests use, so nothing is
-// measured.
+// says which it stopped, once the package's build without any mutant is
+// seen to stay under the cap. That check is made once: a second mutant's
+// build over the cap isn't followed by another. The stand-in build fails
+// on its own after the monitor has polled it, as one the stubbed-out kill
+// had stopped would. A build keeps the default cap whatever its tests use,
+// so nothing is measured.
 func TestWorkerTestRSSKillsRunawayBuild(t *testing.T) {
 	mon := stubMemCap(t, 3<<20)
-	mon.rss.Store(999999 * 1024)
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), 30*time.Second)
-	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 0.5; exit 1"} },
-		func(string) []string { return []string{"true"} })
-	var result mutator.Mutant
-	stderr := captureStderr(t, func() { result = w.Test(context.Background(), m) })
-	if result.Status != mutator.StatusTimedOut {
-		t.Errorf("Status=%v, want TimedOut", result.Status)
+	n := 0
+	runs := fakeBuildsAndRuns(t, func(string) []string {
+		n++
+		if n == 2 { // the build without a mutant
+			mon.rss.Store(1024)
+			return []string{"sleep", "0.3"}
+		}
+		mon.rss.Store(999999 * 1024)
+		return []string{"sh", "-c", "sleep 0.5; exit 1"}
+	}, func(string) []string { return []string{"true"} })
+	const want = "gomutants: worker 0: building m/calc went over the 3 MiB memory cap and was killed, treating as TIMED OUT\n"
+	for range 2 {
+		var result mutator.Mutant
+		stderr := captureStderr(t, func() { result = w.Test(context.Background(), m) })
+		if result.Status != mutator.StatusTimedOut {
+			t.Errorf("Status=%v, want TimedOut", result.Status)
+		}
+		if stderr != want {
+			t.Errorf("stderr = %q, want %q", stderr, want)
+		}
 	}
-	if len(runs.runs) != 0 || len(runs.builds) != 1 {
-		t.Errorf("builds = %v, runs = %v, want one build and no run after a build the monitor stopped", runs.builds, runs.runs)
+	if want := []string{"m/calc", "m/calc", "m/calc"}; len(runs.runs) != 0 || !slices.Equal(runs.builds, want) {
+		t.Errorf("builds = %v, runs = %v, want %v and no run: each mutant's, and one without a mutant for the first", runs.builds, runs.runs, want)
 	}
-	want := "gomutants: worker 0: building m/calc went over the 3 MiB memory cap and was killed, treating as TIMED OUT\n"
-	if stderr != want {
-		t.Errorf("stderr = %q, want %q", stderr, want)
+}
+
+// TestWorkerTestBuildOverCapWithoutMutant: a build over the cap whose
+// package's build without any mutant goes over it too, or can't tell, is
+// INFRA ERROR, not TIMED OUT, which would drop every mutant of the package
+// from the efficacy denominator unsaid. INFRA ERROR isn't cached, and the
+// check is kept for the rest of the run: a later mutant's build over the
+// cap isn't followed by another.
+func TestWorkerTestBuildOverCapWithoutMutant(t *testing.T) {
+	const overCap = "gomutants: worker 0: building m/calc went over the 3 MiB memory cap, and building it without a mutant didn't stay under it, treating as INFRA ERROR\n"
+	cases := []struct {
+		name string
+		// unmutated is the build without a mutant, and rss what it uses.
+		unmutated []string
+		rss       int64
+		startErr  bool // its start fails instead
+		want      string
+	}{
+		{"over cap too", []string{"sh", "-c", "sleep 0.5; exit 1"}, 999999 * 1024, false,
+			"gomutants: worker 0: building m/calc without a mutant goes over the 3 MiB memory cap too; raise --memory-cap to test its mutants\n"},
+		{"fails", []string{"sh", "-c", "echo undefined: x >&2; exit 1"}, 1024, false,
+			"gomutants: worker 0: can't tell whether m/calc's build fits under the memory cap without a mutant: building it: exit status 1\nundefined: x\n"},
+		{"fails to start", []string{"true"}, 1024, true,
+			"gomutants: worker 0: can't tell whether m/calc's build fits under the memory cap without a mutant: fork failed\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mon := stubMemCap(t, 3<<20)
+			w, m := fakeWorker(t, nil, 30*time.Second)
+			n := 0
+			runs := fakeBuildsAndRuns(t, func(string) []string {
+				n++
+				if n == 2 {
+					mon.rss.Store(tc.rss)
+					return tc.unmutated
+				}
+				mon.rss.Store(999999 * 1024)
+				return []string{"sh", "-c", "sleep 0.5; exit 1"}
+			}, func(string) []string { return []string{"true"} })
+			if tc.startErr {
+				start := startCommandFunc
+				calls := 0
+				startCommandFunc = func(cmd *exec.Cmd) error {
+					calls++
+					if calls == 2 {
+						n++ // the stand-in isn't asked for it
+						return errors.New("fork failed")
+					}
+					return start(cmd)
+				}
+			}
+			for _, want := range []string{tc.want + overCap, overCap} {
+				var got mutator.Mutant
+				stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
+				if got.Status != mutator.StatusInfraError {
+					t.Errorf("Status=%v, want InfraError", got.Status)
+				}
+				if stderr != want {
+					t.Errorf("stderr = %q, want %q", stderr, want)
+				}
+			}
+			if n != 3 || len(runs.runs) != 0 {
+				t.Errorf("%d builds, runs = %v, want 3 and none: each mutant's, and one without a mutant for the first", n, runs.runs)
+			}
+		})
+	}
+}
+
+// TestWorkerTestCancelledBuildCheckSaysNothing: a cancel of ctx during the
+// build without any mutant says nothing of it, nor of the mutant's build
+// over the cap: the run is ending, and the mutant is discarded.
+func TestWorkerTestCancelledBuildCheckSaysNothing(t *testing.T) {
+	mon := stubMemCap(t, 3<<20)
+	mon.rss.Store(999999 * 1024)
+	w, m := fakeWorker(t, nil, 30*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	n := 0
+	fakeBuildsAndRuns(t, func(string) []string {
+		n++
+		if n == 2 {
+			mon.rss.Store(1024)
+			time.AfterFunc(100*time.Millisecond, cancel)
+			return []string{"sleep", "5"}
+		}
+		return []string{"sh", "-c", "sleep 0.5; exit 1"}
+	}, func(string) []string { return []string{"true"} })
+	var got mutator.Mutant
+	if stderr := captureStderr(t, func() { got = w.Test(ctx, m) }); stderr != "" {
+		t.Errorf("stderr = %q, want nothing said", stderr)
+	}
+	if got.Status != mutator.StatusPending || n != 2 {
+		t.Errorf("Status=%v after %d builds, want the mutant Pending after 2", got.Status, n)
 	}
 }
 
@@ -1237,7 +1342,9 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 		fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 0.3; exit 1"} },
 			func(string) []string { return []string{"true"} })
 		stderr := captureStderr(t, func() { w.Test(context.Background(), m) })
-		if want := "gomutants: worker 0: building m/calc went over the 5 MiB memory cap and was killed, treating as TIMED OUT\n"; stderr != want {
+		want := "gomutants: worker 0: building m/calc without a mutant goes over the 5 MiB memory cap too; raise --memory-cap to test its mutants\n" +
+			"gomutants: worker 0: building m/calc went over the 5 MiB memory cap, and building it without a mutant didn't stay under it, treating as INFRA ERROR\n"
+		if stderr != want {
 			t.Errorf("stderr = %q, want %q", stderr, want)
 		}
 	})

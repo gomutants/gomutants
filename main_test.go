@@ -609,6 +609,19 @@ func TestRunMemoryCapErrorsExitUsage(t *testing.T) {
 	}
 }
 
+// TestParseFlagsMemoryCap: a valid --memory-cap is parsed into the flags.
+// TestRunMemoryCapErrorsExitUsage can't tell: a flag that isn't defined
+// is a usage error naming memory-cap too.
+func TestParseFlagsMemoryCap(t *testing.T) {
+	opts, err := parseFlags([]string{"--memory-cap=4GiB", "./..."})
+	if err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if opts.flags.MemoryCap != "4GiB" {
+		t.Errorf("MemoryCap = %q, want 4GiB", opts.flags.MemoryCap)
+	}
+}
+
 // TestRunMemoryCap: the configured cap reaches the pool as is, unset as
 // the 2 GiB default, and off as config.NoMemoryCap, not as 0, which the
 // pool reads as unset. A value loadConfig would have rejected keeps the
