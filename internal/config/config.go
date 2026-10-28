@@ -43,7 +43,7 @@ type Config struct {
 	Tags string `yaml:"tags"`
 	// MemoryCap is the most memory a build or test run's process group
 	// may use before it is killed: a whole number of MiB or GiB ("4GiB",
-	// "3072MiB"), or "off". Empty is DefaultMemoryCap. A package whose
+	// "3072MiB"), from 64MiB to 1024GiB, or "off". Empty is DefaultMemoryCap. A package whose
 	// suite goes over it without any mutant still gets a raised cap for its
 	// test runs, up to four times this. Use MemoryCapBytes in callers.
 	MemoryCap string `yaml:"memory-cap"`
@@ -132,15 +132,21 @@ const DefaultMemoryCap int64 = 2 << 30
 // runner.ExecOpts).
 const NoMemoryCap int64 = -1
 
-// maxMemoryCap bounds memory-cap at 1 TiB, so a package's raised cap,
-// up to four times it, can't overflow an int64.
-const maxMemoryCap int64 = 1 << 40
+// minMemoryCap and maxMemoryCap bound memory-cap. 64 MiB is below what
+// any `go test -c` needs, so a cap under it is a slip of MiB for GiB,
+// which would read every mutant TIMED OUT or INFRA ERROR and test none. 1
+// TiB keeps a package's raised cap, up to four times it, from
+// overflowing an int64.
+const (
+	minMemoryCap int64 = 64 << 20
+	maxMemoryCap int64 = 1 << 40
+)
 
 // MemoryCapBytes returns the memory cap in bytes: DefaultMemoryCap when
-// unset, NoMemoryCap for "off", or the parsed size. A size is a positive
-// whole number with a MiB or GiB suffix, up to 1 TiB; the unit is
-// required, so "4G" or a bare "4096" can't be read as a size it doesn't
-// mean.
+// unset, NoMemoryCap for "off", or the parsed size. A size is a whole
+// number, digits alone with no leading zero, followed by MiB or GiB in any
+// case, from 64MiB to 1024GiB; the unit is required, so "4G" or a bare
+// "4096" can't be read as a size it doesn't mean.
 func (c *Config) MemoryCapBytes() (int64, error) {
 	s := strings.TrimSpace(c.MemoryCap)
 	if s == "" {
@@ -150,21 +156,31 @@ func (c *Config) MemoryCapBytes() (int64, error) {
 		return NoMemoryCap, nil
 	}
 	var unit int64
-	var digits string
-	switch {
-	case strings.HasSuffix(s, "MiB"):
-		unit, digits = 1<<20, strings.TrimSuffix(s, "MiB")
-	case strings.HasSuffix(s, "GiB"):
-		unit, digits = 1<<30, strings.TrimSuffix(s, "GiB")
+	var unitName string
+	switch suffix := s[len(s)-min(len(s), 3):]; {
+	case strings.EqualFold(suffix, "MiB"):
+		unit, unitName = 1<<20, "MiB"
+	case strings.EqualFold(suffix, "GiB"):
+		unit, unitName = 1<<30, "GiB"
 	default:
 		return 0, fmt.Errorf("memory-cap %q: want a size in MiB or GiB (e.g. 4GiB, 3072MiB) or off", c.MemoryCap)
 	}
-	n, err := strconv.ParseInt(digits, 10, 64)
-	if err != nil || n <= 0 {
+	digits := strings.TrimRight(s[:len(s)-3], " \t")
+	if digits == "" || digits[0] == '0' || strings.TrimLeft(digits, "0123456789") != "" {
 		return 0, fmt.Errorf("memory-cap %q: want a positive whole number of MiB or GiB (e.g. 4GiB, 3072MiB) or off", c.MemoryCap)
 	}
+	if len(digits) != len(s)-3 {
+		return 0, fmt.Errorf("memory-cap %q: write it without a space, as %s%s", c.MemoryCap, digits, unitName)
+	}
+	// Digits alone fail to parse only out of an int's range, as the largest
+	// int, which is over the bound too.
+	parsed, _ := strconv.Atoi(digits)
+	n := int64(parsed)
 	if n > maxMemoryCap/unit {
 		return 0, fmt.Errorf("memory-cap %q: must be at most 1024GiB", c.MemoryCap)
+	}
+	if n*unit < minMemoryCap {
+		return 0, fmt.Errorf("memory-cap %q: must be at least 64MiB (did you mean %dGiB?)", c.MemoryCap, n)
 	}
 	return n * unit, nil
 }

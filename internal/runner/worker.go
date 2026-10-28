@@ -429,6 +429,10 @@ func (c *binArgsCache) get(ctx context.Context, projectDir, tags, pkg string, fl
 // Read as TIMED OUT, its mutants drop out of the efficacy denominator,
 // and --threshold-efficacy passes on survivors. Twice what the suite uses
 // alone still stops a mutant that runs away in it.
+//
+// It also holds whether each package's build without any mutant stays
+// under the workers' cap (see Worker.buildBin), checked the first time a
+// build of the package goes over it.
 type suiteCaps struct {
 	mu   sync.Mutex
 	pkgs map[string]*suiteCap
@@ -441,6 +445,10 @@ type suiteCap struct {
 	mu       sync.Mutex
 	measured bool         // under mu: the suite's measurement was made
 	rssCap   atomic.Int64 // 0 until measured, and for a failed measurement
+	// built and buildFits, under mu: the build without any mutant was
+	// made, and it stayed under the cap.
+	built     bool
+	buildFits bool
 }
 
 func (c *suiteCaps) entry(pkg string) *suiteCap {
@@ -482,6 +490,20 @@ func (c *suiteCaps) measure(pkg string, measure func() int64) (int64, bool) {
 	}
 	n := e.rssCap.Load()
 	return n, n != 0
+}
+
+// buildFits returns whether pkg's build without any mutant stays under the
+// workers' cap, checking with fits on first use. The answer is kept for the
+// rest of the run, as measure's is.
+func (c *suiteCaps) buildFits(pkg string, fits func() bool) bool {
+	e := c.entry(pkg)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.built {
+		e.built = true
+		e.buildFits = fits()
+	}
+	return e.buildFits
 }
 
 // Worker tests a single mutant: it builds the test binary of each package
@@ -726,6 +748,14 @@ func (w *Worker) recheck(ctx context.Context, m mutator.Mutant, full map[string]
 // gets the worker's cap, w.memCap, whatever its package's tests get (see
 // suiteCaps): what a compile or link uses doesn't grow with what the tests
 // start.
+//
+// A mutant rarely changes what its package's compile or link uses, so a
+// build over the cap is more likely the package's than the mutant's. The
+// first time one goes over, the package is built once without any mutant
+// (see unmutatedBuildFits). If that goes over too, or can't tell, the
+// mutant is INFRA ERROR, which isn't cached: read as TIMED OUT, every
+// mutant of a package whose build needs more than the cap would drop out
+// of the efficacy denominator, leaving it untested without a word.
 func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.MutantStatus) {
 	if bin, ok := w.bins[pkg]; ok {
 		return bin, mutator.StatusLived
@@ -752,6 +782,12 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 			return "", mutator.StatusInfraError
 		}
 		if res.memKilled {
+			if !w.suiteCaps.buildFits(pkg, func() bool { return w.unmutatedBuildFits(ctx, pkg) }) {
+				if ctx.Err() == nil {
+					fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s went over the %d MiB memory cap, and building it without a mutant didn't stay under it, treating as %s\n", w.id, pkg, w.memCap>>20, mutator.StatusInfraError)
+				}
+				return "", mutator.StatusInfraError
+			}
 			w.reportMemKill("building", pkg, w.memCap)
 		}
 		return "", classifyBuildFailure(res.runErr, res.memKilled, stdout.String(), stderr.String())
@@ -904,24 +940,16 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 	}
 	bin := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-suite.test", w.id))
 	defer func() { _ = os.Remove(bin) }()
-	buildCtx, cancelBuild := context.WithTimeout(ctx, buildTimeout)
-	defer cancelBuild()
-	cmd, _, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, false))
-	proctree.Bound(cmd)
-	build, err := w.runMonitored(cmd, w.memCap)
+	build, stderr, err := w.buildUnmutated(ctx, pkg, bin)
 	if err != nil {
 		return fail(err.Error())
 	}
 	if build.runErr != nil {
-		why := "building it: " + build.runErr.Error()
-		if out := strings.TrimSpace(stderr.String()); out != "" {
-			why += "\n" + out
-		}
-		return fail(why)
+		return fail(buildFailure(build, stderr))
 	}
 	runCtx, cancelRun := context.WithTimeout(ctx, w.policy.Global)
 	defer cancelRun()
-	cmd, _, _ = w.makeCmd(runCtx, bin, dir, runArgs(nil, binArgs))
+	cmd, _, _ := w.makeCmd(runCtx, bin, dir, runArgs(nil, binArgs))
 	cmd.Env = w.binEnv(dir)
 	proctree.Bound(cmd)
 	ceiling := suiteRSSCeilingFactor * w.memCap
@@ -953,6 +981,54 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests use %d MiB without a mutant, so their memory cap is raised to %d MiB\n", w.id, pkg, res.peak>>20, rssCap>>20)
 	}
 	return rssCap
+}
+
+// unmutatedBuildFits builds pkg's test binary without any mutant and
+// reports whether the build finished under the worker's cap (see
+// buildBin). A build that fails another way, or fails to start, doesn't
+// tell, and reads as one that doesn't fit; either is said, unless ctx was
+// cancelled.
+func (w *Worker) unmutatedBuildFits(ctx context.Context, pkg string) bool {
+	bin := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-unmutated.test", w.id))
+	defer func() { _ = os.Remove(bin) }()
+	build, stderr, err := w.buildUnmutated(ctx, pkg, bin)
+	var why string
+	switch {
+	case ctx.Err() != nil:
+		return false
+	case err != nil:
+		why = err.Error()
+	case build.memKilled:
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s without a mutant goes over the %d MiB memory cap too; raise --memory-cap to test its mutants\n", w.id, pkg, w.memCap>>20)
+		return false
+	case build.runErr != nil:
+		why = buildFailure(build, stderr)
+	default:
+		return true
+	}
+	fmt.Fprintf(os.Stderr, "gomutants: worker %d: can't tell whether %s's build fits under the memory cap without a mutant: %s\n", w.id, pkg, why)
+	return false
+}
+
+// buildUnmutated builds pkg's test binary at bin without the overlay, as
+// buildBin does with it, and returns how the build ended and its stderr.
+func (w *Worker) buildUnmutated(ctx context.Context, pkg, bin string) (monitored, string, error) {
+	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
+	defer cancel()
+	cmd, _, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, false))
+	proctree.Bound(cmd)
+	res, err := w.runMonitored(cmd, w.memCap)
+	return res, stderr.String(), err
+}
+
+// buildFailure says why a build that ran failed: its error, then its
+// stderr.
+func buildFailure(build monitored, stderr string) string {
+	why := "building it: " + build.runErr.Error()
+	if out := strings.TrimSpace(stderr); out != "" {
+		why += "\n" + out
+	}
+	return why
 }
 
 // pkgDir returns the directory pkg's test binary runs from: the mutated
