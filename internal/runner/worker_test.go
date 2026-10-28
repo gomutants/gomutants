@@ -27,6 +27,9 @@ func TestPackageVarDefaults(t *testing.T) {
 	if got, want := maxSubprocRSSBytes, int64(2*1024*1024*1024); got != want {
 		t.Errorf("maxSubprocRSSBytes = %d, want %d (2 GiB)", got, want)
 	}
+	if NoMemoryCap != -1 {
+		t.Errorf("NoMemoryCap = %d, want -1", NoMemoryCap)
+	}
 	if got, want := monitorPollInterval, 1*time.Second; got != want {
 		t.Errorf("monitorPollInterval = %v, want %v", got, want)
 	}

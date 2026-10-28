@@ -1223,6 +1223,98 @@ func TestWorkerTestSuiteOverCeilingKeepsCap(t *testing.T) {
 	}
 }
 
+// TestWorkerTestMemCapIsTheWorkers: a worker's own cap (see
+// ExecOpts.MemoryCap), not the default, caps its builds and test runs, and
+// is the base its packages' raised caps and the measuring run's ceiling
+// are made from.
+func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
+	t.Run("build", func(t *testing.T) {
+		mon := stubMemCap(t, 2<<20)
+		mon.rss.Store(999999 * 1024)
+		w, m := fakeWorker(t, nil, 30*time.Second)
+		w.memCap = 5 << 20
+		fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 0.3; exit 1"} },
+			func(string) []string { return []string{"true"} })
+		stderr := captureStderr(t, func() { w.Test(context.Background(), m) })
+		if want := "gomutants: worker 0: building m/calc went over the 5 MiB memory cap and was killed, treating as TIMED OUT\n"; stderr != want {
+			t.Errorf("stderr = %q, want %q", stderr, want)
+		}
+	})
+	t.Run("raised", func(t *testing.T) {
+		mon := stubMemCap(t, 2<<20)
+		// Over the worker's 4 MiB, under twice it.
+		mon.rss.Store(5 << 20)
+		w, m := fakeWorker(t, nil, 30*time.Second)
+		w.memCap = 4 << 20
+		fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
+			func(string) []string { return []string{"sleep", "0.3"} })
+		var got mutator.Mutant
+		stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
+		if got.Status != mutator.StatusLived {
+			t.Errorf("Status=%v, want LIVED under the raised cap", got.Status)
+		}
+		if want := "gomutants: worker 0: m/calc's tests use 5 MiB without a mutant, so their memory cap is raised to 10 MiB\n"; stderr != want {
+			t.Errorf("stderr = %q, want %q", stderr, want)
+		}
+	})
+	t.Run("over ceiling", func(t *testing.T) {
+		mon := stubMemCap(t, 2<<20)
+		mon.rss.Store(999999 * 1024)
+		w, m := fakeWorker(t, nil, 30*time.Second)
+		w.memCap = 3 << 20
+		fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
+			func(string) []string { return []string{"sleep", "0.3"} })
+		stderr := captureStderr(t, func() { w.Test(context.Background(), m) })
+		want := "gomutants: worker 0: m/calc's tests go over 12 MiB without a mutant, so they keep the 3 MiB memory cap\n" +
+			"gomutants: worker 0: testing m/calc went over the 3 MiB memory cap and was killed, treating as TIMED OUT\n"
+		if stderr != want {
+			t.Errorf("stderr = %q, want %q", stderr, want)
+		}
+	})
+}
+
+// TestWorkerTestNoMemCapNeverKills: a worker whose cap is off (0 or less,
+// see ExecOpts.MemoryCap) has nothing killed whatever its runs use, and
+// the monitor still records the peak.
+func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
+	for _, memCap := range []int64{0, NoMemoryCap} {
+		t.Run(fmt.Sprint(memCap), func(t *testing.T) {
+			mon := stubMemCap(t, 2<<20)
+			mon.rss.Store(999999 * 1024)
+			w, m := fakeWorker(t, nil, 30*time.Second)
+			w.memCap = memCap
+			runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"sleep", "0.3"} },
+				func(string) []string { return []string{"sleep", "0.3"} })
+			var got mutator.Mutant
+			stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
+			if got.Status != mutator.StatusLived || mon.kills.Load() != 0 || len(runs.runs) != 1 || stderr != "" {
+				t.Errorf("Status=%v, kills = %d, runs = %v, stderr = %q, want LIVED from one run, nothing killed or said", got.Status, mon.kills.Load(), runs.runs, stderr)
+			}
+
+			cmd, _, _ := w.makeCmd(context.Background(), "sleep", t.TempDir(), []string{"0.3"})
+			res, err := w.runMonitored(cmd, memCap)
+			if err != nil {
+				t.Fatalf("runMonitored: %v", err)
+			}
+			if res.memKilled || res.peak != 999999*1024 {
+				t.Errorf("memKilled = %v, peak = %d, want no kill and the peak %d", res.memKilled, res.peak, 999999*1024)
+			}
+		})
+	}
+
+	// The smallest cap there is still caps.
+	stubMemCap(t, 2<<20).rss.Store(999999 * 1024)
+	w, _ := fakeWorker(t, nil, 30*time.Second)
+	cmd, _, _ := w.makeCmd(context.Background(), "sleep", t.TempDir(), []string{"0.3"})
+	res, err := w.runMonitored(cmd, 1)
+	if err != nil {
+		t.Fatalf("runMonitored: %v", err)
+	}
+	if !res.memKilled {
+		t.Error("a 1-byte cap killed nothing, want the run over it killed")
+	}
+}
+
 // TestWorkerTestSuiteMeasureFailureKept: a run over the cap whose
 // package's suite can't be measured is INFRA ERROR, not TIMED OUT: there
 // is no telling whether the mutant or its suite went over, and INFRA

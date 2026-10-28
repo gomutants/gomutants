@@ -22,25 +22,28 @@ import (
 	"github.com/gomutants/gomutants/internal/proctree"
 )
 
-// maxSubprocRSSBytes caps per-mutant subprocess group memory. A mutation that
-// flips a loop termination or allocation bound can make go test (or its test
-// binary) balloon to tens of GB within seconds. We SIGKILL the whole process
-// group at this cap; a killed mutant is classified as TimedOut, unless its
-// tests had already reported it (see classifyTestOutcome).
+// maxSubprocRSSBytes is the default memory cap of a worker's subprocess
+// groups (see Worker.memCap), for one ExecOpts.MemoryCap leaves unset. A
+// mutation that flips a loop termination or allocation bound can make go
+// test (or its test binary) balloon to tens of GB within seconds. We
+// SIGKILL the whole process group at the cap; a killed mutant is
+// classified as TimedOut, unless its tests had already reported it (see
+// classifyTestOutcome).
 //
-// A package whose suite needs more than this without any mutant gets a
+// A package whose suite needs more than the cap without any mutant gets a
 // higher cap for its test runs (see suiteCaps).
 //
 // var (not const) so tests can lower it to a tiny value and force the
-// monitor goroutine's kill path on a normal-sized test process.
+// monitor goroutine's kill path on a normal-sized test process. A worker
+// reads it when it is made.
 //
 // On Windows pgroupRSSBytes is a no-op (returns 0) so this cap never trips;
 // the per-mutant context timeout is the backstop there.
 var maxSubprocRSSBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
 
 // suiteRSSCeilingFactor bounds a run that measures a package's suite
-// without any mutant (see Worker.measureSuite) at this many times
-// maxSubprocRSSBytes, and a package's raised cap at the same, so the host
+// without any mutant (see Worker.measureSuite) at this many times the
+// worker's memory cap, and a package's raised cap at the same, so the host
 // is still protected from a suite that grows without end.
 const suiteRSSCeilingFactor = 4
 
@@ -414,13 +417,14 @@ func (c *binArgsCache) get(ctx context.Context, projectDir, tags, pkg string, fl
 }
 
 // suiteCaps holds the memory cap each package's test runs get, shared by
-// a pool's workers. A package's cap is maxSubprocRSSBytes until a run of
-// its tests goes over it. Its suite is then measured once without any
+// a pool's workers. A package's cap is the workers' (see Worker.memCap)
+// until a run of its tests goes over it. Its suite is then measured once without any
 // mutant (see Worker.measureSuite), and the cap becomes twice what that
 // run used, if that is higher, up to suiteRSSCeilingFactor times it.
 //
 // The cap sums every process a suite starts, so a suite whose tests run a
-// linter or an analyzer can go over 2 GiB with any mutant at all (#124).
+// linter or an analyzer can go over the default 2 GiB with any mutant at
+// all (#124).
 // Read as TIMED OUT, its mutants drop out of the efficacy denominator,
 // and --threshold-efficacy passes on survivors. Twice what the suite uses
 // alone still stops a mutant that runs away in it.
@@ -452,12 +456,13 @@ func (c *suiteCaps) entry(pkg string) *suiteCap {
 	return e
 }
 
-// get returns pkg's cap: maxSubprocRSSBytes until its suite is measured.
-func (c *suiteCaps) get(pkg string) int64 {
+// get returns pkg's cap: base, the workers' cap, until its suite is
+// measured.
+func (c *suiteCaps) get(pkg string, base int64) int64 {
 	if n := c.entry(pkg).rssCap.Load(); n != 0 {
 		return n
 	}
-	return maxSubprocRSSBytes
+	return base
 }
 
 // measure returns pkg's cap, measuring its suite with measure on first
@@ -503,6 +508,12 @@ type Worker struct {
 	// suiteCaps holds each package's memory cap for its test runs; a
 	// pool's workers share one.
 	suiteCaps *suiteCaps
+
+	// memCap is the memory cap of every build and test run's process
+	// group, and the base of each package's cap for its test runs (see
+	// suiteCaps). maxSubprocRSSBytes unless the pool sets one; 0 or less
+	// is no cap (see runMonitored).
+	memCap int64
 
 	// childGOMAXPROCS, if > 0, caps the GOMAXPROCS of each `go test` child.
 	// Limits compile + test runtime parallelism per child so N parallel workers
@@ -567,6 +578,7 @@ func NewWorker(id int, tmpDir string, policy TimeoutPolicy, sourceCache map[stri
 		testMap:     testMap,
 		binArgs:     &binArgsCache{},
 		suiteCaps:   &suiteCaps{},
+		memCap:      maxSubprocRSSBytes,
 	}, nil
 }
 
@@ -709,9 +721,9 @@ func (w *Worker) recheck(ctx context.Context, m mutator.Mutant, full map[string]
 // hangs: it kills the build's whole process group, so a tool `go` started
 // goes with it, and reads as InfraError, as a hung build is the host's
 // failure, not the mutant's verdict. ctx still cancels the build. A build
-// gets the default cap, maxSubprocRSSBytes, whatever its package's tests
-// get (see suiteCaps): what a compile or link uses doesn't grow with what
-// the tests start.
+// gets the worker's cap, w.memCap, whatever its package's tests get (see
+// suiteCaps): what a compile or link uses doesn't grow with what the tests
+// start.
 func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.MutantStatus) {
 	if bin, ok := w.bins[pkg]; ok {
 		return bin, mutator.StatusLived
@@ -726,7 +738,7 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 	defer cancel()
 	cmd, stdout, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, true))
 	proctree.Bound(cmd)
-	res, err := w.runMonitored(cmd, maxSubprocRSSBytes)
+	res, err := w.runMonitored(cmd, w.memCap)
 	if err != nil {
 		return "", w.startFailure(err)
 	}
@@ -738,7 +750,7 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 			return "", mutator.StatusInfraError
 		}
 		if res.memKilled {
-			w.reportMemKill("building", pkg, maxSubprocRSSBytes)
+			w.reportMemKill("building", pkg, w.memCap)
 		}
 		return "", classifyBuildFailure(res.runErr, res.memKilled, stdout.String(), stderr.String())
 	}
@@ -808,7 +820,7 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %v, treating as %s\n", w.id, err, mutator.StatusInfraError)
 		return binRun{status: mutator.StatusInfraError}
 	}
-	rssCap := w.suiteCaps.get(run.pkg)
+	rssCap := w.suiteCaps.get(run.pkg, w.memCap)
 	r := w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
 	if r.overCap() {
 		raised, ok := w.suiteCaps.measure(run.pkg, func() int64 { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
@@ -866,7 +878,7 @@ func (w *Worker) runBinOnce(ctx context.Context, run pkgRun, bin, dir string, bi
 // measureSuite runs pkg's whole suite from dir without any mutant, from a
 // binary built without the overlay, and returns the memory cap its test
 // runs get (see suiteCaps): twice the most the run was seen to use, or
-// maxSubprocRSSBytes if that is higher. It is 0 when the suite couldn't
+// the worker's cap, w.memCap, if that is higher. It is 0 when the suite couldn't
 // be built or run, or ctx was cancelled, or the memory probe read nothing
 // of a run that lasted past two of its polls: a live process group uses
 // some memory, so that is the probe's outage (see pgroupRSSBytes), and a
@@ -877,10 +889,10 @@ func (w *Worker) runBinOnce(ctx context.Context, run pkgRun, bin, dir string, bi
 // suite uses, if maybe not all, as -failfast stops it at the first
 // failure; that is said.
 //
-// The run is stopped at suiteRSSCeilingFactor times maxSubprocRSSBytes,
-// and the cap is never raised past that, the most a run of the package is
-// let use. A suite that goes over that alone keeps maxSubprocRSSBytes, so
-// its mutants that go over it read TIMED OUT, as before.
+// The run is stopped at suiteRSSCeilingFactor times w.memCap, and the cap
+// is never raised past that, the most a run of the package is let use. A
+// suite that goes over that alone keeps w.memCap, so its mutants that go
+// over it read TIMED OUT, as before.
 func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []string) int64 {
 	fail := func(why string) int64 {
 		if ctx.Err() == nil {
@@ -894,7 +906,7 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 	defer cancelBuild()
 	cmd, _, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, false))
 	proctree.Bound(cmd)
-	build, err := w.runMonitored(cmd, maxSubprocRSSBytes)
+	build, err := w.runMonitored(cmd, w.memCap)
 	if err != nil {
 		return fail(err.Error())
 	}
@@ -910,7 +922,7 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 	cmd, _, _ = w.makeCmd(runCtx, bin, dir, runArgs(nil, binArgs))
 	cmd.Env = w.binEnv(dir)
 	proctree.Bound(cmd)
-	ceiling := suiteRSSCeilingFactor * maxSubprocRSSBytes
+	ceiling := suiteRSSCeilingFactor * w.memCap
 	start := time.Now()
 	res, err := w.runMonitored(cmd, ceiling)
 	if err != nil {
@@ -920,8 +932,8 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 		return 0
 	}
 	if res.memKilled {
-		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests go over %d MiB without a mutant, so they keep the %d MiB memory cap\n", w.id, pkg, ceiling>>20, maxSubprocRSSBytes>>20)
-		return maxSubprocRSSBytes
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests go over %d MiB without a mutant, so they keep the %d MiB memory cap\n", w.id, pkg, ceiling>>20, w.memCap>>20)
+		return w.memCap
 	}
 	// gomutants:disable-next-line CONDITIONALS_BOUNDARY reason="a run's elapsed time never lands on the threshold to the nanosecond, so > and >= can't be told apart"
 	if res.peak == 0 && time.Since(start) > 2*monitorPollInterval {
@@ -934,8 +946,8 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 		}
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests %s without a mutant, so the %d MiB they were seen to use may be less than they need\n", w.id, pkg, how, res.peak>>20)
 	}
-	rssCap := min(max(maxSubprocRSSBytes, 2*res.peak), ceiling)
-	if rssCap > maxSubprocRSSBytes {
+	rssCap := min(max(w.memCap, 2*res.peak), ceiling)
+	if rssCap > w.memCap {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests use %d MiB without a mutant, so their memory cap is raised to %d MiB\n", w.id, pkg, res.peak>>20, rssCap>>20)
 	}
 	return rssCap
@@ -979,7 +991,9 @@ type monitored struct {
 }
 
 // runMonitored runs cmd (see makeCmd) under the RSS monitor, which kills
-// its process group over rssCap, and returns how it ended. A failure to
+// its process group over rssCap, and returns how it ended. An rssCap of 0
+// or less is no cap: the monitor still records the peak, and kills
+// nothing. A failure to
 // start is returned as an error, with nothing run (see startFailure).
 func (w *Worker) runMonitored(cmd *exec.Cmd, rssCap int64) (monitored, error) {
 	if err := startCommandFunc(cmd); err != nil {
@@ -1021,7 +1035,7 @@ func (w *Worker) runMonitored(cmd *exec.Cmd, rssCap int64) (monitored, error) {
 			case <-t.C:
 				rss := pgroupRSSBytes(pgid)
 				peak = max(peak, rss)
-				if rss > rssCap {
+				if rssCap > 0 && rss > rssCap {
 					killed.Store(true)
 					killPgroup(pgid)
 					return

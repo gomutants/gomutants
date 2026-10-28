@@ -134,6 +134,9 @@ func (mr *mutationRun) setup(ctx context.Context) error {
 	if mr.cfg.Cache != "" {
 		mr.goToolchain = goVersionFunc(ctx)
 		mr.loadedCache = cacheLoadFunc(mr.cfg.Cache, mr.goModule, cacheToolVersion(), mr.cfg.Tags, mr.cfg.CanonicalTestFlags(), mr.goToolchain)
+		// Before Lookup, so a TIMED OUT measured under another cap is
+		// tested again rather than replayed.
+		mr.loadedCache.SetMemoryCap(mr.memoryCap())
 		// Hasher is created before discovery's PreReadFiles so the
 		// coverage-key calc can use it. SetSrcCache is called once
 		// the in-memory source map exists (in preReadSources), so
@@ -384,6 +387,22 @@ func (mr *mutationRun) cachedCoverageProfile(ctx context.Context) bool {
 		}
 	}
 	return false
+}
+
+// memoryCap returns the run's memory cap in bytes, 0 for off (see
+// config.MemoryCapBytes). loadConfig has rejected a value it can't parse.
+func (mr *mutationRun) memoryCap() int64 {
+	n, _ := mr.cfg.MemoryCapBytes()
+	return n
+}
+
+// poolMemoryCap is memoryCap as runner.ExecOpts.MemoryCap takes it, where
+// 0 is the default and off is runner.NoMemoryCap.
+func (mr *mutationRun) poolMemoryCap() int64 {
+	if n := mr.memoryCap(); n != 0 {
+		return n
+	}
+	return runner.NoMemoryCap
 }
 
 // measureBaseline times one unmutated test run and derives the global
@@ -687,7 +706,7 @@ func (mr *mutationRun) runMutants(ctx context.Context) {
 	}
 	mr.profileBytes = nil
 
-	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields(), GOROOT: mr.goroot}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
+	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields(), GOROOT: mr.goroot, MemoryCap: mr.poolMemoryCap()}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
 	// interval into the run, not on the very first mutant.
 	mr.lastCheckpoint = time.Now()
