@@ -134,9 +134,6 @@ func (mr *mutationRun) setup(ctx context.Context) error {
 	if mr.cfg.Cache != "" {
 		mr.goToolchain = goVersionFunc(ctx)
 		mr.loadedCache = cacheLoadFunc(mr.cfg.Cache, mr.goModule, cacheToolVersion(), mr.cfg.Tags, mr.cfg.CanonicalTestFlags(), mr.goToolchain)
-		// Before Lookup, so a TIMED OUT measured under another cap is
-		// tested again rather than replayed.
-		mr.loadedCache.SetMemoryCap(mr.memoryCap())
 		// Hasher is created before discovery's PreReadFiles so the
 		// coverage-key calc can use it. SetSrcCache is called once
 		// the in-memory source map exists (in preReadSources), so

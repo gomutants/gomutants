@@ -37,8 +37,8 @@ timeout-coefficient: 10
 # Memory cap of each build and test run's process group, in MiB or GiB
 # (default: 2GiB). A run over it is killed and its mutant reads TIMED OUT.
 # A package whose tests go over it without any mutant gets up to 4x it for
-# its test runs. "off" disables it. Changing it tests cached TIMED OUT
-# mutants again and keeps the rest. No effect on Windows.
+# its test runs. "off" disables it. The cache doesn't record it, so a
+# cached TIMED OUT stays cached after a change. No effect on Windows.
 # memory-cap: 2GiB
 
 # JSON report output path (default: mutation-report.json).
