@@ -1383,13 +1383,20 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 
 // TestWorkerTestNoMemCapNeverKills: a worker whose cap is off
 // (config.NoMemoryCap, or 0, which runMonitored reads as none too) has
-// nothing killed whatever its runs use, and the monitor still records the
-// peak.
+// nothing killed whatever its runs use, and nothing polls its memory: a
+// probe that read the process table every second would cost each build and
+// run for a peak nothing reads.
 func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
 	for _, memCap := range []int64{0, config.NoMemoryCap} {
 		t.Run(fmt.Sprint(memCap), func(t *testing.T) {
 			mon := stubMemCap(t, 2<<20)
 			mon.rss.Store(999999 * 1024)
+			var polls atomic.Int32
+			probe := groupRSSFunc
+			groupRSSFunc = func(pgid int) (int64, error) {
+				polls.Add(1)
+				return probe(pgid)
+			}
 			w, m := fakeWorker(t, nil, 30*time.Second)
 			w.memCap = memCap
 			runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"sleep", "0.3"} },
@@ -1405,8 +1412,8 @@ func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
 			if err != nil {
 				t.Fatalf("runMonitored: %v", err)
 			}
-			if res.memKilled || res.peak != 999999*1024 {
-				t.Errorf("memKilled = %v, peak = %d, want no kill and the peak %d", res.memKilled, res.peak, 999999*1024)
+			if res.memKilled || res.peak != 0 || polls.Load() != 0 {
+				t.Errorf("memKilled = %v, peak = %d, polls = %d, want no kill and nothing polled", res.memKilled, res.peak, polls.Load())
 			}
 		})
 	}
@@ -1421,6 +1428,16 @@ func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
 	}
 	if !res.memKilled {
 		t.Error("a 1-byte cap killed nothing, want the run over it killed")
+	}
+}
+
+// TestRunMonitoredNoCapReportsFailure: with no cap, nothing polls, and a
+// run that fails still returns its exit error.
+func TestRunMonitoredNoCapReportsFailure(t *testing.T) {
+	w, _ := fakeWorker(t, nil, 30*time.Second)
+	cmd, _, _ := w.makeCmd(context.Background(), "false", t.TempDir(), nil)
+	if res, err := w.runMonitored(cmd, config.NoMemoryCap); err != nil || res.runErr == nil {
+		t.Errorf("runMonitored(false) = %+v, %v, want its exit error", res, err)
 	}
 }
 
