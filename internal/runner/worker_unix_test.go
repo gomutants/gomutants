@@ -877,21 +877,26 @@ func TestWorkerTestPackageWithoutTests(t *testing.T) {
 // the binaries' arguments, which can wait on another worker's read. Each
 // run takes 0.6s of a 1s deadline: shared, the second is cut off. Each
 // build takes 1.2s: counted, even one would be. A 0.6s read and two 0.3s
-// runs: counted, the second run would get 0.1s.
+// runs: counted, the second run would get 0.1s. A 0.1s run of m/calc, the
+// mutant's own package and so the first, leaves m/app's 0.5s run 0.9s,
+// where the first run's time alone would leave it 0.1s: 0.4s to spare
+// either way, as the cases above are near ties for that.
 func TestWorkerTestRunDeadline(t *testing.T) {
 	const calc, app = "m/calc", "m/app"
 	both := []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}, {Pkg: app, Name: "TestApp"}}
 	cases := []struct {
-		name  string
-		refs  []coverage.TestRef
-		build []string
-		args  time.Duration
-		run   []string
-		want  mutator.MutantStatus
+		name   string
+		refs   []coverage.TestRef
+		build  []string
+		args   time.Duration
+		run    []string
+		appRun []string // m/app's run, if not run
+		want   mutator.MutantStatus
 	}{
-		{"builds don't count", []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}}, []string{"sleep", "1.2"}, 0, []string{"true"}, mutator.StatusLived},
-		{"reading args doesn't count", both, []string{"true"}, 600 * time.Millisecond, []string{"sleep", "0.3"}, mutator.StatusLived},
-		{"runs share it", both, []string{"true"}, 0, []string{"sleep", "0.6"}, mutator.StatusTimedOut},
+		{"builds don't count", []coverage.TestRef{{Pkg: calc, Name: "TestCalc"}}, []string{"sleep", "1.2"}, 0, []string{"true"}, nil, mutator.StatusLived},
+		{"reading args doesn't count", both, []string{"true"}, 600 * time.Millisecond, []string{"sleep", "0.3"}, nil, mutator.StatusLived},
+		{"runs share it", both, []string{"true"}, 0, []string{"sleep", "0.6"}, nil, mutator.StatusTimedOut},
+		{"a run leaves the rest", both, []string{"true"}, 0, []string{"sleep", "0.1"}, []string{"sleep", "0.5"}, mutator.StatusLived},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -900,7 +905,12 @@ func TestWorkerTestRunDeadline(t *testing.T) {
 			tm := routeMap("f.go:1", tc.refs...).WithSuitesForTesting(false, nil,
 				coverage.Package{ImportPath: calc}, coverage.Package{ImportPath: app})
 			w, m := fakeWorker(t, tm, time.Second)
-			fakeBuildsAndRuns(t, func(string) []string { return tc.build }, func(string) []string { return tc.run })
+			fakeBuildsAndRuns(t, func(string) []string { return tc.build }, func(pkg string) []string {
+				if pkg == app && tc.appRun != nil {
+					return tc.appRun
+				}
+				return tc.run
+			})
 			testBinaryArgsFunc = func(context.Context, string, string, string, []string) ([]string, error) {
 				time.Sleep(tc.args)
 				return nil, nil
