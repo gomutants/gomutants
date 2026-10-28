@@ -649,16 +649,7 @@ func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 func TestWorkerTestRSSKillsRunawayBuild(t *testing.T) {
 	mon := stubMemCap(t, 3<<20)
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), 30*time.Second)
-	n := 0
-	runs := fakeBuildsAndRuns(t, func(string) []string {
-		n++
-		if n == 2 { // the build without a mutant
-			mon.rss.Store(1024)
-			return []string{"sleep", "0.3"}
-		}
-		mon.rss.Store(999999 * 1024)
-		return []string{"sh", "-c", "sleep 0.5; exit 1"}
-	}, func(string) []string { return []string{"true"} })
+	_, runs := fakeBuildsOverCap(t, mon, []string{"sleep", "0.3"}, 1024)
 	const want = "gomutants: worker 0: building m/calc went over the 3 MiB memory cap and was killed, treating as TIMED OUT\n"
 	for range 2 {
 		var result mutator.Mutant
@@ -702,42 +693,66 @@ func TestWorkerTestBuildOverCapWithoutMutant(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mon := stubMemCap(t, 3<<20)
 			w, m := fakeWorker(t, nil, 30*time.Second)
-			n := 0
-			runs := fakeBuildsAndRuns(t, func(string) []string {
-				n++
-				if n == 2 {
-					mon.rss.Store(tc.rss)
-					return tc.unmutated
-				}
-				mon.rss.Store(999999 * 1024)
-				return []string{"sh", "-c", "sleep 0.5; exit 1"}
-			}, func(string) []string { return []string{"true"} })
+			n, runs := fakeBuildsOverCap(t, mon, tc.unmutated, tc.rss)
 			if tc.startErr {
-				start := startCommandFunc
-				calls := 0
-				startCommandFunc = func(cmd *exec.Cmd) error {
-					calls++
-					if calls == 2 {
-						n++ // the stand-in isn't asked for it
-						return errors.New("fork failed")
-					}
-					return start(cmd)
-				}
+				failSecondStart(func() { *n++ }) // the stand-in isn't asked for it
 			}
-			for _, want := range []string{tc.want + overCap, overCap} {
-				var got mutator.Mutant
-				stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
-				if got.Status != mutator.StatusInfraError {
-					t.Errorf("Status=%v, want InfraError", got.Status)
-				}
-				if stderr != want {
-					t.Errorf("stderr = %q, want %q", stderr, want)
-				}
-			}
-			if n != 3 || len(runs.runs) != 0 {
-				t.Errorf("%d builds, runs = %v, want 3 and none: each mutant's, and one without a mutant for the first", n, runs.runs)
+			wantInfraErrors(t, w, m, tc.want+overCap, overCap)
+			if *n != 3 || len(runs.runs) != 0 {
+				t.Errorf("%d builds, runs = %v, want 3 and none: each mutant's, and one without a mutant for the first", *n, runs.runs)
 			}
 		})
+	}
+}
+
+// fakeBuildsOverCap fakes every build as one over the cap that fails on
+// its own after the monitor has polled it, but the second, the package's
+// build without a mutant, which runs unmutated and uses rss. Each run
+// passes. It returns how many builds were asked for, and what ran.
+func fakeBuildsOverCap(t *testing.T, mon *memCapStub, unmutated []string, rss int64) (*int, *fakeRuns) {
+	t.Helper()
+	n := 0
+	runs := fakeBuildsAndRuns(t, func(string) []string {
+		n++
+		if n == 2 {
+			mon.rss.Store(rss)
+			return unmutated
+		}
+		mon.rss.Store(999999 * 1024)
+		return []string{"sh", "-c", "sleep 0.5; exit 1"}
+	}, func(string) []string { return []string{"true"} })
+	return &n, runs
+}
+
+// failSecondStart fails the second command started, the build without a
+// mutant, with "fork failed", after calling failed. It wraps the stand-in
+// already in place, whose cleanup puts the original back.
+func failSecondStart(failed func()) {
+	start := startCommandFunc
+	calls := 0
+	startCommandFunc = func(cmd *exec.Cmd) error {
+		calls++
+		if calls == 2 {
+			failed()
+			return errors.New("fork failed")
+		}
+		return start(cmd)
+	}
+}
+
+// wantInfraErrors tests m with w once per entry of wants, and wants each
+// test INFRA ERROR, saying that entry.
+func wantInfraErrors(t *testing.T, w *Worker, m mutator.Mutant, wants ...string) {
+	t.Helper()
+	for _, want := range wants {
+		var got mutator.Mutant
+		stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
+		if got.Status != mutator.StatusInfraError {
+			t.Errorf("Status=%v, want InfraError", got.Status)
+		}
+		if stderr != want {
+			t.Errorf("stderr = %q, want %q", stderr, want)
+		}
 	}
 }
 
