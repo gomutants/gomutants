@@ -168,14 +168,7 @@ type Cache struct {
 	// the cache rather than reuse stale equivalence (or any other) verdicts.
 	// omitempty + the default "" keeps pre-v4 caches inert (they fail the
 	// gate on the SchemaVersion bump anyway).
-	GoToolchain string `json:"go_toolchain,omitempty"`
-	// MemoryCapMiB is the `--memory-cap` the cache's entries were measured
-	// under, in MiB, or -1 for off (see SetMemoryCap). Unlike BuildTags and
-	// TestFlags it doesn't join the metadata gate: a cap only cuts runs
-	// short, so a change reruns the TIMED OUT entries and keeps the rest.
-	// Absent (0) reads as the default 2 GiB, the only cap a cache written
-	// without the field can have been measured under, so those stay usable.
-	MemoryCapMiB    int64   `json:"memory_cap_mib,omitempty"`
+	GoToolchain     string  `json:"go_toolchain,omitempty"`
 	CoverageKey     string  `json:"coverage_key,omitempty"`
 	CoverageProfile string  `json:"coverage_profile,omitempty"`
 	Entries         []Entry `json:"entries"`
@@ -669,37 +662,6 @@ func Load(path, goModule, toolVersion, buildTags, testFlags, goToolchain string)
 		return empty
 	}
 	return &c
-}
-
-// defaultMemoryCapMiB is the memory cap a cache without MemoryCapMiB was
-// measured under: the default 2 GiB.
-const defaultMemoryCapMiB = 2048
-
-// SetMemoryCap records capBytes, the run's memory cap in bytes (0 for
-// off), as the cap c's entries are measured under. If c's were measured
-// under another, its TIMED OUT entries are dropped first: a mutant the old
-// cap stopped can live or be killed under a higher one, and one stopped
-// at its deadline is rerun with them, as entries don't say which stopped
-// them.
-//
-// KILLED and LIVED entries are kept either way. After the cap is lowered,
-// a fresh run could stop some of those at the new cap and read TIMED OUT;
-// the kept verdict is still true, measured with more room. Nil-safe, like
-// Lookup.
-func (c *Cache) SetMemoryCap(capBytes int64) {
-	if c == nil {
-		return
-	}
-	mib := capBytes >> 20
-	if mib == 0 {
-		mib = -1
-	}
-	if cmp.Or(c.MemoryCapMiB, defaultMemoryCapMiB) != mib {
-		c.Entries = slices.DeleteFunc(c.Entries, func(e Entry) bool {
-			return parseStatus(e.Status) == mutator.StatusTimedOut
-		})
-	}
-	c.MemoryCapMiB = mib
 }
 
 // Save writes c to path, creating parent directories as needed. The
