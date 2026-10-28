@@ -98,6 +98,9 @@ func parseFlags(args []string) (*cliOptions, error) {
 		return nil
 	})
 	fs.StringVar(&f.CoverPkg, "coverpkg", "", "coverage package pattern")
+	// The back-quoted `size` is the value placeholder; see the
+	// --test-flags comment below for why it must come first.
+	fs.StringVar(&f.MemoryCap, "memory-cap", "", "memory cap: a build or test run whose process group uses more than this `size` (MiB or GiB, e.g. 4GiB, 3072MiB) is killed, and its mutant reads TIMED OUT; off disables it (default: 2GiB). A package whose tests go over it without any mutant gets up to 4x it for its test runs. No effect on Windows")
 	fs.StringVar(&f.Tags, "tags", "", "comma-separated build tags forwarded as -tags to the inner go list/go test (gremlins-compat)")
 	// fs.Func rather than StringVar so repeated --test-flags accumulate
 	// instead of the last one silently winning; a user building the value
@@ -206,6 +209,10 @@ func loadConfig(opts *cliOptions) (config.Config, runFilters, error) {
 	// Checked after ApplyFlags so a value from .gomutants.yml is screened
 	// too, not just the CLI one.
 	if err := checkTestFlags(cfg.TestFlagFields()); err != nil {
+		return cfg, runFilters{}, usageError(err)
+	}
+	if _, err := cfg.MemoryCapBytes(); err != nil {
+		// gomutants:disable-next-line RETURN_ZERO reason="run drops cfg on an error, as on every other return of loadConfig's"
 		return cfg, runFilters{}, usageError(err)
 	}
 

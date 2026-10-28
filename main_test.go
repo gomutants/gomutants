@@ -579,6 +579,55 @@ func TestRunConfigLoadError(t *testing.T) {
 	}
 }
 
+// TestRunMemoryCapErrorsExitUsage: a memory cap that doesn't parse is a
+// usage error, from the flag or from .gomutants.yml. Each run is a dry
+// run of a one-file module, so one that wrongly goes ahead ends in
+// seconds rather than mutation-testing the working directory.
+func TestRunMemoryCapErrorsExitUsage(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module testmod\n\ngo 1.26\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte("package testmod\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "cap.yml")
+	if err := os.WriteFile(cfgPath, []byte("memory-cap: nope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(dir)
+	for _, args := range [][]string{
+		{"--memory-cap=3GB"},
+		{"--memory-cap=0GiB"},
+		{"--config", cfgPath},
+	} {
+		err := run(context.Background(), append(args, "--cache=off", "--dry-run", "testmod"))
+		requireExitCode(t, err, exitCodeUsageError)
+		if !strings.Contains(err.Error(), "memory-cap") {
+			t.Errorf("%v: error should name memory-cap, got: %v", args, err)
+		}
+	}
+}
+
+// TestPoolMemoryCap: the configured cap reaches the pool as is, unset as
+// the 2 GiB default, and off as runner.NoMemoryCap, not as 0, which the
+// pool reads as unset.
+func TestPoolMemoryCap(t *testing.T) {
+	for _, tt := range []struct {
+		in   string
+		want int64
+	}{
+		{"", 2 << 30},
+		{"4GiB", 4 << 30},
+		{"off", runner.NoMemoryCap},
+	} {
+		mr := &mutationRun{cfg: config.Config{MemoryCap: tt.in}}
+		if got := mr.poolMemoryCap(); got != tt.want {
+			t.Errorf("memory-cap %q: poolMemoryCap() = %d, want %d", tt.in, got, tt.want)
+		}
+	}
+}
+
 // TestRunResolvePackagesError kills BRANCH_IF on the discover.ResolvePackages
 // error check by pointing at a package pattern go-list can't resolve.
 func TestRunResolvePackagesError(t *testing.T) {

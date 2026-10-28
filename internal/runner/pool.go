@@ -22,15 +22,21 @@ type ResultCallback func(m mutator.Mutant)
 // ExecOpts bundles the inner `go test` knobs forwarded to each worker:
 // TestCPU (0 omits -cpu, letting go test default to GOMAXPROCS), Tags
 // (empty omits -tags), TestFlags (user-supplied flags appended verbatim;
-// nil appends nothing), and GOROOT (the toolchain's, put first on PATH for
-// every test binary as `go test` does; empty leaves PATH alone). Grouped
-// into one struct so NewPool stays within a sane parameter count.
+// nil appends nothing), GOROOT (the toolchain's, put first on PATH for
+// every test binary as `go test` does; empty leaves PATH alone), and
+// MemoryCap (the memory cap of each build and test run in bytes, see
+// Worker.memCap; 0 keeps the default 2 GiB, NoMemoryCap turns it off).
+// Grouped into one struct so NewPool stays within a sane parameter count.
 type ExecOpts struct {
 	TestCPU   int
 	Tags      string
 	TestFlags []string
 	GOROOT    string
+	MemoryCap int64
 }
+
+// NoMemoryCap is the ExecOpts.MemoryCap that turns the memory cap off.
+const NoMemoryCap int64 = -1
 
 // Pool coordinates parallel mutation testing.
 type Pool struct {
@@ -186,7 +192,8 @@ func failPending(mutants []mutator.Mutant, pending []int, onResult ResultCallbac
 // childGOMAXPROCS each ended up with — neither of which is observable
 // through the pool's mutant return value. The workers share one read of
 // the arguments their test binaries are run with (see binArgsCache), and
-// each package's memory cap (see suiteCaps).
+// each package's memory cap (see suiteCaps), whose base is
+// ExecOpts.MemoryCap.
 func (p *Pool) createWorkers() []*Worker {
 	workers := make([]*Worker, 0, p.workers)
 	cap := childGOMAXPROCSFor(p.workers)
@@ -205,6 +212,9 @@ func (p *Pool) createWorkers() []*Worker {
 		w.testFlags = p.exec.TestFlags
 		w.binArgs = binArgs
 		w.suiteCaps = caps
+		if p.exec.MemoryCap != 0 {
+			w.memCap = p.exec.MemoryCap
+		}
 		workers = append(workers, w)
 	}
 	return workers

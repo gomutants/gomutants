@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -877,5 +878,92 @@ func TestLoadIgnoresRunMutantID(t *testing.T) {
 	}
 	if cfg.RunMutantID != "" {
 		t.Errorf("RunMutantID=%q, want empty — the config key must be ignored", cfg.RunMutantID)
+	}
+}
+
+func TestMemoryCapBytes(t *testing.T) {
+	const (
+		unit  = "want a size in MiB or GiB"
+		whole = "want a positive whole number"
+		most  = "must be at most 1024GiB"
+	)
+	tests := []struct {
+		in      string
+		want    int64
+		wantErr string // "" for none
+	}{
+		{"", DefaultMemoryCap, ""},
+		{"  ", DefaultMemoryCap, ""},
+		{"off", 0, ""},
+		{"OFF", 0, ""},
+		{"1MiB", 1 << 20, ""},
+		{"3072MiB", 3072 << 20, ""},
+		{"4GiB", 4 << 30, ""},
+		{" 4GiB ", 4 << 30, ""},
+		{"1024GiB", 1 << 40, ""},
+		{"1048576MiB", 1 << 40, ""},
+		{"1025GiB", 0, most},
+		{"1048577MiB", 0, most},
+		// Over 1<<62, which parses as an int64 but not in 63 bits.
+		{"9223372036854775807MiB", 0, most},
+		// Over an int64: ParseInt's range error, not the 1 TiB bound.
+		{"9223372036854775808MiB", 0, whole},
+		{"4096", 0, unit},
+		{"4G", 0, unit},
+		{"4GB", 0, unit},
+		{"4gib", 0, unit},
+		{"nope", 0, unit},
+		{"GiB", 0, whole},
+		{"0GiB", 0, whole},
+		{"-1GiB", 0, whole},
+		{"1.5GiB", 0, whole},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			c := Config{MemoryCap: tt.in}
+			got, err := c.MemoryCapBytes()
+			if got != tt.want {
+				t.Errorf("MemoryCapBytes(%q)=%d, want %d", tt.in, got, tt.want)
+			}
+			switch {
+			case tt.wantErr == "" && err != nil:
+				t.Errorf("MemoryCapBytes(%q) err=%v, want none", tt.in, err)
+			case tt.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tt.wantErr) || !strings.Contains(err.Error(), "memory-cap")):
+				t.Errorf("MemoryCapBytes(%q) err=%v, want one naming memory-cap that says %q", tt.in, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDefaultMemoryCapValue(t *testing.T) {
+	if DefaultMemoryCap != 2*1024*1024*1024 {
+		t.Errorf("DefaultMemoryCap=%d, want 2 GiB", DefaultMemoryCap)
+	}
+}
+
+// TestMemoryCap pins the YAML key and the merge: --memory-cap overrides
+// the file, and an empty flag leaves it alone.
+func TestMemoryCap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".gomutants.yml")
+	if err := os.WriteFile(path, []byte("memory-cap: 4GiB\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MemoryCap != "4GiB" {
+		t.Fatalf("MemoryCap=%q, want 4GiB from YAML", cfg.MemoryCap)
+	}
+
+	cfg.ApplyFlags(Flags{})
+	if cfg.MemoryCap != "4GiB" {
+		t.Errorf("MemoryCap=%q after an empty flag, want the YAML value kept", cfg.MemoryCap)
+	}
+
+	cfg.ApplyFlags(Flags{MemoryCap: "off"})
+	if cfg.MemoryCap != "off" {
+		t.Errorf("MemoryCap=%q, want off from the flag", cfg.MemoryCap)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,12 @@ type Config struct {
 	// guarded by `//go:build` constraints. Go parses the comma-separated
 	// list itself, so we pass the raw string through unchanged.
 	Tags string `yaml:"tags"`
+	// MemoryCap is the most memory a build or test run's process group
+	// may use before it is killed: a whole number of MiB or GiB ("4GiB",
+	// "3072MiB"), or "off". Empty is DefaultMemoryCap. A package whose
+	// suite goes over it without any mutant still gets a raised cap for its
+	// test runs, up to four times this. Use MemoryCapBytes in callers.
+	MemoryCap string `yaml:"memory-cap"`
 	// TestFlags is forwarded verbatim to the inner `go test` invocations
 	// (per-mutant runs, the coverage run, the baseline run) and to nothing
 	// else. That scoping is the point, and is why GOFLAGS is not a usable
@@ -115,6 +122,47 @@ const (
 	// bounds worst-case lost work on a hard kill to ~this duration.
 	DefaultCheckpointInterval = 10 * time.Second
 )
+
+// DefaultMemoryCap is the memory cap, in bytes, a run gets when
+// memory-cap is unset.
+const DefaultMemoryCap int64 = 2 << 30
+
+// maxMemoryCap bounds memory-cap at 1 TiB, so a package's raised cap,
+// up to four times it, can't overflow an int64.
+const maxMemoryCap int64 = 1 << 40
+
+// MemoryCapBytes returns the memory cap in bytes: DefaultMemoryCap when
+// unset, 0 for "off" (no cap), or the parsed size. A size is a positive
+// whole number with a MiB or GiB suffix, up to 1 TiB; the unit is
+// required, so "4G" or a bare "4096" can't be read as a size it doesn't
+// mean.
+func (c *Config) MemoryCapBytes() (int64, error) {
+	s := strings.TrimSpace(c.MemoryCap)
+	if s == "" {
+		return DefaultMemoryCap, nil
+	}
+	if strings.EqualFold(s, "off") {
+		return 0, nil
+	}
+	var unit int64
+	var digits string
+	switch {
+	case strings.HasSuffix(s, "MiB"):
+		unit, digits = 1<<20, strings.TrimSuffix(s, "MiB")
+	case strings.HasSuffix(s, "GiB"):
+		unit, digits = 1<<30, strings.TrimSuffix(s, "GiB")
+	default:
+		return 0, fmt.Errorf("memory-cap %q: want a size in MiB or GiB (e.g. 4GiB, 3072MiB) or off", c.MemoryCap)
+	}
+	n, err := strconv.ParseInt(digits, 10, 64)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("memory-cap %q: want a positive whole number of MiB or GiB (e.g. 4GiB, 3072MiB) or off", c.MemoryCap)
+	}
+	if n > maxMemoryCap/unit {
+		return 0, fmt.Errorf("memory-cap %q: must be at most 1024GiB", c.MemoryCap)
+	}
+	return n * unit, nil
+}
 
 // AdaptiveTimeoutEnabled returns whether per-mutant adaptive timeout
 // selection is in effect. The pointer field allows three states (set to
@@ -357,6 +405,7 @@ type Flags struct {
 	CheckpointInterval CheckpointIntervalFlag
 	CoverPkg           string
 	Tags               string
+	MemoryCap          string
 	TestFlags          string
 	Output             string
 	Disable            string
@@ -417,6 +466,9 @@ func (c *Config) applyStringFlags(f Flags) {
 	}
 	if f.Tags != "" {
 		c.Tags = f.Tags
+	}
+	if f.MemoryCap != "" {
+		c.MemoryCap = f.MemoryCap
 	}
 	if f.TestFlags != "" {
 		c.TestFlags = f.TestFlags
