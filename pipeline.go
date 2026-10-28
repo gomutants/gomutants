@@ -386,20 +386,15 @@ func (mr *mutationRun) cachedCoverageProfile(ctx context.Context) bool {
 	return false
 }
 
-// memoryCap returns the run's memory cap in bytes, 0 for off (see
-// config.MemoryCapBytes). loadConfig has rejected a value it can't parse.
+// memoryCap returns the run's memory cap in bytes, config.NoMemoryCap
+// for off (see config.MemoryCapBytes). loadConfig has rejected a value it
+// can't parse; one that got here anyway keeps the default cap, not none.
 func (mr *mutationRun) memoryCap() int64 {
-	n, _ := mr.cfg.MemoryCapBytes()
-	return n
-}
-
-// poolMemoryCap is memoryCap as runner.ExecOpts.MemoryCap takes it, where
-// 0 is the default and off is runner.NoMemoryCap.
-func (mr *mutationRun) poolMemoryCap() int64 {
-	if n := mr.memoryCap(); n != 0 {
-		return n
+	n, err := mr.cfg.MemoryCapBytes()
+	if err != nil {
+		return config.DefaultMemoryCap
 	}
-	return runner.NoMemoryCap
+	return n
 }
 
 // measureBaseline times one unmutated test run and derives the global
@@ -703,7 +698,7 @@ func (mr *mutationRun) runMutants(ctx context.Context) {
 	}
 	mr.profileBytes = nil
 
-	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields(), GOROOT: mr.goroot, MemoryCap: mr.poolMemoryCap()}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
+	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields(), GOROOT: mr.goroot, MemoryCap: mr.memoryCap()}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
 	// interval into the run, not on the very first mutant.
 	mr.lastCheckpoint = time.Now()

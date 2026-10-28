@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gomutants/gomutants/internal/config"
 	"github.com/gomutants/gomutants/internal/coverage"
 	"github.com/gomutants/gomutants/internal/mutator"
 )
@@ -24,11 +25,8 @@ import (
 // INVERT_BITWISE mutants on the literals (e.g. `2 * 1024 * 1024 * 1024`,
 // `1 << 20`) are unkillable.
 func TestPackageVarDefaults(t *testing.T) {
-	if got, want := maxSubprocRSSBytes, int64(2*1024*1024*1024); got != want {
-		t.Errorf("maxSubprocRSSBytes = %d, want %d (2 GiB)", got, want)
-	}
-	if NoMemoryCap != -1 {
-		t.Errorf("NoMemoryCap = %d, want -1", NoMemoryCap)
+	if maxSubprocRSSBytes != config.DefaultMemoryCap {
+		t.Errorf("maxSubprocRSSBytes = %d, want config.DefaultMemoryCap", maxSubprocRSSBytes)
 	}
 	if got, want := monitorPollInterval, 1*time.Second; got != want {
 		t.Errorf("monitorPollInterval = %v, want %v", got, want)

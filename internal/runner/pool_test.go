@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gomutants/gomutants/internal/config"
 	"github.com/gomutants/gomutants/internal/coverage"
 	"github.com/gomutants/gomutants/internal/mutator"
 )
@@ -229,13 +230,13 @@ func TestPoolCreateWorkersPropagatesExecOpts(t *testing.T) {
 }
 
 // TestPoolCreateWorkersMemoryCap: an unset ExecOpts.MemoryCap keeps the
-// default cap, and NoMemoryCap turns it off.
+// default cap, and config.NoMemoryCap turns it off.
 func TestPoolCreateWorkersMemoryCap(t *testing.T) {
 	for _, tt := range []struct {
 		set, want int64
 	}{
 		{0, maxSubprocRSSBytes},
-		{NoMemoryCap, NoMemoryCap},
+		{config.NoMemoryCap, config.NoMemoryCap},
 	} {
 		p := NewPool(1, ExecOpts{MemoryCap: tt.set}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
 		workers := p.createWorkers()

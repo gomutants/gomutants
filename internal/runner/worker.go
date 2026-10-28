@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gomutants/gomutants/internal/config"
 	"github.com/gomutants/gomutants/internal/coverage"
 	"github.com/gomutants/gomutants/internal/mutator"
 	"github.com/gomutants/gomutants/internal/patch"
@@ -39,7 +40,7 @@ import (
 //
 // On Windows pgroupRSSBytes is a no-op (returns 0) so this cap never trips;
 // the per-mutant context timeout is the backstop there.
-var maxSubprocRSSBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
+var maxSubprocRSSBytes = config.DefaultMemoryCap
 
 // suiteRSSCeilingFactor bounds a run that measures a package's suite
 // without any mutant (see Worker.measureSuite) at this many times the
@@ -511,8 +512,9 @@ type Worker struct {
 
 	// memCap is the memory cap of every build and test run's process
 	// group, and the base of each package's cap for its test runs (see
-	// suiteCaps). maxSubprocRSSBytes unless the pool sets one; 0 or less
-	// is no cap (see runMonitored).
+	// suiteCaps). maxSubprocRSSBytes unless the pool sets one;
+	// config.NoMemoryCap is no cap (runMonitored reads any cap of 0 or
+	// less as none).
 	memCap int64
 
 	// childGOMAXPROCS, if > 0, caps the GOMAXPROCS of each `go test` child.

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gomutants/gomutants/internal/config"
 	"github.com/gomutants/gomutants/internal/coverage"
 	"github.com/gomutants/gomutants/internal/mutator"
 	"github.com/gomutants/gomutants/internal/proctree"
@@ -1273,11 +1274,12 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 	})
 }
 
-// TestWorkerTestNoMemCapNeverKills: a worker whose cap is off (0 or less,
-// see ExecOpts.MemoryCap) has nothing killed whatever its runs use, and
-// the monitor still records the peak.
+// TestWorkerTestNoMemCapNeverKills: a worker whose cap is off
+// (config.NoMemoryCap, or 0, which runMonitored reads as none too) has
+// nothing killed whatever its runs use, and the monitor still records the
+// peak.
 func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
-	for _, memCap := range []int64{0, NoMemoryCap} {
+	for _, memCap := range []int64{0, config.NoMemoryCap} {
 		t.Run(fmt.Sprint(memCap), func(t *testing.T) {
 			mon := stubMemCap(t, 2<<20)
 			mon.rss.Store(999999 * 1024)

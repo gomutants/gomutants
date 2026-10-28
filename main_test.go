@@ -609,21 +609,23 @@ func TestRunMemoryCapErrorsExitUsage(t *testing.T) {
 	}
 }
 
-// TestPoolMemoryCap: the configured cap reaches the pool as is, unset as
-// the 2 GiB default, and off as runner.NoMemoryCap, not as 0, which the
-// pool reads as unset.
-func TestPoolMemoryCap(t *testing.T) {
+// TestRunMemoryCap: the configured cap reaches the pool as is, unset as
+// the 2 GiB default, and off as config.NoMemoryCap, not as 0, which the
+// pool reads as unset. A value loadConfig would have rejected keeps the
+// default rather than turn the cap off.
+func TestRunMemoryCap(t *testing.T) {
 	for _, tt := range []struct {
 		in   string
 		want int64
 	}{
 		{"", 2 << 30},
 		{"4GiB", 4 << 30},
-		{"off", runner.NoMemoryCap},
+		{"off", config.NoMemoryCap},
+		{"4GB", 2 << 30},
 	} {
 		mr := &mutationRun{cfg: config.Config{MemoryCap: tt.in}}
-		if got := mr.poolMemoryCap(); got != tt.want {
-			t.Errorf("memory-cap %q: poolMemoryCap() = %d, want %d", tt.in, got, tt.want)
+		if got := mr.memoryCap(); got != tt.want {
+			t.Errorf("memory-cap %q: memoryCap() = %d, want %d", tt.in, got, tt.want)
 		}
 	}
 }
