@@ -1051,6 +1051,10 @@ func TestClassifyTestOutcome(t *testing.T) {
 			"--- FAIL: TestAdd\n", mutator.StatusKilled},
 		{"memkilled after a panic => killed", anyErr, true, nil,
 			"panic: boom\n\ngoroutine 1 [running]:\n", mutator.StatusKilled},
+		// A binary that exited 0 had no test fail: the marker is a test's
+		// own text, or a process's it started, such as a fixture's `go test`.
+		{"memkilled after a passing binary printed a failure => timed out", nil, true, nil,
+			"--- FAIL: TestFixture\n", mutator.StatusTimedOut},
 		{"success beats infrastructure error", nil, false, nil, "FATAL ERROR: OUT OF MEMORY", mutator.StatusLived},
 		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
 		// The binary was built beforehand, so a compile diagnostic or a

@@ -40,8 +40,8 @@ var maxSubprocRSSBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
 
 // suiteRSSCeilingFactor bounds a run that measures a package's suite
 // without any mutant (see Worker.measureSuite) at this many times
-// maxSubprocRSSBytes, so the host is still protected from a suite that
-// grows without end.
+// maxSubprocRSSBytes, and a package's raised cap at the same, so the host
+// is still protected from a suite that grows without end.
 const suiteRSSCeilingFactor = 4
 
 // monitorPollInterval is the cadence at which the RSS monitor probes the
@@ -417,7 +417,7 @@ func (c *binArgsCache) get(ctx context.Context, projectDir, tags, pkg string, fl
 // a pool's workers. A package's cap is maxSubprocRSSBytes until a run of
 // its tests goes over it. Its suite is then measured once without any
 // mutant (see Worker.measureSuite), and the cap becomes twice what that
-// run used, if that is higher.
+// run used, if that is higher, up to suiteRSSCeilingFactor times it.
 //
 // The cap sums every process a suite starts, so a suite whose tests run a
 // linter or an analyzer can go over 2 GiB with any mutant at all (#124).
@@ -433,8 +433,9 @@ type suiteCaps struct {
 // package's suite is measured, so another worker that goes over its cap
 // meanwhile waits for that measurement instead of making its own.
 type suiteCap struct {
-	mu     sync.Mutex
-	rssCap atomic.Int64 // 0 until measured
+	mu       sync.Mutex
+	measured bool         // under mu: the suite's measurement was made
+	rssCap   atomic.Int64 // 0 until measured, and for a failed measurement
 }
 
 func (c *suiteCaps) entry(pkg string) *suiteCap {
@@ -460,16 +461,21 @@ func (c *suiteCaps) get(pkg string) int64 {
 }
 
 // measure returns pkg's cap, measuring its suite with measure on first
-// use. measure returns 0 for a failed measurement, which leaves the suite
-// unmeasured, so the next run that goes over the cap tries again.
-func (c *suiteCaps) measure(pkg string, measure func() int64) int64 {
+// use, or 0 and false if that measurement failed. measure returns 0 for a
+// failed measurement. The failure is kept for the rest of the run: one
+// that fails the same way every time would otherwise be made again, a
+// rebuild of the package without the overlay, for each of its mutants
+// that goes over the cap, while the other workers on it wait.
+func (c *suiteCaps) measure(pkg string, measure func() int64) (int64, bool) {
 	e := c.entry(pkg)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.rssCap.Load() == 0 {
+	if !e.measured {
+		e.measured = true
 		e.rssCap.Store(measure())
 	}
-	return c.get(pkg)
+	n := e.rssCap.Load()
+	return n, n != 0
 }
 
 // Worker tests a single mutant: it builds the test binary of each package
@@ -778,7 +784,9 @@ type binRun struct {
 // A run over the cap that ends TIMED_OUT has the package's suite measured
 // without any mutant, the first time one of its runs does. If that raises
 // the cap, the run is made again under the new cap, with timeout to
-// itself.
+// itself: as a build's, the killed run's time is none the tests' timings
+// show (see runGroups). If the suite couldn't be measured, the run is
+// INFRA ERROR.
 //
 // The binary gets no -test.timeout: it would start its own clock along
 // with the deadline's, and its timeout panic, winning the race, would
@@ -802,17 +810,32 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 	}
 	rssCap := w.suiteCaps.get(run.pkg)
 	r := w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
-	if r.memKilled && r.status == mutator.StatusTimedOut {
-		raised := w.suiteCaps.measure(run.pkg, func() int64 { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
+	if r.overCap() {
+		raised, ok := w.suiteCaps.measure(run.pkg, func() int64 { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
+		if !ok {
+			// Without the measurement there's no telling whether the
+			// mutant or its suite went over the cap. INFRA ERROR isn't
+			// cached, so the next run measures again.
+			if ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "gomutants: worker %d: testing %s went over the %d MiB memory cap, and its tests couldn't be measured without a mutant, treating as %s\n", w.id, run.pkg, rssCap>>20, mutator.StatusInfraError)
+			}
+			return binRun{status: mutator.StatusInfraError}
+		}
 		if raised > rssCap {
 			rssCap = raised
 			r = w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
 		}
 	}
-	if r.memKilled && r.status == mutator.StatusTimedOut {
+	if r.overCap() && ctx.Err() == nil {
 		w.reportMemKill("testing", run.pkg, rssCap)
 	}
 	return r
+}
+
+// overCap reports whether the RSS monitor stopped the run before a test
+// reported the mutation detected (see classifyTestOutcome).
+func (r binRun) overCap() bool {
+	return r.memKilled && r.status == mutator.StatusTimedOut
 }
 
 // runBinOnce is one run of runBin's, under the memory cap rssCap.
@@ -843,13 +866,21 @@ func (w *Worker) runBinOnce(ctx context.Context, run pkgRun, bin, dir string, bi
 // measureSuite runs pkg's whole suite from dir without any mutant, from a
 // binary built without the overlay, and returns the memory cap its test
 // runs get (see suiteCaps): twice the most the run was seen to use, or
-// maxSubprocRSSBytes if that is higher. A run that fails its tests or its
-// deadline still shows what the suite uses. It is 0 when the suite
-// couldn't be built or run, or ctx was cancelled.
+// maxSubprocRSSBytes if that is higher. It is 0 when the suite couldn't
+// be built or run, or ctx was cancelled, or the memory probe read nothing
+// of a run that lasted past two of its polls: a live process group uses
+// some memory, so that is the probe's outage (see pgroupRSSBytes), and a
+// cap made from it would be the default's. A run over sooner can have
+// ended before the first poll, and keeps the default.
 //
-// The run is stopped at suiteRSSCeilingFactor times maxSubprocRSSBytes. A
-// suite that goes over that alone keeps maxSubprocRSSBytes, so its
-// mutants that go over it read TIMED OUT, as before.
+// A run that fails its tests or its deadline still shows some of what the
+// suite uses, if maybe not all, as -failfast stops it at the first
+// failure; that is said.
+//
+// The run is stopped at suiteRSSCeilingFactor times maxSubprocRSSBytes,
+// and the cap is never raised past that, the most a run of the package is
+// let use. A suite that goes over that alone keeps maxSubprocRSSBytes, so
+// its mutants that go over it read TIMED OUT, as before.
 func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []string) int64 {
 	fail := func(why string) int64 {
 		if ctx.Err() == nil {
@@ -880,6 +911,7 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 	cmd.Env = w.binEnv(dir)
 	proctree.Bound(cmd)
 	ceiling := suiteRSSCeilingFactor * maxSubprocRSSBytes
+	start := time.Now()
 	res, err := w.runMonitored(cmd, ceiling)
 	if err != nil {
 		return fail(err.Error())
@@ -891,7 +923,18 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests go over %d MiB without a mutant, so they keep the %d MiB memory cap\n", w.id, pkg, ceiling>>20, maxSubprocRSSBytes>>20)
 		return maxSubprocRSSBytes
 	}
-	rssCap := max(maxSubprocRSSBytes, 2*res.peak)
+	// gomutants:disable-next-line CONDITIONALS_BOUNDARY reason="a run's elapsed time never lands on the threshold to the nanosecond, so > and >= can't be told apart"
+	if res.peak == 0 && time.Since(start) > 2*monitorPollInterval {
+		return fail("no reading of its memory came back")
+	}
+	if res.runErr != nil {
+		how := "failed"
+		if runCtx.Err() == context.DeadlineExceeded {
+			how = "ran past their deadline"
+		}
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests %s without a mutant, so the %d MiB they were seen to use may be less than they need\n", w.id, pkg, how, res.peak>>20)
+	}
+	rssCap := min(max(maxSubprocRSSBytes, 2*res.peak), ceiling)
 	if rssCap > maxSubprocRSSBytes {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests use %d MiB without a mutant, so their memory cap is raised to %d MiB\n", w.id, pkg, res.peak>>20, rssCap>>20)
 	}
@@ -1203,10 +1246,12 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 //
 // Priority order:
 //  1. memKilled → TimedOut (RSS monitor SIGKILL'd the tree), or Killed if
-//     the output already shows the mutation detected (see detected). A
-//     test can fail and its binary exit while a process it started still
-//     holds the output open and grows (see proctree.DrainDelay); the
-//     failure was reported before the kill.
+//     the binary failed and the output already shows the mutation
+//     detected (see detected). A test can fail and its binary exit while
+//     a process it started still holds the output open and grows (see
+//     proctree.DrainDelay); the failure was reported before the kill. A
+//     binary that exited 0 had no test fail, so a marker in its output is
+//     text a test or a process it started printed.
 //  2. runErr == nil → Lived (tests all passed with the mutant applied).
 //  3. testCtxErr == DeadlineExceeded → TimedOut.
 //  4. output carries a recognized test-phase infrastructure signature, and
@@ -1217,7 +1262,7 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 //  6. Otherwise → Killed.
 func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, output string, truncated bool) mutator.MutantStatus {
 	if memKilled {
-		if detected(output) {
+		if runErr != nil && detected(output) {
 			return mutator.StatusKilled
 		}
 		return mutator.StatusTimedOut

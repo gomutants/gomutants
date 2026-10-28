@@ -1213,37 +1213,139 @@ func TestWorkerTestSuiteOverCeilingKeepsCap(t *testing.T) {
 	}
 }
 
-// TestWorkerTestSuiteMeasureFailureNotKept: a suite that can't be
-// measured keeps the cap for the run that went over it, and the next run
-// that goes over it tries again: the failure can be the host's, gone by
-// then.
-func TestWorkerTestSuiteMeasureFailureNotKept(t *testing.T) {
+// TestWorkerTestSuiteMeasureFailureKept: a run over the cap whose
+// package's suite can't be measured is INFRA ERROR, not TIMED OUT: there
+// is no telling whether the mutant or its suite went over, and INFRA
+// ERROR isn't cached, so the next run measures again. The failure is kept
+// for the rest of this one: a later mutant of the package that goes over
+// the cap isn't built again without the overlay.
+func TestWorkerTestSuiteMeasureFailureKept(t *testing.T) {
 	mon := stubMemCap(t, 2<<20)
 	mon.rss.Store(999999 * 1024)
 	w, m := fakeWorker(t, nil, 30*time.Second)
 	n := 0
 	runs := fakeBuildsAndRuns(t, func(string) []string {
-		// Each mutant's build succeeds, the unmutated one after it fails.
+		// The first mutant's build succeeds, the unmutated one after it
+		// fails.
 		n++
-		if n%2 == 0 {
+		if n == 2 {
 			return []string{"false"}
 		}
 		return []string{"true"}
 	}, func(string) []string { return []string{"sleep", "0.3"} })
-	for range 2 {
+	const overCap = "gomutants: worker 0: testing m/calc went over the 2 MiB memory cap, and its tests couldn't be measured without a mutant, treating as INFRA ERROR\n"
+	wants := []string{
+		"gomutants: worker 0: can't measure the memory m/calc's tests use without a mutant: building it: exit status 1\n" + overCap,
+		overCap,
+	}
+	for _, want := range wants {
 		var got mutator.Mutant
 		stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
-		if got.Status != mutator.StatusTimedOut {
-			t.Errorf("Status=%v, want TimedOut", got.Status)
+		if got.Status != mutator.StatusInfraError {
+			t.Errorf("Status=%v, want InfraError", got.Status)
 		}
-		want := "gomutants: worker 0: can't measure the memory m/calc's tests use without a mutant: building it: exit status 1\n" +
-			"gomutants: worker 0: testing m/calc went over the 2 MiB memory cap and was killed, treating as TIMED OUT\n"
 		if stderr != want {
 			t.Errorf("stderr = %q, want %q", stderr, want)
 		}
 	}
-	if want := []string{"m/calc", "m/calc", "m/calc", "m/calc"}; !slices.Equal(runs.builds, want) {
-		t.Errorf("builds = %v, want %v: each mutant's, and an unmutated one for each", runs.builds, want)
+	if want := []string{"m/calc", "m/calc", "m/calc"}; !slices.Equal(runs.builds, want) {
+		t.Errorf("builds = %v, want %v: each mutant's, and one unmutated for the first", runs.builds, want)
+	}
+}
+
+// TestWorkerTestCancelledRunSaysNothing: a run over the cap that ctx
+// cancels says nothing of a memory kill, whether ctx cancels its
+// package's measurement or, the package measured already, the run itself:
+// the mutant is left untested, and its result thrown away.
+func TestWorkerTestCancelledRunSaysNothing(t *testing.T) {
+	cases := []struct {
+		name string
+		// mutants is how many are tested; ctx cancels 0.1s into the
+		// cancel'th run.
+		mutants, cancel int
+	}{
+		{"measuring", 1, 2},
+		// The suite goes over the ceiling, so it keeps the cap and the
+		// second mutant's run isn't made again.
+		{"measured", 2, 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mon := stubMemCap(t, 2<<20)
+			mon.rss.Store(999999 * 1024)
+			w, m := fakeWorker(t, nil, 30*time.Second)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			n := 0
+			fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, func(string) []string {
+				n++
+				if n == tc.cancel {
+					time.AfterFunc(100*time.Millisecond, cancel)
+				}
+				return []string{"sleep", "0.3"}
+			})
+			for range tc.mutants - 1 {
+				captureStderr(t, func() { w.Test(ctx, m) })
+			}
+			if stderr := captureStderr(t, func() { w.Test(ctx, m) }); stderr != "" {
+				t.Errorf("stderr = %q, want nothing said", stderr)
+			}
+			if n != tc.cancel {
+				t.Errorf("%d runs, want %d: ctx cancelled another run", n, tc.cancel)
+			}
+		})
+	}
+}
+
+// TestMeasureSuiteCap: the cap a measured suite's runs get, and what is
+// said of it. A run that fails or runs past its deadline is kept, but may
+// have stopped short of what the suite uses. The cap is never raised past
+// the measuring run's ceiling. A probe that reads nothing of a run past
+// two of its polls is an outage, and measures nothing; a run over sooner
+// can have ended before the first poll. Those two are polled every 0.5s,
+// and run 2.5 and 1.5 polls, so a threshold of one or three polls reads
+// them the other way, with a quarter second to spare.
+func TestMeasureSuiteCap(t *testing.T) {
+	const tests = "gomutants: worker 0: m/calc's tests "
+	cases := []struct {
+		name   string
+		rss    int64
+		run    []string
+		global time.Duration
+		poll   time.Duration // stubMemCap's if 0
+		want   int64
+		stderr string
+	}{
+		{name: "failed", rss: 3 << 20, run: []string{"sh", "-c", "sleep 0.3; exit 1"}, global: 30 * time.Second, want: 6 << 20,
+			stderr: tests + "failed without a mutant, so the 3 MiB they were seen to use may be less than they need\n" +
+				tests + "use 3 MiB without a mutant, so their memory cap is raised to 6 MiB\n"},
+		{name: "past the deadline", rss: 3 << 20, run: []string{"sleep", "5"}, global: 300 * time.Millisecond, want: 6 << 20,
+			stderr: tests + "ran past their deadline without a mutant, so the 3 MiB they were seen to use may be less than they need\n" +
+				tests + "use 3 MiB without a mutant, so their memory cap is raised to 6 MiB\n"},
+		{name: "limited to the ceiling", rss: 5 << 20, run: []string{"sleep", "0.3"}, global: 30 * time.Second, want: 8 << 20,
+			stderr: tests + "use 5 MiB without a mutant, so their memory cap is raised to 8 MiB\n"},
+		{name: "probe reads nothing", rss: 0, run: []string{"sleep", "1.25"}, global: 30 * time.Second, poll: 500 * time.Millisecond, want: 0,
+			stderr: "gomutants: worker 0: can't measure the memory m/calc's tests use without a mutant: no reading of its memory came back\n"},
+		{name: "over within two polls", rss: 0, run: []string{"sleep", "0.75"}, global: 30 * time.Second, poll: 500 * time.Millisecond, want: 2 << 20},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mon := stubMemCap(t, 2<<20)
+			if tc.poll != 0 {
+				monitorPollInterval = tc.poll
+			}
+			mon.rss.Store(tc.rss)
+			w, _ := fakeWorker(t, nil, tc.global)
+			fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, func(string) []string { return tc.run })
+			var got int64
+			stderr := captureStderr(t, func() { got = w.measureSuite(context.Background(), "m/calc", t.TempDir(), nil) })
+			if got != tc.want {
+				t.Errorf("measureSuite = %d MiB, want %d MiB", got>>20, tc.want>>20)
+			}
+			if stderr != tc.stderr {
+				t.Errorf("stderr = %q, want %q", stderr, tc.stderr)
+			}
+		})
 	}
 }
 
