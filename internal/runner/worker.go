@@ -25,7 +25,11 @@ import (
 // maxSubprocRSSBytes caps per-mutant subprocess group memory. A mutation that
 // flips a loop termination or allocation bound can make go test (or its test
 // binary) balloon to tens of GB within seconds. We SIGKILL the whole process
-// group at this cap; a killed mutant is classified as TimedOut.
+// group at this cap; a killed mutant is classified as TimedOut, unless its
+// tests had already reported it (see classifyTestOutcome).
+//
+// A package whose suite needs more than this without any mutant gets a
+// higher cap for its test runs (see suiteCaps).
 //
 // var (not const) so tests can lower it to a tiny value and force the
 // monitor goroutine's kill path on a normal-sized test process.
@@ -33,6 +37,12 @@ import (
 // On Windows pgroupRSSBytes is a no-op (returns 0) so this cap never trips;
 // the per-mutant context timeout is the backstop there.
 var maxSubprocRSSBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GiB
+
+// suiteRSSCeilingFactor bounds a run that measures a package's suite
+// without any mutant (see Worker.measureSuite) at this many times
+// maxSubprocRSSBytes, and a package's raised cap at the same, so the host
+// is still protected from a suite that grows without end.
+const suiteRSSCeilingFactor = 4
 
 // monitorPollInterval is the cadence at which the RSS monitor probes the
 // group's memory. var so tests can shrink it to make the kill path fire
@@ -206,9 +216,15 @@ const sigkillMessage = "signal: killed"
 // makes their absence meaningless (see infraFromOutput), so a clipped stream
 // declines to classify as well.
 func killVetoed(stdout string, truncated bool) bool {
-	return truncated ||
-		strings.Contains(stdout, testFailureMarker) ||
-		hasLineWithPrefix(stdout, panicMarker)
+	return truncated || detected(stdout)
+}
+
+// detected reports whether a test binary's output shows the mutation was
+// detected: a test reported a failure, or the binary aborted on a panic
+// (see testFailureMarker and panicMarker).
+func detected(output string) bool {
+	return strings.Contains(output, testFailureMarker) ||
+		hasLineWithPrefix(output, panicMarker)
 }
 
 // hasLineWithPrefix reports whether any line of s starts with prefix.
@@ -397,6 +413,71 @@ func (c *binArgsCache) get(ctx context.Context, projectDir, tags, pkg string, fl
 	return args, nil
 }
 
+// suiteCaps holds the memory cap each package's test runs get, shared by
+// a pool's workers. A package's cap is maxSubprocRSSBytes until a run of
+// its tests goes over it. Its suite is then measured once without any
+// mutant (see Worker.measureSuite), and the cap becomes twice what that
+// run used, if that is higher, up to suiteRSSCeilingFactor times it.
+//
+// The cap sums every process a suite starts, so a suite whose tests run a
+// linter or an analyzer can go over 2 GiB with any mutant at all (#124).
+// Read as TIMED OUT, its mutants drop out of the efficacy denominator,
+// and --threshold-efficacy passes on survivors. Twice what the suite uses
+// alone still stops a mutant that runs away in it.
+type suiteCaps struct {
+	mu   sync.Mutex
+	pkgs map[string]*suiteCap
+}
+
+// suiteCap is one package's entry in suiteCaps. mu is held while the
+// package's suite is measured, so another worker that goes over its cap
+// meanwhile waits for that measurement instead of making its own.
+type suiteCap struct {
+	mu       sync.Mutex
+	measured bool         // under mu: the suite's measurement was made
+	rssCap   atomic.Int64 // 0 until measured, and for a failed measurement
+}
+
+func (c *suiteCaps) entry(pkg string) *suiteCap {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pkgs == nil {
+		c.pkgs = make(map[string]*suiteCap)
+	}
+	e, ok := c.pkgs[pkg]
+	if !ok {
+		e = &suiteCap{}
+		c.pkgs[pkg] = e
+	}
+	return e
+}
+
+// get returns pkg's cap: maxSubprocRSSBytes until its suite is measured.
+func (c *suiteCaps) get(pkg string) int64 {
+	if n := c.entry(pkg).rssCap.Load(); n != 0 {
+		return n
+	}
+	return maxSubprocRSSBytes
+}
+
+// measure returns pkg's cap, measuring its suite with measure on first
+// use, or 0 and false if that measurement failed. measure returns 0 for a
+// failed measurement. The failure is kept for the rest of the run: one
+// that fails the same way every time would otherwise be made again, a
+// rebuild of the package without the overlay, for each of its mutants
+// that goes over the cap, while the other workers on it wait.
+func (c *suiteCaps) measure(pkg string, measure func() int64) (int64, bool) {
+	e := c.entry(pkg)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.measured {
+		e.measured = true
+		e.rssCap.Store(measure())
+	}
+	n := e.rssCap.Load()
+	return n, n != 0
+}
+
 // Worker tests a single mutant: it builds the test binary of each package
 // whose tests it runs, with the mutant in place through an overlay, then
 // runs the binary.
@@ -418,6 +499,10 @@ type Worker struct {
 	// binArgs reads and caches what every run of a test binary is passed;
 	// a pool's workers share one.
 	binArgs *binArgsCache
+
+	// suiteCaps holds each package's memory cap for its test runs; a
+	// pool's workers share one.
+	suiteCaps *suiteCaps
 
 	// childGOMAXPROCS, if > 0, caps the GOMAXPROCS of each `go test` child.
 	// Limits compile + test runtime parallelism per child so N parallel workers
@@ -481,6 +566,7 @@ func NewWorker(id int, tmpDir string, policy TimeoutPolicy, sourceCache map[stri
 		projectDir:  projectDir,
 		testMap:     testMap,
 		binArgs:     &binArgsCache{},
+		suiteCaps:   &suiteCaps{},
 	}, nil
 }
 
@@ -586,11 +672,11 @@ func (w *Worker) runGroups(ctx context.Context, m mutator.Mutant, groups map[str
 		// A package without tests has no binary to run: its `go test`
 		// reports "no test files" and passes.
 		if bin != "" {
-			status, ran := w.runBin(ctx, m, run, bin, short, left)
-			if status != mutator.StatusLived {
-				return status
+			r := w.runBin(ctx, m, run, bin, short, left)
+			if r.status != mutator.StatusLived {
+				return r.status
 			}
-			left -= ran
+			left -= r.ran
 		}
 	}
 	return mutator.StatusLived
@@ -622,7 +708,10 @@ func (w *Worker) recheck(ctx context.Context, m mutator.Mutant, full map[string]
 // monitor stops a runaway compile or link, and buildTimeout one that
 // hangs: it kills the build's whole process group, so a tool `go` started
 // goes with it, and reads as InfraError, as a hung build is the host's
-// failure, not the mutant's verdict. ctx still cancels the build.
+// failure, not the mutant's verdict. ctx still cancels the build. A build
+// gets the default cap, maxSubprocRSSBytes, whatever its package's tests
+// get (see suiteCaps): what a compile or link uses doesn't grow with what
+// the tests start.
 func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.MutantStatus) {
 	if bin, ok := w.bins[pkg]; ok {
 		return bin, mutator.StatusLived
@@ -635,23 +724,23 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 	_ = os.Remove(bin)
 	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
 	defer cancel()
-	cmd, stdout, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin))
+	cmd, stdout, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, true))
 	proctree.Bound(cmd)
-	runErr, memKilled, err := w.runMonitored(cmd)
+	res, err := w.runMonitored(cmd, maxSubprocRSSBytes)
 	if err != nil {
 		return "", w.startFailure(err)
 	}
 	// The monitor's kill fails the build too, so a nil error is a build
 	// that finished.
-	if runErr != nil {
+	if res.runErr != nil {
 		if buildCtx.Err() == context.DeadlineExceeded {
 			fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s took over %v, treating as %s\n", w.id, pkg, buildTimeout, mutator.StatusInfraError)
 			return "", mutator.StatusInfraError
 		}
-		if memKilled {
-			w.reportMemKill("building", pkg)
+		if res.memKilled {
+			w.reportMemKill("building", pkg, maxSubprocRSSBytes)
 		}
-		return "", classifyBuildFailure(runErr, memKilled, stdout.String(), stderr.String())
+		return "", classifyBuildFailure(res.runErr, res.memKilled, stdout.String(), stderr.String())
 	}
 	if _, err := os.Stat(bin); err != nil {
 		bin = ""
@@ -674,13 +763,30 @@ func (w *Worker) removeBins() {
 	w.bins = nil
 }
 
+// binRun is how a run of a test binary ended (see runBin).
+type binRun struct {
+	status mutator.MutantStatus
+	// ran is how long the run took against its deadline, from the
+	// deadline's start, after the arguments are read, which can wait on
+	// another worker's read and is no time the tests took. Only a run
+	// that passed is read for it: any other ends the mutant's run.
+	ran time.Duration
+	// memKilled is set for a run the RSS monitor stopped.
+	memKilled bool
+}
+
 // runBin runs bin, the test binary of run.pkg, as `go test` runs it: from
 // the package's directory, filtered to run.tests, with the arguments `go
 // test` passes for the run's flags (see binArgsCache). The run is cut off
-// TIMED_OUT after timeout. It returns the run's outcome and how long the
-// run took against timeout: from its deadline's start, after the
-// arguments are read, which can wait on another worker's read and is no
-// time the tests took.
+// TIMED_OUT after timeout, or over the package's memory cap (see
+// suiteCaps).
+//
+// A run over the cap that ends TIMED_OUT has the package's suite measured
+// without any mutant, the first time one of its runs does. If that raises
+// the cap, the run is made again under the new cap, with timeout to
+// itself: as a build's, the killed run's time is none the tests' timings
+// show (see runGroups). If the suite couldn't be measured, the run is
+// INFRA ERROR.
 //
 // The binary gets no -test.timeout: it would start its own clock along
 // with the deadline's, and its timeout panic, winning the race, would
@@ -691,17 +797,49 @@ func (w *Worker) removeBins() {
 // Its stderr goes to the same buffer as its stdout, as `go test` merges
 // them: the classifier reads one stream for a test's own failure markers,
 // and a panic is reported on stderr.
-func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) (mutator.MutantStatus, time.Duration) {
+func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin string, short bool, timeout time.Duration) binRun {
 	dir, ok := w.pkgDir(m, run.pkg)
 	if !ok {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: no directory known for package %s, treating as %s\n", w.id, run.pkg, mutator.StatusInfraError)
-		return mutator.StatusInfraError, 0
+		return binRun{status: mutator.StatusInfraError}
 	}
 	binArgs, err := w.binArgs.get(ctx, w.projectDir, w.tags, run.pkg, w.binFlags(short))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %v, treating as %s\n", w.id, err, mutator.StatusInfraError)
-		return mutator.StatusInfraError, 0
+		return binRun{status: mutator.StatusInfraError}
 	}
+	rssCap := w.suiteCaps.get(run.pkg)
+	r := w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
+	if r.overCap() {
+		raised, ok := w.suiteCaps.measure(run.pkg, func() int64 { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
+		if !ok {
+			// Without the measurement there's no telling whether the
+			// mutant or its suite went over the cap. INFRA ERROR isn't
+			// cached, so the next run measures again.
+			if ctx.Err() == nil {
+				fmt.Fprintf(os.Stderr, "gomutants: worker %d: testing %s went over the %d MiB memory cap, and its tests couldn't be measured without a mutant, treating as %s\n", w.id, run.pkg, rssCap>>20, mutator.StatusInfraError)
+			}
+			return binRun{status: mutator.StatusInfraError}
+		}
+		if raised > rssCap {
+			rssCap = raised
+			r = w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
+		}
+	}
+	if r.overCap() && ctx.Err() == nil {
+		w.reportMemKill("testing", run.pkg, rssCap)
+	}
+	return r
+}
+
+// overCap reports whether the RSS monitor stopped the run before a test
+// reported the mutation detected (see classifyTestOutcome).
+func (r binRun) overCap() bool {
+	return r.memKilled && r.status == mutator.StatusTimedOut
+}
+
+// runBinOnce is one run of runBin's, under the memory cap rssCap.
+func (w *Worker) runBinOnce(ctx context.Context, run pkgRun, bin, dir string, binArgs []string, timeout time.Duration, rssCap int64) binRun {
 	start := time.Now()
 	runCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -709,19 +847,98 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 	cmd.Stderr = output
 	cmd.Env = w.binEnv(dir)
 	proctree.Bound(cmd)
-	runErr, memKilled, err := w.runMonitored(cmd)
+	res, err := w.runMonitored(cmd, rssCap)
 	if err != nil {
 		// A deadline that ran out by the start (the routed run's earlier
 		// packages took all of it) fails the start with it.
 		if runCtx.Err() == context.DeadlineExceeded {
-			return mutator.StatusTimedOut, time.Since(start)
+			return binRun{status: mutator.StatusTimedOut}
 		}
-		return w.startFailure(err), time.Since(start)
+		return binRun{status: w.startFailure(err)}
 	}
-	if memKilled {
-		w.reportMemKill("testing", run.pkg)
+	return binRun{
+		status:    classifyTestOutcome(res.runErr, res.memKilled, runCtx.Err(), output.String(), output.truncated),
+		ran:       time.Since(start),
+		memKilled: res.memKilled,
 	}
-	return classifyTestOutcome(runErr, memKilled, runCtx.Err(), output.String(), output.truncated), time.Since(start)
+}
+
+// measureSuite runs pkg's whole suite from dir without any mutant, from a
+// binary built without the overlay, and returns the memory cap its test
+// runs get (see suiteCaps): twice the most the run was seen to use, or
+// maxSubprocRSSBytes if that is higher. It is 0 when the suite couldn't
+// be built or run, or ctx was cancelled, or the memory probe read nothing
+// of a run that lasted past two of its polls: a live process group uses
+// some memory, so that is the probe's outage (see pgroupRSSBytes), and a
+// cap made from it would be the default's. A run over sooner can have
+// ended before the first poll, and keeps the default.
+//
+// A run that fails its tests or its deadline still shows some of what the
+// suite uses, if maybe not all, as -failfast stops it at the first
+// failure; that is said.
+//
+// The run is stopped at suiteRSSCeilingFactor times maxSubprocRSSBytes,
+// and the cap is never raised past that, the most a run of the package is
+// let use. A suite that goes over that alone keeps maxSubprocRSSBytes, so
+// its mutants that go over it read TIMED OUT, as before.
+func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []string) int64 {
+	fail := func(why string) int64 {
+		if ctx.Err() == nil {
+			fmt.Fprintf(os.Stderr, "gomutants: worker %d: can't measure the memory %s's tests use without a mutant: %s\n", w.id, pkg, why)
+		}
+		return 0
+	}
+	bin := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-suite.test", w.id))
+	defer func() { _ = os.Remove(bin) }()
+	buildCtx, cancelBuild := context.WithTimeout(ctx, buildTimeout)
+	defer cancelBuild()
+	cmd, _, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, false))
+	proctree.Bound(cmd)
+	build, err := w.runMonitored(cmd, maxSubprocRSSBytes)
+	if err != nil {
+		return fail(err.Error())
+	}
+	if build.runErr != nil {
+		why := "building it: " + build.runErr.Error()
+		if out := strings.TrimSpace(stderr.String()); out != "" {
+			why += "\n" + out
+		}
+		return fail(why)
+	}
+	runCtx, cancelRun := context.WithTimeout(ctx, w.policy.Global)
+	defer cancelRun()
+	cmd, _, _ = w.makeCmd(runCtx, bin, dir, runArgs(nil, binArgs))
+	cmd.Env = w.binEnv(dir)
+	proctree.Bound(cmd)
+	ceiling := suiteRSSCeilingFactor * maxSubprocRSSBytes
+	start := time.Now()
+	res, err := w.runMonitored(cmd, ceiling)
+	if err != nil {
+		return fail(err.Error())
+	}
+	if ctx.Err() != nil {
+		return 0
+	}
+	if res.memKilled {
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests go over %d MiB without a mutant, so they keep the %d MiB memory cap\n", w.id, pkg, ceiling>>20, maxSubprocRSSBytes>>20)
+		return maxSubprocRSSBytes
+	}
+	// gomutants:disable-next-line CONDITIONALS_BOUNDARY reason="a run's elapsed time never lands on the threshold to the nanosecond, so > and >= can't be told apart"
+	if res.peak == 0 && time.Since(start) > 2*monitorPollInterval {
+		return fail("no reading of its memory came back")
+	}
+	if res.runErr != nil {
+		how := "failed"
+		if runCtx.Err() == context.DeadlineExceeded {
+			how = "ran past their deadline"
+		}
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests %s without a mutant, so the %d MiB they were seen to use may be less than they need\n", w.id, pkg, how, res.peak>>20)
+	}
+	rssCap := min(max(maxSubprocRSSBytes, 2*res.peak), ceiling)
+	if rssCap > maxSubprocRSSBytes {
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests use %d MiB without a mutant, so their memory cap is raised to %d MiB\n", w.id, pkg, res.peak>>20, rssCap>>20)
+	}
+	return rssCap
 }
 
 // pkgDir returns the directory pkg's test binary runs from: the mutated
@@ -746,20 +963,27 @@ func (w *Worker) startFailure(err error) mutator.MutantStatus {
 }
 
 // reportMemKill reports that the RSS monitor killed a build or test run of
-// pkg. The mutant reads TIMED OUT either way, the same as one that ran out
-// its deadline, and this line is all that tells the two apart: a longer
-// timeout won't change a mutant the cap stopped.
-func (w *Worker) reportMemKill(doing, pkg string) {
-	fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s %s went over the %d MiB memory cap and was killed, treating as %s\n", w.id, doing, pkg, maxSubprocRSSBytes>>20, mutator.StatusTimedOut)
+// pkg at rssCap. The mutant reads TIMED OUT either way, the same as one
+// that ran out its deadline, and this line is all that tells the two
+// apart: a longer timeout won't change a mutant the cap stopped.
+func (w *Worker) reportMemKill(doing, pkg string, rssCap int64) {
+	fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s %s went over the %d MiB memory cap and was killed, treating as %s\n", w.id, doing, pkg, rssCap>>20, mutator.StatusTimedOut)
 }
 
-// runMonitored runs cmd (see makeCmd) under the RSS monitor and returns
-// how it ended: its Wait error, and whether the monitor killed it. A
-// failure to start is returned as startErr, with nothing run (see
-// startFailure).
-func (w *Worker) runMonitored(cmd *exec.Cmd) (runErr error, memKilled bool, startErr error) {
-	if startErr = startCommandFunc(cmd); startErr != nil {
-		return
+// monitored is how a command run under the RSS monitor ended (see
+// runMonitored).
+type monitored struct {
+	runErr    error // cmd.Wait's
+	memKilled bool  // the monitor killed the group over its cap
+	peak      int64 // the most the group was seen to use at a poll
+}
+
+// runMonitored runs cmd (see makeCmd) under the RSS monitor, which kills
+// its process group over rssCap, and returns how it ended. A failure to
+// start is returned as an error, with nothing run (see startFailure).
+func (w *Worker) runMonitored(cmd *exec.Cmd, rssCap int64) (monitored, error) {
+	if err := startCommandFunc(cmd); err != nil {
+		return monitored{}, err
 	}
 
 	// Resolve the process-group "handle" we'll later kill if RSS runs away.
@@ -772,6 +996,9 @@ func (w *Worker) runMonitored(cmd *exec.Cmd) (runErr error, memKilled bool, star
 	pgid := processGroup(cmd.Process.Pid)
 
 	var killed atomic.Bool
+	// peak is written by the monitor goroutine only, and read once it has
+	// exited.
+	var peak int64
 	monitorDone := make(chan struct{})
 	monitorExited := make(chan struct{})
 	go func() {
@@ -792,7 +1019,9 @@ func (w *Worker) runMonitored(cmd *exec.Cmd) (runErr error, memKilled bool, star
 			case <-monitorDone:
 				return
 			case <-t.C:
-				if pgroupRSSBytes(pgid) > maxSubprocRSSBytes {
+				rss := pgroupRSSBytes(pgid)
+				peak = max(peak, rss)
+				if rss > rssCap {
 					killed.Store(true)
 					killPgroup(pgid)
 					return
@@ -808,7 +1037,7 @@ func (w *Worker) runMonitored(cmd *exec.Cmd) (runErr error, memKilled bool, star
 	// race with the next test's swap of those package-level vars (caught by
 	// `go test -race`).
 	<-monitorExited
-	return err, killed.Load(), nil
+	return monitored{runErr: err, memKilled: killed.Load(), peak: peak}, nil
 }
 
 // makeCmd builds the *exec.Cmd that runs name with args from dir — a
@@ -859,9 +1088,10 @@ func (w *Worker) binEnv(dir string) []string {
 }
 
 // buildArgs constructs the `go test -c` argv that builds pkg's test binary
-// to bin with the mutant's overlay in place. Kept as a distinct builder so
-// callers can verify the flag and package wiring without spinning up a
-// subprocess.
+// to bin, with the mutant's overlay in place if overlay is set, or of the
+// unmutated package if not (see Worker.measureSuite). Kept as a distinct
+// builder so callers can verify the flag and package wiring without
+// spinning up a subprocess.
 //
 // Of the user's --test-flags only the build flags apply (see
 // coverage.BuildFlags): `go test -c` rejects any flag it doesn't know,
@@ -870,11 +1100,14 @@ func (w *Worker) binEnv(dir string) []string {
 // They go last, after the package, as `go test` reads them there too (see
 // binFlags), and Go takes the last occurrence of a repeated flag, so a
 // user value still beats ours.
-func (w *Worker) buildArgs(pkg, bin string) []string {
+func (w *Worker) buildArgs(pkg, bin string, overlay bool) []string {
 	// -vet=off: vet runs in the user's CI on clean source; re-running it
 	// per mutant is pure overhead. Measured ~17–39% per-mutant wall-clock
 	// reduction on representative packages.
-	args := []string{"test", "-c", "-o", bin, "-vet=off", "-overlay=" + w.overlayPath}
+	args := []string{"test", "-c", "-o", bin, "-vet=off"}
+	if overlay {
+		args = append(args, "-overlay="+w.overlayPath)
+	}
 	if w.tags != "" {
 		args = append(args, "-tags="+w.tags)
 	}
@@ -1012,7 +1245,13 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 // are classifyBuildFailure's.
 //
 // Priority order:
-//  1. memKilled → TimedOut (RSS monitor SIGKILL'd the tree).
+//  1. memKilled → TimedOut (RSS monitor SIGKILL'd the tree), or Killed if
+//     the binary failed and the output already shows the mutation
+//     detected (see detected). A test can fail and its binary exit while
+//     a process it started still holds the output open and grows (see
+//     proctree.DrainDelay); the failure was reported before the kill. A
+//     binary that exited 0 had no test fail, so a marker in its output is
+//     text a test or a process it started printed.
 //  2. runErr == nil → Lived (tests all passed with the mutant applied).
 //  3. testCtxErr == DeadlineExceeded → TimedOut.
 //  4. output carries a recognized test-phase infrastructure signature, and
@@ -1023,6 +1262,9 @@ func (w *Worker) computeTimeout(m mutator.Mutant) time.Duration {
 //  6. Otherwise → Killed.
 func classifyTestOutcome(runErr error, memKilled bool, testCtxErr error, output string, truncated bool) mutator.MutantStatus {
 	if memKilled {
+		if runErr != nil && detected(output) {
+			return mutator.StatusKilled
+		}
 		return mutator.StatusTimedOut
 	}
 	if runErr == nil {

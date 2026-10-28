@@ -471,17 +471,30 @@ func TestLoad_SchemaVersionMismatch(t *testing.T) {
 
 // TestLoad_SchemaVersionPinned hardcodes the current on-disk schema number
 // so that bumping or nudging the SchemaVersion constant without intent is
-// caught: a cache written at literal version 11 must load under the current
-// constant. (Pins SchemaVersion == 11; kills off-by-one mutations of it.)
+// caught: a cache written at literal version 12 must load under the current
+// constant. (Pins SchemaVersion == 12; kills off-by-one mutations of it.)
 func TestLoad_SchemaVersionPinned(t *testing.T) {
-	if SchemaVersion != 11 {
+	if SchemaVersion != 12 {
 		t.Fatalf("SchemaVersion = %d; update this pinned test and the on-disk fixture deliberately", SchemaVersion)
 	}
 	p := filepath.Join(t.TempDir(), "cache.json")
-	mustWrite(t, p, fmt.Sprintf(`{"schema_version":11,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":12,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"KILLED"}]}`, testModule, testVersion))
 	c := Load(p, testModule, testVersion, "", "", "")
 	if len(c.Entries) != 1 {
-		t.Fatalf("a literal-version-11 cache must load under SchemaVersion=11, got %d entries", len(c.Entries))
+		t.Fatalf("a literal-version-12 cache must load under SchemaVersion=12, got %d entries", len(c.Entries))
+	}
+}
+
+// TestLoad_V11CacheRejected pins the v12 bump's reason: a v11 TIMED OUT
+// entry may record a mutant stopped at the memory cap by its suite's own
+// use, which now runs under a higher cap, so the metadata gate must
+// discard it wholesale.
+func TestLoad_V11CacheRejected(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "cache.json")
+	mustWrite(t, p, fmt.Sprintf(`{"schema_version":11,"go_module":"%s","tool_version":"%s","entries":[{"rel_file":"x.go","status":"TIMED OUT"}]}`, testModule, testVersion))
+	c := Load(p, testModule, testVersion, "", "", "")
+	if len(c.Entries) != 0 {
+		t.Fatalf("a v11 cache must be discarded under SchemaVersion=12, got %d entries", len(c.Entries))
 	}
 }
 

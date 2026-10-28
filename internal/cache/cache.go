@@ -84,7 +84,14 @@ import (
 //	    unformatted source (`return!ok` → `returnok`, `a<0` → `a<-1`), now
 //	    spaced off from it, so v10 NOT_VIABLE entries can again be mutants
 //	    that compile.
-const SchemaVersion = 11
+//	v12: TIMED OUT means the mutant itself ran away. Through v11 a test run
+//	    over the 2 GiB memory cap read TIMED OUT even when the package's
+//	    suite goes over it without any mutant (a suite whose tests run a
+//	    linter, #124); such a package's runs now get a cap measured from
+//	    its suite, so v11 TIMED OUT entries can be mutants that now live or
+//	    are killed. A run stopped at the cap after a test had reported a
+//	    failure is now KILLED too.
+const SchemaVersion = 12
 
 // I/O syscalls used by Save are exposed as package-level function
 // variables so tests can inject failures into each error path
