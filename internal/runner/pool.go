@@ -25,7 +25,8 @@ type ResultCallback func(m mutator.Mutant)
 // nil appends nothing), GOROOT (the toolchain's, put first on PATH for
 // every test binary as `go test` does; empty leaves PATH alone), and
 // MemoryCap (the memory cap of each build and test run in bytes, see
-// Worker.memCap; 0 keeps the default 2 GiB, NoMemoryCap turns it off).
+// Worker.memCap; 0 keeps config.DefaultMemoryCap, config.NoMemoryCap
+// turns it off).
 // Grouped into one struct so NewPool stays within a sane parameter count.
 type ExecOpts struct {
 	TestCPU   int
@@ -34,9 +35,6 @@ type ExecOpts struct {
 	GOROOT    string
 	MemoryCap int64
 }
-
-// NoMemoryCap is the ExecOpts.MemoryCap that turns the memory cap off.
-const NoMemoryCap int64 = -1
 
 // Pool coordinates parallel mutation testing.
 type Pool struct {

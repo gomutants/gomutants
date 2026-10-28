@@ -127,12 +127,17 @@ const (
 // memory-cap is unset.
 const DefaultMemoryCap int64 = 2 << 30
 
+// NoMemoryCap is the memory cap, in bytes, of "off": no cap. It is
+// negative so 0 stays free to mean unset in a zero value (see
+// runner.ExecOpts).
+const NoMemoryCap int64 = -1
+
 // maxMemoryCap bounds memory-cap at 1 TiB, so a package's raised cap,
 // up to four times it, can't overflow an int64.
 const maxMemoryCap int64 = 1 << 40
 
 // MemoryCapBytes returns the memory cap in bytes: DefaultMemoryCap when
-// unset, 0 for "off" (no cap), or the parsed size. A size is a positive
+// unset, NoMemoryCap for "off", or the parsed size. A size is a positive
 // whole number with a MiB or GiB suffix, up to 1 TiB; the unit is
 // required, so "4G" or a bare "4096" can't be read as a size it doesn't
 // mean.
@@ -142,7 +147,7 @@ func (c *Config) MemoryCapBytes() (int64, error) {
 		return DefaultMemoryCap, nil
 	}
 	if strings.EqualFold(s, "off") {
-		return 0, nil
+		return NoMemoryCap, nil
 	}
 	var unit int64
 	var digits string

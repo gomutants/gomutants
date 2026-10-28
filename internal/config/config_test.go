@@ -894,8 +894,8 @@ func TestMemoryCapBytes(t *testing.T) {
 	}{
 		{"", DefaultMemoryCap, ""},
 		{"  ", DefaultMemoryCap, ""},
-		{"off", 0, ""},
-		{"OFF", 0, ""},
+		{"off", NoMemoryCap, ""},
+		{"OFF", NoMemoryCap, ""},
 		{"1MiB", 1 << 20, ""},
 		{"3072MiB", 3072 << 20, ""},
 		{"4GiB", 4 << 30, ""},
@@ -938,6 +938,9 @@ func TestMemoryCapBytes(t *testing.T) {
 func TestDefaultMemoryCapValue(t *testing.T) {
 	if DefaultMemoryCap != 2*1024*1024*1024 {
 		t.Errorf("DefaultMemoryCap=%d, want 2 GiB", DefaultMemoryCap)
+	}
+	if NoMemoryCap != -1 {
+		t.Errorf("NoMemoryCap=%d, want -1", NoMemoryCap)
 	}
 }
 
