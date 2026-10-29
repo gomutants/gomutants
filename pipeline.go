@@ -687,7 +687,7 @@ func (mr *mutationRun) runMutants(ctx context.Context) {
 	}
 	mr.profileBytes = nil
 
-	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields(), GOROOT: mr.goroot}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
+	pool := runner.NewPool(mr.cfg.Workers, runner.ExecOpts{TestCPU: mr.cfg.TestCPU, Tags: mr.cfg.Tags, TestFlags: mr.cfg.TestFlagFields(), GOROOT: mr.goroot, MemoryCap: mr.filters.memCap}, policy, mr.tmpDir, mr.srcCache, mr.projectDir, mr.testMap)
 	// Seed lastCheckpoint so the first periodic checkpoint fires one full
 	// interval into the run, not on the very first mutant.
 	mr.lastCheckpoint = time.Now()

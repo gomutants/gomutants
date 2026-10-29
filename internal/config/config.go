@@ -5,6 +5,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,6 +41,12 @@ type Config struct {
 	// guarded by `//go:build` constraints. Go parses the comma-separated
 	// list itself, so we pass the raw string through unchanged.
 	Tags string `yaml:"tags"`
+	// MemoryCap is the most memory a build or test run's process group
+	// may use before it is killed: a whole number of MiB or GiB ("4GiB",
+	// "3072MiB"), from 64MiB to 1024GiB, or "off". Empty is DefaultMemoryCap. A package whose
+	// suite goes over it without any mutant still gets a raised cap for its
+	// test runs, up to four times this. Use MemoryCapBytes in callers.
+	MemoryCap string `yaml:"memory-cap"`
 	// TestFlags is forwarded verbatim to the inner `go test` invocations
 	// (per-mutant runs, the coverage run, the baseline run) and to nothing
 	// else. That scoping is the point, and is why GOFLAGS is not a usable
@@ -115,6 +122,68 @@ const (
 	// bounds worst-case lost work on a hard kill to ~this duration.
 	DefaultCheckpointInterval = 10 * time.Second
 )
+
+// DefaultMemoryCap is the memory cap, in bytes, a run gets when
+// memory-cap is unset.
+const DefaultMemoryCap int64 = 2 << 30
+
+// NoMemoryCap is the memory cap, in bytes, of "off": no cap. It is
+// negative so 0 stays free to mean unset in a zero value (see
+// runner.ExecOpts).
+const NoMemoryCap int64 = -1
+
+// minMemoryCap and maxMemoryCap bound memory-cap. 64 MiB is below what
+// any `go test -c` needs, so a cap under it is a slip of MiB for GiB,
+// which would read every mutant TIMED OUT or INFRA ERROR and test none. 1
+// TiB keeps a package's raised cap, up to four times it, from
+// overflowing an int64.
+const (
+	minMemoryCap int64 = 64 << 20
+	maxMemoryCap int64 = 1 << 40
+)
+
+// MemoryCapBytes returns the memory cap in bytes: DefaultMemoryCap when
+// unset, NoMemoryCap for "off", or the parsed size. A size is a whole
+// number, digits alone with no leading zero, followed by MiB or GiB in any
+// case, from 64MiB to 1024GiB; the unit is required, so "4G" or a bare
+// "4096" can't be read as a size it doesn't mean.
+func (c *Config) MemoryCapBytes() (int64, error) {
+	s := strings.TrimSpace(c.MemoryCap)
+	if s == "" {
+		return DefaultMemoryCap, nil
+	}
+	if strings.EqualFold(s, "off") {
+		return NoMemoryCap, nil
+	}
+	var unit int64
+	var unitName string
+	switch suffix := s[len(s)-min(len(s), 3):]; {
+	case strings.EqualFold(suffix, "MiB"):
+		unit, unitName = 1<<20, "MiB"
+	case strings.EqualFold(suffix, "GiB"):
+		unit, unitName = 1<<30, "GiB"
+	default:
+		return 0, fmt.Errorf("memory-cap %q: want a size in MiB or GiB (e.g. 4GiB, 3072MiB) or off", c.MemoryCap)
+	}
+	digits := strings.TrimRight(s[:len(s)-3], " \t")
+	if digits == "" || digits[0] == '0' || strings.TrimLeft(digits, "0123456789") != "" {
+		return 0, fmt.Errorf("memory-cap %q: want a positive whole number of MiB or GiB (e.g. 4GiB, 3072MiB) or off", c.MemoryCap)
+	}
+	if len(digits) != len(s)-3 {
+		return 0, fmt.Errorf("memory-cap %q: write it without a space, as %s%s", c.MemoryCap, digits, unitName)
+	}
+	// Digits alone fail to parse only out of an int's range, as the largest
+	// int, which is over the bound too.
+	parsed, _ := strconv.Atoi(digits)
+	n := int64(parsed)
+	if n > maxMemoryCap/unit {
+		return 0, fmt.Errorf("memory-cap %q: must be at most 1024GiB", c.MemoryCap)
+	}
+	if n*unit < minMemoryCap {
+		return 0, fmt.Errorf("memory-cap %q: must be at least 64MiB (did you mean %dGiB?)", c.MemoryCap, n)
+	}
+	return n * unit, nil
+}
 
 // AdaptiveTimeoutEnabled returns whether per-mutant adaptive timeout
 // selection is in effect. The pointer field allows three states (set to
@@ -357,6 +426,7 @@ type Flags struct {
 	CheckpointInterval CheckpointIntervalFlag
 	CoverPkg           string
 	Tags               string
+	MemoryCap          string
 	TestFlags          string
 	Output             string
 	Disable            string
@@ -417,6 +487,9 @@ func (c *Config) applyStringFlags(f Flags) {
 	}
 	if f.Tags != "" {
 		c.Tags = f.Tags
+	}
+	if f.MemoryCap != "" {
+		c.MemoryCap = f.MemoryCap
 	}
 	if f.TestFlags != "" {
 		c.TestFlags = f.TestFlags
