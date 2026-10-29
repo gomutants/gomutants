@@ -898,13 +898,7 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 			// alone, there's no telling whether the mutant or its suite
 			// went over the cap. INFRA ERROR isn't cached, so the next run
 			// measures again.
-			if ctx.Err() == nil {
-				why := "its tests couldn't be measured without a mutant"
-				if raised == suiteOverCeiling {
-					why = fmt.Sprintf("its tests go over %d MiB without a mutant", suiteRSSCeilingFactor*w.memCap>>20)
-				}
-				fmt.Fprintf(os.Stderr, "gomutants: worker %d: testing %s went over the %d MiB memory cap, and %s, treating as %s\n", w.id, run.pkg, rssCap>>20, why, mutator.StatusInfraError)
-			}
+			w.reportSuiteUnfit(ctx, run.pkg, rssCap, raised)
 			return binRun{status: mutator.StatusInfraError}
 		}
 		if raised > rssCap {
@@ -916,6 +910,20 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 		w.reportMemKill("testing", run.pkg, rssCap)
 	}
 	return r
+}
+
+// reportSuiteUnfit says why a run of pkg's tests over its cap rssCap is
+// INFRA ERROR (see runBin), from what measuring the suite returned,
+// raised, unless ctx was cancelled.
+func (w *Worker) reportSuiteUnfit(ctx context.Context, pkg string, rssCap, raised int64) {
+	if ctx.Err() != nil {
+		return
+	}
+	why := "its tests couldn't be measured without a mutant"
+	if raised == suiteOverCeiling {
+		why = fmt.Sprintf("its tests go over %d MiB without a mutant", suiteRSSCeilingFactor*w.memCap>>20)
+	}
+	fmt.Fprintf(os.Stderr, "gomutants: worker %d: testing %s went over the %d MiB memory cap, and %s, treating as %s\n", w.id, pkg, rssCap>>20, why, mutator.StatusInfraError)
 }
 
 // overCap reports whether the RSS monitor stopped the run before a test
