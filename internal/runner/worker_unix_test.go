@@ -1537,28 +1537,33 @@ func TestWorkerTestCancelledRunSaysNothing(t *testing.T) {
 			w.memCap = 2 << 20
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			n := 0
-			fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, func(string) []string {
-				n++
-				mon.rss.Store(999999 * 1024)
-				if n == 2 {
-					mon.rss.Store(1 << 20)
-				}
-				if n == tc.cancel {
-					time.AfterFunc(100*time.Millisecond, cancel)
-				}
-				return []string{"sleep", "0.3"}
-			})
+			runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
+				cancellingRuns(mon, []int64{999999 * 1024, 1 << 20, 999999 * 1024}, tc.cancel, cancel))
 			for range tc.mutants - 1 {
 				captureStderr(t, func() { w.Test(ctx, m) })
 			}
 			if stderr := captureStderr(t, func() { w.Test(ctx, m) }); stderr != "" {
 				t.Errorf("stderr = %q, want nothing said", stderr)
 			}
-			if n != tc.cancel {
-				t.Errorf("%d runs, want %d: ctx cancelled another run", n, tc.cancel)
+			if len(runs.runs) != tc.cancel {
+				t.Errorf("%d runs, want %d: ctx cancelled another run", len(runs.runs), tc.cancel)
 			}
 		})
+	}
+}
+
+// cancellingRuns returns a stand-in for fakeBuildsAndRuns' test runs: the
+// nth run sleeps 0.3s, the probe reading rss[n-1] for it, and the
+// cancel'th calls cancel 0.1s in.
+func cancellingRuns(mon *monitorStub, rss []int64, cancelAt int, cancel func()) func(string) []string {
+	n := 0
+	return func(string) []string {
+		n++
+		mon.rss.Store(rss[n-1])
+		if n == cancelAt {
+			time.AfterFunc(100*time.Millisecond, cancel)
+		}
+		return []string{"sleep", "0.3"}
 	}
 }
 
