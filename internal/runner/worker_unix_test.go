@@ -515,19 +515,16 @@ func TestWorkerTestGetpgidFallback(t *testing.T) {
 	cache := map[string][]byte{srcPath: src}
 	plusIdx := strings.IndexByte(string(src), '+')
 
-	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
 	origRSS := groupRSSFunc
 	origKill := syscallKillFunc
 	origGetpgid := syscallGetpgidFunc
 	defer func() {
-		maxSubprocRSSBytes = origCap
 		monitorPollInterval = origPoll
 		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 		syscallGetpgidFunc = origGetpgid
 	}()
-	maxSubprocRSSBytes = 1024
 	monitorPollInterval = 50 * time.Millisecond
 	groupRSSFunc = func(int) (int64, error) { return 999999 * 1024, nil }
 
@@ -550,6 +547,7 @@ func TestWorkerTestGetpgidFallback(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewWorker: %v", err)
 	}
+	w.memCap = 1024
 
 	m := mutator.Mutant{
 		ID: 1, File: srcPath, Pkg: "testmod",
@@ -606,8 +604,9 @@ func TestKillPgroupSendsNegativePgid(t *testing.T) {
 func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 	// 2 MiB, well below the stubbed probe, and a whole number of MiB so the
 	// log line's cap reads back as set.
-	mon := stubMemCap(t, 2<<20)
+	mon := stubMonitor(t)
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), 30*time.Second)
+	w.memCap = 2 << 20
 	n := 0
 	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string {
@@ -647,8 +646,9 @@ func TestWorkerTestRSSKillsRunaway(t *testing.T) {
 // had stopped would. A build keeps the default cap whatever its tests use,
 // so nothing is measured.
 func TestWorkerTestRSSKillsRunawayBuild(t *testing.T) {
-	mon := stubMemCap(t, 3<<20)
+	mon := stubMonitor(t)
 	w, m := fakeWorker(t, routeMap("f.go:1", coverage.TestRef{Pkg: "m/calc", Name: "TestCalc"}), 30*time.Second)
+	w.memCap = 3 << 20
 	_, runs := fakeBuildsOverCap(t, mon, []string{"sleep", "0.3"}, 1024)
 	const want = "gomutants: worker 0: building m/calc went over the 3 MiB memory cap and was killed, treating as TIMED OUT\n"
 	for range 2 {
@@ -691,8 +691,9 @@ func TestWorkerTestBuildOverCapWithoutMutant(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mon := stubMemCap(t, 3<<20)
+			mon := stubMonitor(t)
 			w, m := fakeWorker(t, nil, 30*time.Second)
+			w.memCap = 3 << 20
 			n, runs := fakeBuildsOverCap(t, mon, tc.unmutated, tc.rss)
 			if tc.startErr {
 				failSecondStart(func() { *n++ }) // the stand-in isn't asked for it
@@ -709,7 +710,7 @@ func TestWorkerTestBuildOverCapWithoutMutant(t *testing.T) {
 // its own after the monitor has polled it, but the second, the package's
 // build without a mutant, which runs unmutated and uses rss. Each run
 // passes. It returns how many builds were asked for, and what ran.
-func fakeBuildsOverCap(t *testing.T, mon *memCapStub, unmutated []string, rss int64) (*int, *fakeRuns) {
+func fakeBuildsOverCap(t *testing.T, mon *monitorStub, unmutated []string, rss int64) (*int, *fakeRuns) {
 	t.Helper()
 	n := 0
 	runs := fakeBuildsAndRuns(t, func(string) []string {
@@ -760,9 +761,10 @@ func wantInfraErrors(t *testing.T, w *Worker, m mutator.Mutant, wants ...string)
 // build without any mutant says nothing of it, nor of the mutant's build
 // over the cap: the run is ending, and the mutant is discarded.
 func TestWorkerTestCancelledBuildCheckSaysNothing(t *testing.T) {
-	mon := stubMemCap(t, 3<<20)
+	mon := stubMonitor(t)
 	mon.rss.Store(999999 * 1024)
 	w, m := fakeWorker(t, nil, 30*time.Second)
+	w.memCap = 3 << 20
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	n := 0
@@ -796,12 +798,13 @@ func TestWorkerTestRSSExactlyAtCapDoesNotKill(t *testing.T) {
 	plusIdx := strings.IndexByte(string(src), '+')
 
 	// The probe reads exactly the cap.
-	mon := stubMemCap(t, 1024)
+	mon := stubMonitor(t)
 
 	w, err := NewWorker(0, t.TempDir(), TimeoutPolicy{Global: 30 * time.Second}, cache, dir, nil)
 	if err != nil {
 		t.Fatalf("NewWorker: %v", err)
 	}
+	w.memCap = 1024
 
 	m := mutator.Mutant{
 		ID: 1, File: srcPath, Pkg: "testmod",
@@ -1239,10 +1242,11 @@ func TestWorkerTestRecheckStopsAtKill(t *testing.T) {
 // from a binary built without the overlay, and a mutant that runs away in
 // it still reads TIMED OUT.
 func TestWorkerTestHeavySuiteRaisesCap(t *testing.T) {
-	mon := stubMemCap(t, 2<<20)
+	mon := stubMonitor(t)
 	// The suite uses 3 MiB whatever the mutant.
 	mon.rss.Store(3 << 20)
 	w, m := fakeWorker(t, nil, 30*time.Second)
+	w.memCap = 2 << 20
 	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sleep", "0.3"} })
 	// Every build and run is bounded like a mutant's (see proctree.Bound),
@@ -1297,9 +1301,10 @@ func TestWorkerTestHeavySuiteRaisesCap(t *testing.T) {
 // for the re-check, where #124 showed: each package whose suite goes over
 // the cap alone gets its own cap, so a survivor stays a re-checked LIVED.
 func TestWorkerTestRecheckHeavySuitesStayLived(t *testing.T) {
-	mon := stubMemCap(t, 2<<20)
+	mon := stubMonitor(t)
 	mon.rss.Store(3 << 20)
 	w, m, started := recheckWorker(t, 30*time.Second, func(string) []string { return []string{"sleep", "0.3"} })
+	w.memCap = 2 << 20
 	var got mutator.Mutant
 	stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
 	if got.Status != mutator.StatusLived || !got.Rechecked {
@@ -1323,9 +1328,10 @@ func TestWorkerTestRecheckHeavySuitesStayLived(t *testing.T) {
 // and keeps the cap, so its mutants that go over it read TIMED OUT. It is
 // measured once all the same.
 func TestWorkerTestSuiteOverCeilingKeepsCap(t *testing.T) {
-	mon := stubMemCap(t, 2<<20)
+	mon := stubMonitor(t)
 	mon.rss.Store(999999 * 1024)
 	w, m := fakeWorker(t, nil, 30*time.Second)
+	w.memCap = 2 << 20
 	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sleep", "0.3"} })
 	var got mutator.Mutant
@@ -1350,9 +1356,10 @@ func TestWorkerTestSuiteOverCeilingKeepsCap(t *testing.T) {
 // are made from.
 func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 	t.Run("build", func(t *testing.T) {
-		mon := stubMemCap(t, 2<<20)
+		mon := stubMonitor(t)
 		mon.rss.Store(999999 * 1024)
 		w, m := fakeWorker(t, nil, 30*time.Second)
+		w.memCap = 2 << 20
 		w.memCap = 5 << 20
 		fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 0.3; exit 1"} },
 			func(string) []string { return []string{"true"} })
@@ -1364,10 +1371,11 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 		}
 	})
 	t.Run("raised", func(t *testing.T) {
-		mon := stubMemCap(t, 2<<20)
+		mon := stubMonitor(t)
 		// Over the worker's 4 MiB, under twice it.
 		mon.rss.Store(5 << 20)
 		w, m := fakeWorker(t, nil, 30*time.Second)
+		w.memCap = 2 << 20
 		w.memCap = 4 << 20
 		fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 			func(string) []string { return []string{"sleep", "0.3"} })
@@ -1381,9 +1389,10 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 		}
 	})
 	t.Run("over ceiling", func(t *testing.T) {
-		mon := stubMemCap(t, 2<<20)
+		mon := stubMonitor(t)
 		mon.rss.Store(999999 * 1024)
 		w, m := fakeWorker(t, nil, 30*time.Second)
+		w.memCap = 2 << 20
 		w.memCap = 3 << 20
 		fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 			func(string) []string { return []string{"sleep", "0.3"} })
@@ -1404,7 +1413,7 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
 	for _, memCap := range []int64{0, config.NoMemoryCap} {
 		t.Run(fmt.Sprint(memCap), func(t *testing.T) {
-			mon := stubMemCap(t, 2<<20)
+			mon := stubMonitor(t)
 			mon.rss.Store(999999 * 1024)
 			var polls atomic.Int32
 			probe := groupRSSFunc
@@ -1413,6 +1422,7 @@ func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
 				return probe(pgid)
 			}
 			w, m := fakeWorker(t, nil, 30*time.Second)
+			w.memCap = 2 << 20
 			w.memCap = memCap
 			runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"sleep", "0.3"} },
 				func(string) []string { return []string{"sleep", "0.3"} })
@@ -1434,8 +1444,9 @@ func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
 	}
 
 	// The smallest cap there is still caps.
-	stubMemCap(t, 2<<20).rss.Store(999999 * 1024)
+	stubMonitor(t).rss.Store(999999 * 1024)
 	w, _ := fakeWorker(t, nil, 30*time.Second)
+	w.memCap = 2 << 20
 	cmd, _, _ := w.makeCmd(context.Background(), "sleep", t.TempDir(), []string{"0.3"})
 	res, err := w.runMonitored(cmd, 1)
 	if err != nil {
@@ -1463,9 +1474,10 @@ func TestRunMonitoredNoCapReportsFailure(t *testing.T) {
 // for the rest of this one: a later mutant of the package that goes over
 // the cap isn't built again without the overlay.
 func TestWorkerTestSuiteMeasureFailureKept(t *testing.T) {
-	mon := stubMemCap(t, 2<<20)
+	mon := stubMonitor(t)
 	mon.rss.Store(999999 * 1024)
 	w, m := fakeWorker(t, nil, 30*time.Second)
+	w.memCap = 2 << 20
 	n := 0
 	runs := fakeBuildsAndRuns(t, func(string) []string {
 		// The first mutant's build succeeds, the unmutated one after it
@@ -1514,9 +1526,10 @@ func TestWorkerTestCancelledRunSaysNothing(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mon := stubMemCap(t, 2<<20)
+			mon := stubMonitor(t)
 			mon.rss.Store(999999 * 1024)
 			w, m := fakeWorker(t, nil, 30*time.Second)
+			w.memCap = 2 << 20
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			n := 0
@@ -1555,7 +1568,7 @@ func TestMeasureSuiteCap(t *testing.T) {
 		rss    int64
 		run    []string
 		global time.Duration
-		poll   time.Duration // stubMemCap's if 0
+		poll   time.Duration // stubMonitor's if 0
 		want   int64
 		stderr string
 	}{
@@ -1573,12 +1586,13 @@ func TestMeasureSuiteCap(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			mon := stubMemCap(t, 2<<20)
+			mon := stubMonitor(t)
 			if tc.poll != 0 {
 				monitorPollInterval = tc.poll
 			}
 			mon.rss.Store(tc.rss)
 			w, _ := fakeWorker(t, nil, tc.global)
+			w.memCap = 2 << 20
 			fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, func(string) []string { return tc.run })
 			var got int64
 			stderr := captureStderr(t, func() { got = w.measureSuite(context.Background(), "m/calc", t.TempDir(), nil) })
@@ -1616,8 +1630,9 @@ func TestMeasureSuiteFails(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			stubMemCap(t, 2<<20)
+			stubMonitor(t)
 			w, _ := fakeWorker(t, nil, 30*time.Second)
+			w.memCap = 2 << 20
 			fakeBuildsAndRuns(t, func(string) []string { return tc.build }, func(string) []string { return tc.run })
 			failStart(tc.start, startErr)
 			ctx, cancel := context.WithCancel(context.Background())
@@ -1659,8 +1674,9 @@ func failStart(nth int, err error) {
 // TIMED OUT without the monitor having stopped it, so its package's suite
 // isn't measured, and no memory kill is reported.
 func TestWorkerTestDeadlineMeasuresNothing(t *testing.T) {
-	stubMemCap(t, 2<<20)
+	stubMonitor(t)
 	w, m := fakeWorker(t, nil, 200*time.Millisecond)
+	w.memCap = 2 << 20
 	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sleep", "5"} })
 	var got mutator.Mutant
@@ -1679,9 +1695,10 @@ func TestWorkerTestDeadlineMeasuresNothing(t *testing.T) {
 // open and grows; the mutant was detected before the kill. Nothing is
 // measured for it.
 func TestWorkerTestMemKillAfterFailureIsKilled(t *testing.T) {
-	mon := stubMemCap(t, 2<<20)
+	mon := stubMonitor(t)
 	mon.rss.Store(999999 * 1024)
 	w, m := fakeWorker(t, nil, 30*time.Second)
+	w.memCap = 2 << 20
 	runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 		func(string) []string { return []string{"sh", "-c", "echo '--- FAIL: TestCalc'; sleep 0.5; exit 1"} })
 	var got mutator.Mutant
@@ -1697,32 +1714,29 @@ func TestWorkerTestMemKillAfterFailureIsKilled(t *testing.T) {
 	}
 }
 
-// memCapStub is what stubMemCap stubs the RSS monitor with: the probe
+// monitorStub is what stubMonitor stubs the RSS monitor with: the probe
 // reads rss for every group, and kills counts the monitor's kills, which
 // do nothing.
-type memCapStub struct {
+type monitorStub struct {
 	rss   atomic.Int64
 	kills atomic.Int32
 }
 
-// stubMemCap sets the memory cap to rssCap, polled every 50ms, and stubs
-// the monitor's probe and kill (see memCapStub). The probe reads 1 KiB
-// until the test sets rss.
-func stubMemCap(t *testing.T, rssCap int64) *memCapStub {
+// stubMonitor polls the memory cap every 50ms and stubs the monitor's
+// probe and kill (see monitorStub). The probe reads 1 KiB until the test
+// sets rss. The test sets the cap on its worker's memCap.
+func stubMonitor(t *testing.T) *monitorStub {
 	t.Helper()
-	origCap := maxSubprocRSSBytes
 	origPoll := monitorPollInterval
 	origRSS := groupRSSFunc
 	origKill := syscallKillFunc
 	t.Cleanup(func() {
-		maxSubprocRSSBytes = origCap
 		monitorPollInterval = origPoll
 		groupRSSFunc = origRSS
 		syscallKillFunc = origKill
 	})
-	maxSubprocRSSBytes = rssCap
 	monitorPollInterval = 50 * time.Millisecond
-	mon := &memCapStub{}
+	mon := &monitorStub{}
 	mon.rss.Store(1024)
 	groupRSSFunc = func(int) (int64, error) { return mon.rss.Load(), nil }
 	syscallKillFunc = func(int, syscall.Signal) error {

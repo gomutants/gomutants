@@ -235,7 +235,7 @@ func TestPoolCreateWorkersMemoryCap(t *testing.T) {
 	for _, tt := range []struct {
 		set, want int64
 	}{
-		{0, maxSubprocRSSBytes},
+		{0, config.DefaultMemoryCap},
 		{config.NoMemoryCap, config.NoMemoryCap},
 	} {
 		p := NewPool(1, ExecOpts{MemoryCap: tt.set}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)

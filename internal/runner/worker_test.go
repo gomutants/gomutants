@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gomutants/gomutants/internal/config"
 	"github.com/gomutants/gomutants/internal/coverage"
 	"github.com/gomutants/gomutants/internal/mutator"
 )
@@ -22,12 +21,9 @@ import (
 // package-level vars and the maxCapturedOutput const. These literals
 // live above any function body and aren't reachable by tests that
 // override them — without an explicit pin, ARITHMETIC_BASE and
-// INVERT_BITWISE mutants on the literals (e.g. `2 * 1024 * 1024 * 1024`,
+// INVERT_BITWISE mutants on the literals (e.g. `1 * time.Second`,
 // `1 << 20`) are unkillable.
 func TestPackageVarDefaults(t *testing.T) {
-	if maxSubprocRSSBytes != config.DefaultMemoryCap {
-		t.Errorf("maxSubprocRSSBytes = %d, want config.DefaultMemoryCap", maxSubprocRSSBytes)
-	}
 	if got, want := monitorPollInterval, 1*time.Second; got != want {
 		t.Errorf("monitorPollInterval = %v, want %v", got, want)
 	}
