@@ -100,7 +100,7 @@ func parseFlags(args []string) (*cliOptions, error) {
 	fs.StringVar(&f.CoverPkg, "coverpkg", "", "coverage package pattern")
 	// The back-quoted `size` is the value placeholder; see the
 	// --test-flags comment below for why it must come first.
-	fs.StringVar(&f.MemoryCap, "memory-cap", "", "memory cap: a mutant's build or test run whose process group uses more than this `size` (MiB or GiB, from 64MiB to 1024GiB, e.g. 4GiB, 3072MiB) is killed, and its mutant reads TIMED OUT, or INFRA ERROR for a build whose package goes over it without any mutant too; off disables it (default: 2GiB). A package whose tests go over it without any mutant gets up to 4x it for its test runs. The coverage, per-test coverage-map, baseline and --detect-equivalent runs aren't capped. No effect on Windows")
+	fs.StringVar(&f.MemoryCap, "memory-cap", "", "memory cap: a mutant's build or test run whose process group uses more than this `size` (MiB or GiB, from 64MiB to 1024GiB, e.g. 4GiB, 3072MiB) is killed, and its mutant reads TIMED OUT, or INFRA ERROR if its package's build needs more than it, or its tests more than 4x it, without any mutant; off disables it (default: 2GiB). A package whose tests go over it without any mutant gets up to 4x it for its test runs. The coverage, per-test coverage-map, baseline and --detect-equivalent runs aren't capped. No effect on Windows")
 	fs.StringVar(&f.Tags, "tags", "", "comma-separated build tags forwarded as -tags to the inner go list/go test (gremlins-compat)")
 	// fs.Func rather than StringVar so repeated --test-flags accumulate
 	// instead of the last one silently winning; a user building the value

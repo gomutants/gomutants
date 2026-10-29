@@ -29,6 +29,11 @@ import (
 // is still protected from a suite that grows without end.
 const suiteRSSCeilingFactor = 4
 
+// suiteOverCeiling is what Worker.measureSuite returns for a suite that
+// goes over suiteRSSCeilingFactor times the worker's cap without any
+// mutant.
+const suiteOverCeiling int64 = -1
+
 // monitorPollInterval is the cadence at which the RSS monitor probes the
 // group's memory. var so tests can shrink it to make the kill path fire
 // quickly.
@@ -410,7 +415,9 @@ func (c *binArgsCache) get(ctx context.Context, projectDir, tags, pkg string, fl
 // all (#124).
 // Read as TIMED OUT, its mutants drop out of the efficacy denominator,
 // and --threshold-efficacy passes on survivors. Twice what the suite uses
-// alone still stops a mutant that runs away in it.
+// alone still stops a mutant that runs away in it. A suite that goes over
+// suiteRSSCeilingFactor times the cap alone needs a higher --memory-cap:
+// its runs over the cap are INFRA ERROR, for the same reason.
 //
 // It also holds whether each package's build without any mutant stays
 // under the workers' cap (see Worker.buildBin), checked the first time a
@@ -425,13 +432,28 @@ type suiteCaps struct {
 // meanwhile waits for that measurement instead of making its own.
 type suiteCap struct {
 	mu       sync.Mutex
-	measured bool         // under mu: the suite's measurement was made
-	rssCap   atomic.Int64 // 0 until measured, and for a failed measurement
-	// built and buildFits, under mu: the build without any mutant was
-	// made, and it stayed under the cap.
-	built     bool
-	buildFits bool
+	measured bool // under mu: the suite's measurement was made
+	// result, under mu, is what the measurement returned (see
+	// Worker.measureSuite), suiteOverCeiling included.
+	result int64
+	// rssCap is the package's cap: result when that is one, else 0. Never
+	// suiteOverCeiling, which runMonitored would read as no cap.
+	rssCap atomic.Int64
+	// built and build, under mu: the build without any mutant was made,
+	// and what it showed.
+	built bool
+	build buildCheck
 }
+
+// buildCheck is what building a package without any mutant showed (see
+// Worker.unmutatedBuildFits).
+type buildCheck int
+
+const (
+	buildUnknown buildCheck = iota // the build couldn't tell
+	buildFits                      // it stayed under the cap
+	buildOverCap                   // it went over the cap too
+)
 
 func (c *suiteCaps) entry(pkg string) *suiteCap {
 	c.mu.Lock()
@@ -456,36 +478,39 @@ func (c *suiteCaps) get(pkg string, base int64) int64 {
 	return base
 }
 
-// measure returns pkg's cap, measuring its suite with measure on first
-// use, or 0 and false if that measurement failed. measure returns 0 for a
-// failed measurement. The failure is kept for the rest of the run: one
-// that fails the same way every time would otherwise be made again, a
-// rebuild of the package without the overlay, for each of its mutants
-// that goes over the cap, while the other workers on it wait.
-func (c *suiteCaps) measure(pkg string, measure func() int64) (int64, bool) {
+// measure returns what measuring pkg's suite with measure returned (see
+// Worker.measureSuite), measuring it on first use: its cap, 0 for a failed
+// measurement, or suiteOverCeiling. The answer is kept for the rest of the
+// run, a failure too: one that fails the same way every time would
+// otherwise be made again, a rebuild of the package without the overlay,
+// for each of its mutants that goes over the cap, while the other workers
+// on it wait.
+func (c *suiteCaps) measure(pkg string, measure func() int64) int64 {
 	e := c.entry(pkg)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.measured {
 		e.measured = true
-		e.rssCap.Store(measure())
+		e.result = measure()
+		if e.result > 0 {
+			e.rssCap.Store(e.result)
+		}
 	}
-	n := e.rssCap.Load()
-	return n, n != 0
+	return e.result
 }
 
-// buildFits returns whether pkg's build without any mutant stays under the
-// workers' cap, checking with fits on first use. The answer is kept for the
-// rest of the run, as measure's is.
-func (c *suiteCaps) buildFits(pkg string, fits func() bool) bool {
+// checkBuild returns what pkg's build without any mutant showed, checking
+// with check on first use. The answer is kept for the rest of the run, as
+// measure's is.
+func (c *suiteCaps) checkBuild(pkg string, check func() buildCheck) buildCheck {
 	e := c.entry(pkg)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.built {
 		e.built = true
-		e.buildFits = fits()
+		e.build = check()
 	}
-	return e.buildFits
+	return e.build
 }
 
 // Worker tests a single mutant: it builds the test binary of each package
@@ -694,7 +719,7 @@ func (w *Worker) Test(ctx context.Context, m mutator.Mutant) mutator.Mutant {
 func (w *Worker) runGroups(ctx context.Context, m mutator.Mutant, groups map[string][]string, short bool, timeout time.Duration) mutator.MutantStatus {
 	left := timeout
 	for _, run := range invocations(groups, m.Pkg) {
-		bin, status := w.buildBin(ctx, run.pkg)
+		bin, status := w.buildBin(ctx, m, run.pkg)
 		if status != mutator.StatusLived {
 			return status
 		}
@@ -744,12 +769,13 @@ func (w *Worker) recheck(ctx context.Context, m mutator.Mutant, full map[string]
 //
 // A mutant rarely changes what its package's compile or link uses, so a
 // build over the cap is more likely the package's than the mutant's. The
-// first time one goes over, the package is built once without any mutant
-// (see unmutatedBuildFits). If that goes over too, or can't tell, the
-// mutant is INFRA ERROR, which isn't cached: read as TIMED OUT, every
-// mutant of a package whose build needs more than the cap would drop out
-// of the efficacy denominator, leaving it untested without a word.
-func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.MutantStatus) {
+// first time one goes over, the package is built once without any mutant,
+// m's file recompiled as it is (see unmutatedBuildFits). If that goes over
+// too, or can't tell, the mutant is INFRA ERROR, which isn't cached: read
+// as TIMED OUT, every mutant of a package whose build needs more than the
+// cap would drop out of the efficacy denominator, leaving it untested
+// without a word.
+func (w *Worker) buildBin(ctx context.Context, m mutator.Mutant, pkg string) (string, mutator.MutantStatus) {
 	if bin, ok := w.bins[pkg]; ok {
 		return bin, mutator.StatusLived
 	}
@@ -761,7 +787,7 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 	_ = os.Remove(bin)
 	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
 	defer cancel()
-	cmd, stdout, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, true))
+	cmd, stdout, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, w.overlayPath))
 	proctree.Bound(cmd)
 	res, err := w.runMonitored(cmd, w.memCap)
 	if err != nil {
@@ -775,9 +801,13 @@ func (w *Worker) buildBin(ctx context.Context, pkg string) (string, mutator.Muta
 			return "", mutator.StatusInfraError
 		}
 		if res.memKilled {
-			if !w.suiteCaps.buildFits(pkg, func() bool { return w.unmutatedBuildFits(ctx, pkg) }) {
+			if check := w.suiteCaps.checkBuild(pkg, func() buildCheck { return w.unmutatedBuildFits(ctx, m, pkg) }); check != buildFits {
 				if ctx.Err() == nil {
-					fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s went over the %d MiB memory cap, and building it without a mutant didn't stay under it, treating as %s\n", w.id, pkg, w.memCap>>20, mutator.StatusInfraError)
+					why := "building it without a mutant didn't stay under it"
+					if check == buildUnknown {
+						why = "its build without a mutant couldn't be checked"
+					}
+					fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s went over the %d MiB memory cap, and %s, treating as %s\n", w.id, pkg, w.memCap>>20, why, mutator.StatusInfraError)
 				}
 				return "", mutator.StatusInfraError
 			}
@@ -828,8 +858,8 @@ type binRun struct {
 // without any mutant, the first time one of its runs does. If that raises
 // the cap, the run is made again under the new cap, with timeout to
 // itself: as a build's, the killed run's time is none the tests' timings
-// show (see runGroups). If the suite couldn't be measured, the run is
-// INFRA ERROR.
+// show (see runGroups). If the suite couldn't be measured, or goes over
+// suiteRSSCeilingFactor times the cap alone, the run is INFRA ERROR.
 //
 // The binary gets no -test.timeout: it would start its own clock along
 // with the deadline's, and its timeout panic, winning the race, would
@@ -854,13 +884,18 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 	rssCap := w.suiteCaps.get(run.pkg, w.memCap)
 	r := w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
 	if r.overCap() {
-		raised, ok := w.suiteCaps.measure(run.pkg, func() int64 { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
-		if !ok {
-			// Without the measurement there's no telling whether the
-			// mutant or its suite went over the cap. INFRA ERROR isn't
-			// cached, so the next run measures again.
+		raised := w.suiteCaps.measure(run.pkg, func() int64 { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
+		if raised <= 0 {
+			// Without the measurement, or with a suite over the ceiling
+			// alone, there's no telling whether the mutant or its suite
+			// went over the cap. INFRA ERROR isn't cached, so the next run
+			// measures again.
 			if ctx.Err() == nil {
-				fmt.Fprintf(os.Stderr, "gomutants: worker %d: testing %s went over the %d MiB memory cap, and its tests couldn't be measured without a mutant, treating as %s\n", w.id, run.pkg, rssCap>>20, mutator.StatusInfraError)
+				why := "its tests couldn't be measured without a mutant"
+				if raised == suiteOverCeiling {
+					why = fmt.Sprintf("its tests go over %d MiB without a mutant", suiteRSSCeilingFactor*w.memCap>>20)
+				}
+				fmt.Fprintf(os.Stderr, "gomutants: worker %d: testing %s went over the %d MiB memory cap, and %s, treating as %s\n", w.id, run.pkg, rssCap>>20, why, mutator.StatusInfraError)
 			}
 			return binRun{status: mutator.StatusInfraError}
 		}
@@ -922,8 +957,9 @@ func (w *Worker) runBinOnce(ctx context.Context, run pkgRun, bin, dir string, bi
 //
 // The run is stopped at suiteRSSCeilingFactor times w.memCap, and the cap
 // is never raised past that, the most a run of the package is let use. A
-// suite that goes over that alone keeps w.memCap, so its mutants that go
-// over it read TIMED OUT, as before.
+// suite that goes over that alone returns suiteOverCeiling: it needs a
+// higher --memory-cap, and its mutants that go over the cap read INFRA
+// ERROR (see runBin).
 func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []string) int64 {
 	fail := func(why string) int64 {
 		if ctx.Err() == nil {
@@ -933,7 +969,7 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 	}
 	bin := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-suite.test", w.id))
 	defer func() { _ = os.Remove(bin) }()
-	build, stderr, err := w.buildUnmutated(ctx, pkg, bin)
+	build, stderr, err := w.buildUnmutated(ctx, pkg, bin, "")
 	if err != nil {
 		return fail(err.Error())
 	}
@@ -955,8 +991,8 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 		return 0
 	}
 	if res.memKilled {
-		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests go over %d MiB without a mutant, so they keep the %d MiB memory cap\n", w.id, pkg, ceiling>>20, w.memCap>>20)
-		return w.memCap
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: %s's tests go over %d MiB without a mutant; raise --memory-cap to test its mutants\n", w.id, pkg, ceiling>>20)
+		return suiteOverCeiling
 	}
 	// gomutants:disable-next-line CONDITIONALS_BOUNDARY reason="a run's elapsed time never lands on the threshold to the nanosecond, so > and >= can't be told apart"
 	if res.peak == 0 && time.Since(start) > 2*monitorPollInterval {
@@ -979,36 +1015,68 @@ func (w *Worker) measureSuite(ctx context.Context, pkg, dir string, binArgs []st
 // unmutatedBuildFits builds pkg's test binary without any mutant and
 // reports whether the build finished under the worker's cap (see
 // buildBin). A build that fails another way, or fails to start, doesn't
-// tell, and reads as one that doesn't fit; either is said, unless ctx was
-// cancelled.
-func (w *Worker) unmutatedBuildFits(ctx context.Context, pkg string) bool {
+// tell; either is said, unless ctx was cancelled.
+//
+// m's file goes in through an overlay as it is, but for a comment at its
+// end that no earlier build had: built from source the build cache already
+// holds, as the coverage and baseline runs left it, `go` would reuse the
+// compile and only link, and a package whose compile needs more than the
+// cap would pass. Changed so, the package and its test variant are
+// compiled again, as for a mutant. The answer is kept for pkg (see
+// suiteCaps.checkBuild), so a suite's package built for another mutant's
+// file reads the same.
+func (w *Worker) unmutatedBuildFits(ctx context.Context, m mutator.Mutant, pkg string) buildCheck {
 	bin := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-unmutated.test", w.id))
 	defer func() { _ = os.Remove(bin) }()
-	build, stderr, err := w.buildUnmutated(ctx, pkg, bin)
+	var build monitored
+	var stderr string
+	overlay, err := w.writeUnmutatedOverlay(m)
+	if err == nil {
+		build, stderr, err = w.buildUnmutated(ctx, pkg, bin, overlay)
+	}
 	var why string
 	switch {
 	case ctx.Err() != nil:
-		return false
+		return buildUnknown
 	case err != nil:
 		why = err.Error()
 	case build.memKilled:
 		fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s without a mutant goes over the %d MiB memory cap too; raise --memory-cap to test its mutants\n", w.id, pkg, w.memCap>>20)
-		return false
+		return buildOverCap
 	case build.runErr != nil:
 		why = buildFailure(build, stderr)
 	default:
-		return true
+		return buildFits
 	}
 	fmt.Fprintf(os.Stderr, "gomutants: worker %d: can't tell whether %s's build fits under the memory cap without a mutant: %s\n", w.id, pkg, why)
-	return false
+	return buildUnknown
 }
 
-// buildUnmutated builds pkg's test binary at bin without the overlay, as
-// buildBin does with it, and returns how the build ended and its stderr.
-func (w *Worker) buildUnmutated(ctx context.Context, pkg, bin string) (monitored, string, error) {
+// writeUnmutatedOverlay writes the overlay unmutatedBuildFits builds
+// through: m's file as it is, with a comment no earlier build had at its
+// end. It returns the overlay's path. Like the mutant's (see NewWorker),
+// the files are the worker's own, written over at its next check.
+func (w *Worker) writeUnmutatedOverlay(m mutator.Mutant) (string, error) {
+	src := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-unmutated.go", w.id))
+	body := append(slices.Clip(w.sourceCache[m.File]), fmt.Sprintf("\n// gomutants: built without a mutant, %d\n", time.Now().UnixNano())...)
+	if err := writeFileFunc(src, body, 0o644); err != nil {
+		return "", err
+	}
+	path := filepath.Join(w.binDir, fmt.Sprintf("worker-%d-unmutated.json", w.id))
+	ovBytes, _ := json.Marshal(overlay{Replace: map[string]string{m.File: src}})
+	if err := writeFileFunc(path, ovBytes, 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// buildUnmutated builds pkg's test binary at bin through overlay, none if
+// "", as buildBin does through the mutant's, and returns how the build
+// ended and its stderr.
+func (w *Worker) buildUnmutated(ctx context.Context, pkg, bin, overlay string) (monitored, string, error) {
 	buildCtx, cancel := context.WithTimeout(ctx, buildTimeout)
 	defer cancel()
-	cmd, _, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, false))
+	cmd, _, stderr := w.makeCmd(buildCtx, "go", w.projectDir, w.buildArgs(pkg, bin, overlay))
 	proctree.Bound(cmd)
 	res, err := w.runMonitored(cmd, w.memCap)
 	return res, stderr.String(), err
@@ -1177,8 +1245,8 @@ func (w *Worker) binEnv(dir string) []string {
 }
 
 // buildArgs constructs the `go test -c` argv that builds pkg's test binary
-// to bin, with the mutant's overlay in place if overlay is set, or of the
-// unmutated package if not (see Worker.measureSuite). Kept as a distinct
+// to bin, through the overlay file overlay, or with none if it is ""
+// (see Worker.measureSuite). Kept as a distinct
 // builder so callers can verify the flag and package wiring without
 // spinning up a subprocess.
 //
@@ -1189,13 +1257,13 @@ func (w *Worker) binEnv(dir string) []string {
 // They go last, after the package, as `go test` reads them there too (see
 // binFlags), and Go takes the last occurrence of a repeated flag, so a
 // user value still beats ours.
-func (w *Worker) buildArgs(pkg, bin string, overlay bool) []string {
+func (w *Worker) buildArgs(pkg, bin, overlay string) []string {
 	// -vet=off: vet runs in the user's CI on clean source; re-running it
 	// per mutant is pure overhead. Measured ~17–39% per-mutant wall-clock
 	// reduction on representative packages.
 	args := []string{"test", "-c", "-o", bin, "-vet=off"}
-	if overlay {
-		args = append(args, "-overlay="+w.overlayPath)
+	if overlay != "" {
+		args = append(args, "-overlay="+overlay)
 	}
 	if w.tags != "" {
 		args = append(args, "-tags="+w.tags)
