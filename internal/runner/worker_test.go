@@ -741,7 +741,7 @@ func TestWorkerTestStartFailureClassifiesInfrastructureErrors(t *testing.T) {
 
 			var got mutator.MutantStatus
 			captured := captureStderr(t, func() {
-				_, got = w.buildBin(context.Background(), "p")
+				_, got = w.buildBin(context.Background(), mutator.Mutant{}, "p")
 			})
 			if got != mutator.StatusInfraError {
 				t.Errorf("Status=%v, want InfraError", got)
@@ -949,21 +949,21 @@ func TestBinFlags(t *testing.T) {
 // to a positional argument). -tags appears exactly when tags are set,
 // which kills BRANCH_IF / CONDITIONALS_NEGATION on `if w.tags != ""`.
 func TestBuildArgs(t *testing.T) {
-	w := &Worker{overlayPath: "/tmp/o.json", tags: "integration,debug", testFlags: []string{"-rapid.checks=20", "-race", "-short"}}
+	w := &Worker{tags: "integration,debug", testFlags: []string{"-rapid.checks=20", "-race", "-short"}}
 	want := []string{"test", "-c", "-o", "/tmp/w.test", "-vet=off", "-overlay=/tmp/o.json", "-tags=integration,debug", "example.com/mod/sub", "-race"}
-	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", true); !slices.Equal(got, want) {
+	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", "/tmp/o.json"); !slices.Equal(got, want) {
 		t.Errorf("buildArgs = %q, want %q", got, want)
 	}
-	w = &Worker{overlayPath: "/tmp/o.json"}
+	w = &Worker{}
 	want = []string{"test", "-c", "-o", "/tmp/w.test", "-vet=off", "-overlay=/tmp/o.json", "example.com/mod/sub"}
-	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", true); !slices.Equal(got, want) {
+	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", "/tmp/o.json"); !slices.Equal(got, want) {
 		t.Errorf("buildArgs without tags or flags = %q, want %q", got, want)
 	}
 	// The unmutated build that measures a suite (see measureSuite) has no
 	// overlay: with it, the suite would run whatever mutant the worker
 	// last staged.
 	want = []string{"test", "-c", "-o", "/tmp/w.test", "-vet=off", "example.com/mod/sub"}
-	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", false); !slices.Equal(got, want) {
+	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", ""); !slices.Equal(got, want) {
 		t.Errorf("buildArgs without the overlay = %q, want %q", got, want)
 	}
 }

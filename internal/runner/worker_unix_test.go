@@ -4,6 +4,7 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -669,11 +670,14 @@ func TestWorkerTestRSSKillsRunawayBuild(t *testing.T) {
 // TestWorkerTestBuildOverCapWithoutMutant: a build over the cap whose
 // package's build without any mutant goes over it too, or can't tell, is
 // INFRA ERROR, not TIMED OUT, which would drop every mutant of the package
-// from the efficacy denominator unsaid. INFRA ERROR isn't cached, and the
-// check is kept for the rest of the run: a later mutant's build over the
-// cap isn't followed by another.
+// from the efficacy denominator unsaid. Each mutant's line says which.
+// INFRA ERROR isn't cached, and the check is kept for the rest of the run:
+// a later mutant's build over the cap isn't followed by another.
 func TestWorkerTestBuildOverCapWithoutMutant(t *testing.T) {
-	const overCap = "gomutants: worker 0: building m/calc went over the 3 MiB memory cap, and building it without a mutant didn't stay under it, treating as INFRA ERROR\n"
+	const (
+		overCap   = "gomutants: worker 0: building m/calc went over the 3 MiB memory cap, and building it without a mutant didn't stay under it, treating as INFRA ERROR\n"
+		unchecked = "gomutants: worker 0: building m/calc went over the 3 MiB memory cap, and its build without a mutant couldn't be checked, treating as INFRA ERROR\n"
+	)
 	cases := []struct {
 		name string
 		// unmutated is the build without a mutant, and rss what it uses.
@@ -681,13 +685,15 @@ func TestWorkerTestBuildOverCapWithoutMutant(t *testing.T) {
 		rss       int64
 		startErr  bool // its start fails instead
 		want      string
+		// perMutant is each mutant's line.
+		perMutant string
 	}{
 		{"over cap too", []string{"sh", "-c", "sleep 0.5; exit 1"}, 999999 * 1024, false,
-			"gomutants: worker 0: building m/calc without a mutant goes over the 3 MiB memory cap too; raise --memory-cap to test its mutants\n"},
+			"gomutants: worker 0: building m/calc without a mutant goes over the 3 MiB memory cap too; raise --memory-cap to test its mutants\n", overCap},
 		{"fails", []string{"sh", "-c", "echo undefined: x >&2; exit 1"}, 1024, false,
-			"gomutants: worker 0: can't tell whether m/calc's build fits under the memory cap without a mutant: building it: exit status 1\nundefined: x\n"},
+			"gomutants: worker 0: can't tell whether m/calc's build fits under the memory cap without a mutant: building it: exit status 1\nundefined: x\n", unchecked},
 		{"fails to start", []string{"true"}, 1024, true,
-			"gomutants: worker 0: can't tell whether m/calc's build fits under the memory cap without a mutant: fork failed\n"},
+			"gomutants: worker 0: can't tell whether m/calc's build fits under the memory cap without a mutant: fork failed\n", unchecked},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -698,7 +704,7 @@ func TestWorkerTestBuildOverCapWithoutMutant(t *testing.T) {
 			if tc.startErr {
 				failSecondStart(func() { *n++ }) // the stand-in isn't asked for it
 			}
-			wantInfraErrors(t, w, m, tc.want+overCap, overCap)
+			wantInfraErrors(t, w, m, tc.want+tc.perMutant, tc.perMutant)
 			if *n != 3 || len(runs.runs) != 0 {
 				t.Errorf("%d builds, runs = %v, want 3 and none: each mutant's, and one without a mutant for the first", *n, runs.runs)
 			}
@@ -1323,11 +1329,12 @@ func TestWorkerTestRecheckHeavySuitesStayLived(t *testing.T) {
 	}
 }
 
-// TestWorkerTestSuiteOverCeilingKeepsCap: a suite that goes over
-// suiteRSSCeilingFactor times the cap without any mutant is stopped there
-// and keeps the cap, so its mutants that go over it read TIMED OUT. It is
-// measured once all the same.
-func TestWorkerTestSuiteOverCeilingKeepsCap(t *testing.T) {
+// TestWorkerTestSuiteOverCeilingIsInfraError: a suite that goes over
+// suiteRSSCeilingFactor times the cap without any mutant is stopped there,
+// and its mutants that go over the cap read INFRA ERROR, not TIMED OUT,
+// which would drop them from the efficacy denominator unsaid. It is
+// measured once, and the cap stays on.
+func TestWorkerTestSuiteOverCeilingIsInfraError(t *testing.T) {
 	mon := stubMonitor(t)
 	mon.rss.Store(999999 * 1024)
 	w, m := fakeWorker(t, nil, 30*time.Second)
@@ -1336,17 +1343,20 @@ func TestWorkerTestSuiteOverCeilingKeepsCap(t *testing.T) {
 		func(string) []string { return []string{"sleep", "0.3"} })
 	var got mutator.Mutant
 	stderr := captureStderr(t, func() { got = w.Test(context.Background(), m) })
-	if got.Status != mutator.StatusTimedOut || len(runs.runs) != 2 {
-		t.Errorf("Status=%v, runs = %v, want TIMED OUT from the mutant's run and the suite's", got.Status, runs.runs)
+	if got.Status != mutator.StatusInfraError || len(runs.runs) != 2 {
+		t.Errorf("Status=%v, runs = %v, want INFRA ERROR from the mutant's run and the suite's", got.Status, runs.runs)
 	}
-	want := "gomutants: worker 0: m/calc's tests go over 8 MiB without a mutant, so they keep the 2 MiB memory cap\n" +
-		"gomutants: worker 0: testing m/calc went over the 2 MiB memory cap and was killed, treating as TIMED OUT\n"
+	const overCap = "gomutants: worker 0: testing m/calc went over the 2 MiB memory cap, and its tests go over 8 MiB without a mutant, treating as INFRA ERROR\n"
+	want := "gomutants: worker 0: m/calc's tests go over 8 MiB without a mutant; raise --memory-cap to test its mutants\n" + overCap
 	if stderr != want {
 		t.Errorf("stderr = %q, want %q", stderr, want)
 	}
-	captureStderr(t, func() { got = w.Test(context.Background(), m) })
-	if got.Status != mutator.StatusTimedOut || len(runs.runs) != 3 {
-		t.Errorf("Status=%v, runs = %v, want TIMED OUT from one more run, measuring nothing", got.Status, runs.runs)
+	stderr = captureStderr(t, func() { got = w.Test(context.Background(), m) })
+	if got.Status != mutator.StatusInfraError || len(runs.runs) != 3 || stderr != overCap {
+		t.Errorf("Status=%v, runs = %v, stderr = %q, want INFRA ERROR from one more run, measuring nothing, and %q", got.Status, runs.runs, stderr, overCap)
+	}
+	if got := w.suiteCaps.get("m/calc", w.memCap); got != w.memCap {
+		t.Errorf("m/calc's cap = %d, want the worker's %d: the over-ceiling mark must not reach a run, which reads a cap of 0 or less as none", got, w.memCap)
 	}
 }
 
@@ -1359,7 +1369,6 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 		mon := stubMonitor(t)
 		mon.rss.Store(999999 * 1024)
 		w, m := fakeWorker(t, nil, 30*time.Second)
-		w.memCap = 2 << 20
 		w.memCap = 5 << 20
 		fakeBuildsAndRuns(t, func(string) []string { return []string{"sh", "-c", "sleep 0.3; exit 1"} },
 			func(string) []string { return []string{"true"} })
@@ -1375,7 +1384,6 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 		// Over the worker's 4 MiB, under twice it.
 		mon.rss.Store(5 << 20)
 		w, m := fakeWorker(t, nil, 30*time.Second)
-		w.memCap = 2 << 20
 		w.memCap = 4 << 20
 		fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 			func(string) []string { return []string{"sleep", "0.3"} })
@@ -1392,13 +1400,12 @@ func TestWorkerTestMemCapIsTheWorkers(t *testing.T) {
 		mon := stubMonitor(t)
 		mon.rss.Store(999999 * 1024)
 		w, m := fakeWorker(t, nil, 30*time.Second)
-		w.memCap = 2 << 20
 		w.memCap = 3 << 20
 		fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} },
 			func(string) []string { return []string{"sleep", "0.3"} })
 		stderr := captureStderr(t, func() { w.Test(context.Background(), m) })
-		want := "gomutants: worker 0: m/calc's tests go over 12 MiB without a mutant, so they keep the 3 MiB memory cap\n" +
-			"gomutants: worker 0: testing m/calc went over the 3 MiB memory cap and was killed, treating as TIMED OUT\n"
+		want := "gomutants: worker 0: m/calc's tests go over 12 MiB without a mutant; raise --memory-cap to test its mutants\n" +
+			"gomutants: worker 0: testing m/calc went over the 3 MiB memory cap, and its tests go over 12 MiB without a mutant, treating as INFRA ERROR\n"
 		if stderr != want {
 			t.Errorf("stderr = %q, want %q", stderr, want)
 		}
@@ -1422,7 +1429,6 @@ func TestWorkerTestNoMemCapNeverKills(t *testing.T) {
 				return probe(pgid)
 			}
 			w, m := fakeWorker(t, nil, 30*time.Second)
-			w.memCap = 2 << 20
 			w.memCap = memCap
 			runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"sleep", "0.3"} },
 				func(string) []string { return []string{"sleep", "0.3"} })
@@ -1520,7 +1526,7 @@ func TestWorkerTestCancelledRunSaysNothing(t *testing.T) {
 		mutants, cancel int
 	}{
 		{"measuring", 1, 2},
-		// The suite goes over the ceiling, so it keeps the cap and the
+		// The suite goes over the ceiling, so its runs keep the cap and the
 		// second mutant's run isn't made again.
 		{"measured", 2, 3},
 	}
@@ -1580,6 +1586,8 @@ func TestMeasureSuiteCap(t *testing.T) {
 				tests + "use 3 MiB without a mutant, so their memory cap is raised to 6 MiB\n"},
 		{name: "limited to the ceiling", rss: 5 << 20, run: []string{"sleep", "0.3"}, global: 30 * time.Second, want: 8 << 20,
 			stderr: tests + "use 5 MiB without a mutant, so their memory cap is raised to 8 MiB\n"},
+		{name: "over the ceiling", rss: 999999 * 1024, run: []string{"sleep", "0.3"}, global: 30 * time.Second, want: suiteOverCeiling,
+			stderr: tests + "go over 8 MiB without a mutant; raise --memory-cap to test its mutants\n"},
 		{name: "probe reads nothing", rss: 0, run: []string{"sleep", "1.25"}, global: 30 * time.Second, poll: 500 * time.Millisecond, want: 0,
 			stderr: "gomutants: worker 0: can't measure the memory m/calc's tests use without a mutant: no reading of its memory came back\n"},
 		{name: "over within two polls", rss: 0, run: []string{"sleep", "0.75"}, global: 30 * time.Second, poll: 500 * time.Millisecond, want: 2 << 20},
@@ -1752,19 +1760,109 @@ func stubMonitor(t *testing.T) *monitorStub {
 const slowLinkDelay = 3 * time.Second
 
 // onLinkGoflags returns a GOFLAGS value whose -toolexec runs the shell
-// command onLink before every link. `go` also runs `link -V=full` to
-// identify the tool, which doesn't run it. Compiles are untouched, so the
-// build cache already holds every package but the module's own.
+// command onLink before every link (see onToolGoflags). Compiles are
+// untouched, so the build cache already holds every package but the
+// module's own.
 func onLinkGoflags(t *testing.T, onLink string) string {
 	t.Helper()
-	wrapper := filepath.Join(t.TempDir(), "onlink.sh")
+	return onToolGoflags(t, "link", onLink)
+}
+
+// onToolGoflags returns a GOFLAGS value whose -toolexec runs the shell
+// command onRun, with the tool's arguments as $@, before every run of
+// tool. `go` also runs `<tool> -V=full` to identify it, which doesn't run
+// onRun.
+func onToolGoflags(t *testing.T, tool, onRun string) string {
+	t.Helper()
+	wrapper := filepath.Join(t.TempDir(), "on"+tool+".sh")
 	script := "#!/bin/sh\n" +
-		"if [ \"$(basename \"$1\")\" = link ] && [ \"$2\" != -V=full ]; then " + onLink + "; fi\n" +
+		"if [ \"$(basename \"$1\")\" = " + tool + " ] && [ \"$2\" != -V=full ]; then " + onRun + "; fi\n" +
 		"exec \"$@\"\n"
 	if err := os.WriteFile(wrapper, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return "-toolexec=" + wrapper
+}
+
+// TestUnmutatedBuildFitsRecompiles: the build without a mutant compiles
+// the mutant's package again, though the build cache holds its compile
+// from a build of the same source, as the coverage and baseline runs
+// leave it. One that only linked would let a package whose compile goes
+// over the cap pass (see unmutatedBuildFits).
+func TestUnmutatedBuildFitsRecompiles(t *testing.T) {
+	w, _, m := addWorker(t, "_ = Add(1, 2)")
+	compiles := filepath.Join(t.TempDir(), "compiles")
+	t.Setenv("GOFLAGS", onToolGoflags(t, "compile", `case " $* " in *" -p testmod "*) echo >> `+compiles+`;; esac`))
+	compiled := func() bool {
+		data, _ := os.ReadFile(compiles)
+		_ = os.Remove(compiles)
+		return len(data) != 0
+	}
+	ctx := context.Background()
+	// The first build fills the cache; the second shows it is used.
+	for i := range 2 {
+		res, stderr, err := w.buildUnmutated(ctx, m.Pkg, filepath.Join(t.TempDir(), "plain.test"), "")
+		if err != nil || res.runErr != nil {
+			t.Fatalf("building %s without an overlay: %v %v\n%s", m.Pkg, err, res.runErr, stderr)
+		}
+		if i == 1 && compiled() {
+			t.Fatalf("a second build of the same source compiled %s again; the cache this test rests on isn't in use", m.Pkg)
+		}
+		compiled()
+	}
+	if got := w.unmutatedBuildFits(ctx, m, m.Pkg); got != buildFits {
+		t.Fatalf("unmutatedBuildFits = %v, want buildFits", got)
+	}
+	if !compiled() {
+		t.Errorf("the build without a mutant didn't compile %s: it measured the link alone", m.Pkg)
+	}
+}
+
+// TestWorkerTestBuildCheckOverlay: the build without a mutant goes in
+// through an overlay of the mutant's file as it is, but for a comment at
+// its end, and the build that measures a suite through none, which needs a
+// binary only (see unmutatedBuildFits).
+func TestWorkerTestBuildCheckOverlay(t *testing.T) {
+	mon := stubMonitor(t)
+	w, m := fakeWorker(t, nil, 30*time.Second)
+	w.memCap = 3 << 20
+	fakeBuildsOverCap(t, mon, []string{"true"}, 1024)
+	var overlays []string
+	start := startCommandFunc
+	startCommandFunc = func(cmd *exec.Cmd) error {
+		overlays = append(overlays, overlayArg(cmd.Args))
+		return start(cmd)
+	}
+	captureStderr(t, func() { w.Test(context.Background(), m) })
+	captureStderr(t, func() { w.measureSuite(context.Background(), m.Pkg, t.TempDir(), nil) })
+	if len(overlays) != 3 || overlays[0] != w.overlayPath || overlays[1] == "" || overlays[1] == w.overlayPath || overlays[2] != "" {
+		t.Fatalf("overlays = %q, want the mutant's (%s), the build check's own, and none for the suite", overlays, w.overlayPath)
+	}
+	data, err := os.ReadFile(overlays[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ov overlay
+	if err := json.Unmarshal(data, &ov); err != nil || len(ov.Replace) != 1 || ov.Replace[m.File] == "" {
+		t.Fatalf("overlay = %s (%v), want %s alone replaced", data, err, m.File)
+	}
+	src, err := os.ReadFile(ov.Replace[m.File])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "package calc\n\n// gomutants: built without a mutant, "; !strings.HasPrefix(string(src), want) || !strings.HasSuffix(string(src), "\n") {
+		t.Errorf("source = %q, want the file as it is, then a line starting %q", src, want[len("package calc\n"):])
+	}
+}
+
+// overlayArg returns the file a `go` command's -overlay names, "" if none.
+func overlayArg(args []string) string {
+	for _, a := range args {
+		if f, ok := strings.CutPrefix(a, "-overlay="); ok {
+			return f
+		}
+	}
+	return ""
 }
 
 // slowLinkGoflags returns a GOFLAGS value that makes every link sleep
