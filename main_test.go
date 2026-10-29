@@ -622,23 +622,29 @@ func TestParseFlagsMemoryCap(t *testing.T) {
 	}
 }
 
-// TestRunMemoryCap: the configured cap reaches the pool as is, unset as
-// the 2 GiB default, and off as config.NoMemoryCap, not as 0, which the
-// pool reads as unset. A value loadConfig would have rejected keeps the
-// default rather than turn the cap off.
-func TestRunMemoryCap(t *testing.T) {
+// TestLoadConfigMemoryCap: loadConfig hands on the cap it parsed: as
+// set, unset as the 2 GiB default, and off as config.NoMemoryCap, not as
+// 0, which the pool reads as unset.
+func TestLoadConfigMemoryCap(t *testing.T) {
+	t.Chdir(t.TempDir())
 	for _, tt := range []struct {
-		in   string
+		args []string
 		want int64
 	}{
-		{"", 2 << 30},
-		{"4GiB", 4 << 30},
-		{"off", config.NoMemoryCap},
-		{"4GB", 2 << 30},
+		{nil, 2 << 30},
+		{[]string{"--memory-cap=4GiB"}, 4 << 30},
+		{[]string{"--memory-cap=off"}, config.NoMemoryCap},
 	} {
-		mr := &mutationRun{cfg: config.Config{MemoryCap: tt.in}}
-		if got := mr.memoryCap(); got != tt.want {
-			t.Errorf("memory-cap %q: memoryCap() = %d, want %d", tt.in, got, tt.want)
+		opts, err := parseFlags(tt.args)
+		if err != nil {
+			t.Fatalf("%v: parseFlags: %v", tt.args, err)
+		}
+		_, filters, err := loadConfig(opts)
+		if err != nil {
+			t.Fatalf("%v: loadConfig: %v", tt.args, err)
+		}
+		if filters.memCap != tt.want {
+			t.Errorf("%v: memCap = %d, want %d", tt.args, filters.memCap, tt.want)
 		}
 	}
 }

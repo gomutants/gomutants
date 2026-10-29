@@ -23,25 +23,6 @@ import (
 	"github.com/gomutants/gomutants/internal/proctree"
 )
 
-// maxSubprocRSSBytes is the default memory cap of a worker's subprocess
-// groups (see Worker.memCap), for one ExecOpts.MemoryCap leaves unset. A
-// mutation that flips a loop termination or allocation bound can make go
-// test (or its test binary) balloon to tens of GB within seconds. We
-// SIGKILL the whole process group at the cap; a killed mutant is
-// classified as TimedOut, unless its tests had already reported it (see
-// classifyTestOutcome).
-//
-// A package whose suite needs more than the cap without any mutant gets a
-// higher cap for its test runs (see suiteCaps).
-//
-// var (not const) so tests can lower it to a tiny value and force the
-// monitor goroutine's kill path on a normal-sized test process. A worker
-// reads it when it is made.
-//
-// On Windows pgroupRSSBytes is a no-op (returns 0) so this cap never trips;
-// the per-mutant context timeout is the backstop there.
-var maxSubprocRSSBytes = config.DefaultMemoryCap
-
 // suiteRSSCeilingFactor bounds a run that measures a package's suite
 // without any mutant (see Worker.measureSuite) at this many times the
 // worker's memory cap, and a package's raised cap at the same, so the host
@@ -535,9 +516,20 @@ type Worker struct {
 
 	// memCap is the memory cap of every build and test run's process
 	// group, and the base of each package's cap for its test runs (see
-	// suiteCaps). maxSubprocRSSBytes unless the pool sets one;
+	// suiteCaps). config.DefaultMemoryCap unless the pool sets one;
 	// config.NoMemoryCap is no cap (runMonitored reads any cap of 0 or
 	// less as none).
+	//
+	// A mutation that flips a loop termination or allocation bound can
+	// make go test (or its test binary) balloon to tens of GB within
+	// seconds. We SIGKILL the whole process group at the cap; a killed
+	// mutant is classified as TimedOut, unless its tests had already
+	// reported it (see classifyTestOutcome), or its package doesn't build
+	// under the cap without a mutant either, which is InfraError (see
+	// suiteCaps.buildFits).
+	//
+	// On Windows pgroupRSSBytes is a no-op (returns 0) so the cap never
+	// trips; the per-mutant context timeout is the backstop there.
 	memCap int64
 
 	// childGOMAXPROCS, if > 0, caps the GOMAXPROCS of each `go test` child.
@@ -603,7 +595,7 @@ func NewWorker(id int, tmpDir string, policy TimeoutPolicy, sourceCache map[stri
 		testMap:     testMap,
 		binArgs:     &binArgsCache{},
 		suiteCaps:   &suiteCaps{},
-		memCap:      maxSubprocRSSBytes,
+		memCap:      config.DefaultMemoryCap,
 	}, nil
 }
 

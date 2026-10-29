@@ -36,9 +36,11 @@ timeout-coefficient: 10
 
 # Memory cap of the process group of each mutant's build and test run, in
 # MiB or GiB, from 64MiB to 1024GiB (default: 2GiB). A run over it is
-# killed and its mutant reads TIMED OUT. A package whose tests go over it
-# without any mutant gets up to 4x it for its test runs. The coverage,
-# baseline and --detect-equivalent runs aren't capped. "off" disables it.
+# killed and its mutant reads TIMED OUT, or INFRA ERROR for a build whose
+# package goes over it without any mutant too. A package whose tests go
+# over it without any mutant gets up to 4x it for its test runs. The
+# coverage, per-test coverage-map, baseline and --detect-equivalent runs
+# aren't capped. "off" disables it.
 # The cache doesn't record it, so a cached TIMED OUT stays cached after a
 # change. No effect on Windows.
 # memory-cap: 2GiB
