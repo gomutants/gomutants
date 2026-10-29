@@ -24,6 +24,9 @@ import (
 // INVERT_BITWISE mutants on the literals (e.g. `1 * time.Second`,
 // `1 << 20`) are unkillable.
 func TestPackageVarDefaults(t *testing.T) {
+	if suiteOverCeiling != -1 {
+		t.Errorf("suiteOverCeiling = %d, want -1", suiteOverCeiling)
+	}
 	if got, want := monitorPollInterval, 1*time.Second; got != want {
 		t.Errorf("monitorPollInterval = %v, want %v", got, want)
 	}

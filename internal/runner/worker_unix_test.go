@@ -1526,14 +1526,13 @@ func TestWorkerTestCancelledRunSaysNothing(t *testing.T) {
 		mutants, cancel int
 	}{
 		{"measuring", 1, 2},
-		// The suite goes over the ceiling, so its runs keep the cap and the
-		// second mutant's run isn't made again.
+		// The suite, the second run, uses 1 MiB alone, so its runs keep the
+		// cap and the second mutant's run isn't made again.
 		{"measured", 2, 3},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			mon := stubMonitor(t)
-			mon.rss.Store(999999 * 1024)
 			w, m := fakeWorker(t, nil, 30*time.Second)
 			w.memCap = 2 << 20
 			ctx, cancel := context.WithCancel(context.Background())
@@ -1541,6 +1540,10 @@ func TestWorkerTestCancelledRunSaysNothing(t *testing.T) {
 			n := 0
 			fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, func(string) []string {
 				n++
+				mon.rss.Store(999999 * 1024)
+				if n == 2 {
+					mon.rss.Store(1 << 20)
+				}
 				if n == tc.cancel {
 					time.AfterFunc(100*time.Millisecond, cancel)
 				}
@@ -1842,6 +1845,7 @@ func TestWorkerTestBuildCheckOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantMode(t, overlays[1], 0o644)
 	var ov overlay
 	if err := json.Unmarshal(data, &ov); err != nil || len(ov.Replace) != 1 || ov.Replace[m.File] == "" {
 		t.Fatalf("overlay = %s (%v), want %s alone replaced", data, err, m.File)
@@ -1850,8 +1854,51 @@ func TestWorkerTestBuildCheckOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantMode(t, ov.Replace[m.File], 0o644)
 	if want := "package calc\n\n// gomutants: built without a mutant, "; !strings.HasPrefix(string(src), want) || !strings.HasSuffix(string(src), "\n") {
 		t.Errorf("source = %q, want the file as it is, then a line starting %q", src, want[len("package calc\n"):])
+	}
+}
+
+// wantMode wants the file at path to have the permission bits perm, as
+// written under the usual umask of 022 or 002.
+func wantMode(t *testing.T, path string, perm os.FileMode) {
+	t.Helper()
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != perm {
+		t.Errorf("%s has mode %v, want %v", path, got, perm)
+	}
+}
+
+// TestUnmutatedBuildFitsWriteFails: a build check whose overlay can't be
+// written can't tell, says why, and builds nothing.
+func TestUnmutatedBuildFitsWriteFails(t *testing.T) {
+	for _, failing := range []int{1, 2} {
+		t.Run(fmt.Sprintf("write %d", failing), func(t *testing.T) {
+			w, m := fakeWorker(t, nil, 30*time.Second)
+			runs := fakeBuildsAndRuns(t, func(string) []string { return []string{"true"} }, func(string) []string { return []string{"true"} })
+			origWrite := writeFileFunc
+			t.Cleanup(func() { writeFileFunc = origWrite })
+			writes := 0
+			writeFileFunc = func(name string, data []byte, perm os.FileMode) error {
+				writes++
+				if writes == failing {
+					return errors.New("disk full")
+				}
+				return origWrite(name, data, perm)
+			}
+			var got buildCheck
+			stderr := captureStderr(t, func() { got = w.unmutatedBuildFits(context.Background(), m, m.Pkg) })
+			if got != buildUnknown || len(runs.builds) != 0 {
+				t.Errorf("unmutatedBuildFits = %v, builds = %v, want buildUnknown and none", got, runs.builds)
+			}
+			if want := "gomutants: worker 0: can't tell whether m/calc's build fits under the memory cap without a mutant: disk full\n"; stderr != want {
+				t.Errorf("stderr = %q, want %q", stderr, want)
+			}
+		})
 	}
 }
 

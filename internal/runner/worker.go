@@ -439,9 +439,7 @@ type suiteCap struct {
 	// rssCap is the package's cap: result when that is one, else 0. Never
 	// suiteOverCeiling, which runMonitored would read as no cap.
 	rssCap atomic.Int64
-	// built and build, under mu: the build without any mutant was made,
-	// and what it showed.
-	built bool
+	// build, under mu, is what the build without any mutant showed.
 	build buildCheck
 }
 
@@ -450,9 +448,10 @@ type suiteCap struct {
 type buildCheck int
 
 const (
-	buildUnknown buildCheck = iota // the build couldn't tell
-	buildFits                      // it stayed under the cap
-	buildOverCap                   // it went over the cap too
+	buildUnchecked buildCheck = iota // it wasn't made yet
+	buildUnknown                     // it couldn't tell
+	buildFits                        // it stayed under the cap
+	buildOverCap                     // it went over the cap too
 )
 
 func (c *suiteCaps) entry(pkg string) *suiteCap {
@@ -492,9 +491,7 @@ func (c *suiteCaps) measure(pkg string, measure func() int64) int64 {
 	if !e.measured {
 		e.measured = true
 		e.result = measure()
-		if e.result > 0 {
-			e.rssCap.Store(e.result)
-		}
+		e.rssCap.Store(max(e.result, 0))
 	}
 	return e.result
 }
@@ -506,8 +503,7 @@ func (c *suiteCaps) checkBuild(pkg string, check func() buildCheck) buildCheck {
 	e := c.entry(pkg)
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if !e.built {
-		e.built = true
+	if e.build == buildUnchecked {
 		e.build = check()
 	}
 	return e.build
@@ -801,14 +797,7 @@ func (w *Worker) buildBin(ctx context.Context, m mutator.Mutant, pkg string) (st
 			return "", mutator.StatusInfraError
 		}
 		if res.memKilled {
-			if check := w.suiteCaps.checkBuild(pkg, func() buildCheck { return w.unmutatedBuildFits(ctx, m, pkg) }); check != buildFits {
-				if ctx.Err() == nil {
-					why := "building it without a mutant didn't stay under it"
-					if check == buildUnknown {
-						why = "its build without a mutant couldn't be checked"
-					}
-					fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s went over the %d MiB memory cap, and %s, treating as %s\n", w.id, pkg, w.memCap>>20, why, mutator.StatusInfraError)
-				}
+			if !w.overCapBuildFits(ctx, m, pkg) {
 				return "", mutator.StatusInfraError
 			}
 			w.reportMemKill("building", pkg, w.memCap)
@@ -823,6 +812,25 @@ func (w *Worker) buildBin(ctx context.Context, m mutator.Mutant, pkg string) (st
 	}
 	w.bins[pkg] = bin
 	return bin, mutator.StatusLived
+}
+
+// overCapBuildFits reports whether pkg's build without any mutant stays
+// under the cap, for a build of it with m in place that went over (see
+// buildBin). If not, the mutant is INFRA ERROR, and it says why, unless
+// ctx was cancelled.
+func (w *Worker) overCapBuildFits(ctx context.Context, m mutator.Mutant, pkg string) bool {
+	check := w.suiteCaps.checkBuild(pkg, func() buildCheck { return w.unmutatedBuildFits(ctx, m, pkg) })
+	if check == buildFits {
+		return true
+	}
+	if ctx.Err() == nil {
+		why := "building it without a mutant didn't stay under it"
+		if check == buildUnknown {
+			why = "its build without a mutant couldn't be checked"
+		}
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: building %s went over the %d MiB memory cap, and %s, treating as %s\n", w.id, pkg, w.memCap>>20, why, mutator.StatusInfraError)
+	}
+	return false
 }
 
 // removeBins removes the current mutant's test binaries; the next mutant
@@ -885,7 +893,7 @@ func (w *Worker) runBin(ctx context.Context, m mutator.Mutant, run pkgRun, bin s
 	r := w.runBinOnce(ctx, run, bin, dir, binArgs, timeout, rssCap)
 	if r.overCap() {
 		raised := w.suiteCaps.measure(run.pkg, func() int64 { return w.measureSuite(ctx, run.pkg, dir, binArgs) })
-		if raised <= 0 {
+		if raised == 0 || raised == suiteOverCeiling {
 			// Without the measurement, or with a suite over the ceiling
 			// alone, there's no telling whether the mutant or its suite
 			// went over the cap. INFRA ERROR isn't cached, so the next run
@@ -1036,8 +1044,6 @@ func (w *Worker) unmutatedBuildFits(ctx context.Context, m mutator.Mutant, pkg s
 	}
 	var why string
 	switch {
-	case ctx.Err() != nil:
-		return buildUnknown
 	case err != nil:
 		why = err.Error()
 	case build.memKilled:
@@ -1048,7 +1054,9 @@ func (w *Worker) unmutatedBuildFits(ctx context.Context, m mutator.Mutant, pkg s
 	default:
 		return buildFits
 	}
-	fmt.Fprintf(os.Stderr, "gomutants: worker %d: can't tell whether %s's build fits under the memory cap without a mutant: %s\n", w.id, pkg, why)
+	if ctx.Err() == nil {
+		fmt.Fprintf(os.Stderr, "gomutants: worker %d: can't tell whether %s's build fits under the memory cap without a mutant: %s\n", w.id, pkg, why)
+	}
 	return buildUnknown
 }
 
