@@ -45,6 +45,9 @@ const (
 (function(){
   var el = document.querySelector('mutation-test-report-app');
   var data = document.getElementById('mutation-report-data').textContent;
+  el.addEventListener('theme-changed', function(e){
+    document.body.style.backgroundColor = e.detail.themeBackgroundColor;
+  });
   el.report = JSON.parse(data);
 })();
 </script>
