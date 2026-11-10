@@ -313,6 +313,21 @@ func TestSummaryNonTTYNoLeadingNewline(t *testing.T) {
 	}
 }
 
+// TestFinishProgressEndsLineOnce: FinishProgress ends the bar's line, and
+// the Summary that follows must not end it a second time.
+func TestFinishProgressEndsLineOnce(t *testing.T) {
+	var buf bytes.Buffer
+	term := &Terminal{w: &buf, isTTY: true, total: 1}
+	term.FinishProgress()
+	if buf.String() != "\n" {
+		t.Fatalf("FinishProgress = %q, want \"\\n\"", buf.String())
+	}
+	term.Summary(&Report{MutantsKilled: 1, MutantsTotal: 1})
+	if strings.HasPrefix(buf.String(), "\n\n\n") {
+		t.Errorf("duplicate leading newline: %q", buf.String())
+	}
+}
+
 func TestSummaryShowsCachedLineWhenNonZero(t *testing.T) {
 	var buf bytes.Buffer
 	term := NewTerminal(&buf, 0, false, false)

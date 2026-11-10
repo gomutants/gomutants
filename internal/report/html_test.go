@@ -85,6 +85,14 @@ func TestWriteHTML_RoundTrip(t *testing.T) {
 	if !strings.Contains(html, "MutationTestElements") {
 		t.Errorf("HTML missing vendored JS bundle (no MutationTestElements global)")
 	}
+	// Pin that htmlChromeSuffix syncs body background before setting
+	// el.report (which dispatches the initial theme-changed event).
+	listenerIdx := strings.Index(html, "el.addEventListener('theme-changed'")
+	reportIdx := strings.Index(html, "el.report = JSON.parse(data)")
+	wantSync := "document.body.style.backgroundColor = e.detail.themeBackgroundColor"
+	if listenerIdx < 0 || listenerIdx > reportIdx || !strings.Contains(html, wantSync) {
+		t.Errorf("HTML missing theme-changed sync before el.report")
+	}
 
 	rep := extractEmbeddedReport(t, html)
 	if rep.SchemaVersion != "2" {

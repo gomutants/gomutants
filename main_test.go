@@ -3193,3 +3193,61 @@ func TestWriteReportsRecheckHint(t *testing.T) {
 		})
 	}
 }
+
+// ttyBuffer captures output while reporting itself as a character device,
+// so report.NewTerminal draws the live progress bar as it would on a real
+// terminal.
+type ttyBuffer struct{ bytes.Buffer }
+
+func (*ttyBuffer) Stat() (os.FileInfo, error) { return charDeviceInfo{}, nil }
+
+type charDeviceInfo struct{}
+
+func (charDeviceInfo) Name() string       { return "tty" }
+func (charDeviceInfo) Size() int64        { return 0 }
+func (charDeviceInfo) Mode() os.FileMode  { return os.ModeDevice | os.ModeCharDevice }
+func (charDeviceInfo) ModTime() time.Time { return time.Time{} }
+func (charDeviceInfo) IsDir() bool        { return false }
+func (charDeviceInfo) Sys() any           { return nil }
+
+// TestRunTTYProgressBarEndsBeforeEquivalencePhase: on a TTY the progress
+// bar is redrawn with a leading \r and no trailing newline, so the line
+// must be ended before a post-test phase prints — otherwise the phase text
+// is glued onto the bar ("... 100%  1sDetecting equivalent mutants...").
+func TestRunTTYProgressBarEndsBeforeEquivalencePhase(t *testing.T) {
+	dir := setupTinyProject(t)
+	t.Chdir(dir)
+
+	var out ttyBuffer
+	origStdout := stdout
+	stdout = &out
+	defer func() { stdout = origStdout }()
+
+	err := run(context.Background(), []string{
+		"--only", "ARITHMETIC_BASE",
+		"--detect-equivalent",
+		"-w", "1",
+		"-o", filepath.Join(dir, "report.json"),
+		"testmod",
+	})
+	if err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	got := out.String()
+	if !strings.Contains(got, "\rTesting mutants [") {
+		t.Fatalf("no TTY progress bar drawn; output:\n%q", got)
+	}
+	const phase = "Detecting equivalent mutants..."
+	i := strings.Index(got, phase)
+	if i < 0 {
+		t.Fatalf("equivalence phase not printed; output:\n%q", got)
+	}
+	if i == 0 || got[i-1] != '\n' {
+		t.Errorf("equivalence phase not on its own line, got %q", got[strings.LastIndex(got[:i], "\r"):i+len(phase)])
+	}
+	// The phase line ends itself; Summary must not end the bar's line again,
+	// which would leave two blank lines before the counts.
+	if strings.Contains(got, "equivalent\n\n\n") {
+		t.Errorf("doubled blank line before the summary; output:\n%q", got[i:])
+	}
+}
