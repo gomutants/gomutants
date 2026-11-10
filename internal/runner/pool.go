@@ -185,11 +185,13 @@ func failPending(mutants []mutator.Mutant, pending []int, onResult ResultCallbac
 // newWorkerFunc, the test sees how many workers were created and what
 // childGOMAXPROCS each ended up with — neither of which is observable
 // through the pool's mutant return value. The workers share one read of
-// the arguments their test binaries are run with (see binArgsCache).
+// the arguments their test binaries are run with (see binArgsCache), and
+// each package's memory cap (see suiteCaps).
 func (p *Pool) createWorkers() []*Worker {
 	workers := make([]*Worker, 0, p.workers)
 	cap := childGOMAXPROCSFor(p.workers)
 	binArgs := &binArgsCache{}
+	caps := &suiteCaps{}
 	for i := range p.workers {
 		w, err := newWorkerFunc(i, p.tmpDir, p.policy, p.srcCache, p.projectDir, p.testMap)
 		if err != nil {
@@ -202,6 +204,7 @@ func (p *Pool) createWorkers() []*Worker {
 		w.goroot = p.exec.GOROOT
 		w.testFlags = p.exec.TestFlags
 		w.binArgs = binArgs
+		w.suiteCaps = caps
 		workers = append(workers, w)
 	}
 	return workers

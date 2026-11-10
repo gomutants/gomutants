@@ -954,13 +954,20 @@ func TestBinFlags(t *testing.T) {
 func TestBuildArgs(t *testing.T) {
 	w := &Worker{overlayPath: "/tmp/o.json", tags: "integration,debug", testFlags: []string{"-rapid.checks=20", "-race", "-short"}}
 	want := []string{"test", "-c", "-o", "/tmp/w.test", "-vet=off", "-overlay=/tmp/o.json", "-tags=integration,debug", "example.com/mod/sub", "-race"}
-	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test"); !slices.Equal(got, want) {
+	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", true); !slices.Equal(got, want) {
 		t.Errorf("buildArgs = %q, want %q", got, want)
 	}
 	w = &Worker{overlayPath: "/tmp/o.json"}
 	want = []string{"test", "-c", "-o", "/tmp/w.test", "-vet=off", "-overlay=/tmp/o.json", "example.com/mod/sub"}
-	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test"); !slices.Equal(got, want) {
+	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", true); !slices.Equal(got, want) {
 		t.Errorf("buildArgs without tags or flags = %q, want %q", got, want)
+	}
+	// The unmutated build that measures a suite (see measureSuite) has no
+	// overlay: with it, the suite would run whatever mutant the worker
+	// last staged.
+	want = []string{"test", "-c", "-o", "/tmp/w.test", "-vet=off", "example.com/mod/sub"}
+	if got := w.buildArgs("example.com/mod/sub", "/tmp/w.test", false); !slices.Equal(got, want) {
+		t.Errorf("buildArgs without the overlay = %q, want %q", got, want)
 	}
 }
 
@@ -1037,6 +1044,17 @@ func TestClassifyTestOutcome(t *testing.T) {
 		// `runErr == nil → Lived`. Asserting TimedOut here kills that
 		// mutation.
 		{"memkilled alone still wins", nil, true, nil, "", mutator.StatusTimedOut},
+		// A test reported the mutation before the kill: a binary that has
+		// failed can still be held open by a process its test started,
+		// which goes on growing.
+		{"memkilled after a reported failure => killed", anyErr, true, nil,
+			"--- FAIL: TestAdd\n", mutator.StatusKilled},
+		{"memkilled after a panic => killed", anyErr, true, nil,
+			"panic: boom\n\ngoroutine 1 [running]:\n", mutator.StatusKilled},
+		// A binary that exited 0 had no test fail: the marker is a test's
+		// own text, or a process's it started, such as a fixture's `go test`.
+		{"memkilled after a passing binary printed a failure => timed out", nil, true, nil,
+			"--- FAIL: TestFixture\n", mutator.StatusTimedOut},
 		{"success beats infrastructure error", nil, false, nil, "FATAL ERROR: OUT OF MEMORY", mutator.StatusLived},
 		{"timeout beats infrastructure error", anyErr, false, context.DeadlineExceeded, "FATAL ERROR: OUT OF MEMORY", mutator.StatusTimedOut},
 		// The binary was built beforehand, so a compile diagnostic or a

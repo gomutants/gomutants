@@ -11,8 +11,8 @@ import (
 // pgroupRSSBytes is a best-effort no-op on Windows. The Unix RSS monitor
 // reads /proc on Linux and `ps -A -o pgid=,rss=` elsewhere; neither has a
 // portable Windows equivalent.
-// Returning 0 means the `pgroupRSSBytes(pgid) > maxSubprocRSSBytes` check
-// in Worker.Test never fires, so runaway mutants on Windows are bounded
+// Returning 0 means the `rss > rssCap` check in Worker.runMonitored never
+// fires, so runaway mutants on Windows are bounded
 // only by the per-mutant context timeout. A future port could use job
 // objects via golang.org/x/sys/windows; for now the timeout backstop is
 // the contract.

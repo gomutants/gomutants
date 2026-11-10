@@ -186,6 +186,10 @@ func TestPoolCreateWorkersAppliesGOMAXPROCS(t *testing.T) {
 		if w.binArgs != workers[0].binArgs {
 			t.Errorf("worker[%d].binArgs is its own cache, want the pool's shared one", i)
 		}
+		// So does one measurement of each package's suite.
+		if w.suiteCaps != workers[0].suiteCaps {
+			t.Errorf("worker[%d].suiteCaps is its own cache, want the pool's shared one", i)
+		}
 	}
 }
 
