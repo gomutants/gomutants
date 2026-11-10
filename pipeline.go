@@ -695,6 +695,10 @@ func (mr *mutationRun) runMutants(ctx context.Context) {
 		mr.progress.OnResult(m)
 		mr.checkpoint(false)
 	})
+	// End the bar's line now, before the equivalence phase prints on it.
+	// Stop the heartbeat first so its idle line can't repaint afterwards.
+	mr.progress.StopHeartbeat()
+	mr.progress.FinishProgress()
 
 	// Trivial Compiler Equivalence pass (opt-in). Recompile each
 	// surviving (LIVED) mutant with package-scoped `-gcflags=-S` and
