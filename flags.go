@@ -98,6 +98,9 @@ func parseFlags(args []string) (*cliOptions, error) {
 		return nil
 	})
 	fs.StringVar(&f.CoverPkg, "coverpkg", "", "coverage package pattern")
+	// The back-quoted `size` is the value placeholder; see the
+	// --test-flags comment below for why it must come first.
+	fs.StringVar(&f.MemoryCap, "memory-cap", "", "memory cap: a mutant's build or test run whose process group uses more than this `size` (MiB or GiB, from 64MiB to 1024GiB, e.g. 4GiB, 3072MiB) is killed, and its mutant reads TIMED OUT, or INFRA ERROR if its package's build needs more than it, or its tests more than 4x it, without any mutant; off disables it (default: 2GiB). A package whose tests go over it without any mutant gets up to 4x it for its test runs. The coverage, per-test coverage-map, baseline and --detect-equivalent runs aren't capped. No effect on Windows")
 	fs.StringVar(&f.Tags, "tags", "", "comma-separated build tags forwarded as -tags to the inner go list/go test (gremlins-compat)")
 	// fs.Func rather than StringVar so repeated --test-flags accumulate
 	// instead of the last one silently winning; a user building the value
@@ -168,10 +171,14 @@ func parseFlags(args []string) (*cliOptions, error) {
 }
 
 // runFilters are the user-supplied exclusion patterns, compiled once the
-// config file and the flags have been merged.
+// config file and the flags have been merged, and the memory cap parsed
+// then.
 type runFilters struct {
 	excluder     *discover.Excluder
 	callExcluder *discover.CallExcluder
+	// memCap is the memory cap in bytes, config.NoMemoryCap for off (see
+	// config.MemoryCapBytes).
+	memCap int64
 }
 
 // loadConfig merges the config file under the parsed flags and rejects
@@ -208,6 +215,11 @@ func loadConfig(opts *cliOptions) (config.Config, runFilters, error) {
 	if err := checkTestFlags(cfg.TestFlagFields()); err != nil {
 		return cfg, runFilters{}, usageError(err)
 	}
+	memCap, err := cfg.MemoryCapBytes()
+	if err != nil {
+		// gomutants:disable-next-line RETURN_ZERO reason="run drops cfg on an error, as on every other return of loadConfig's"
+		return cfg, runFilters{}, usageError(err)
+	}
 
 	// Compile user-supplied patterns before any project or Go-tool work.
 	// These are configuration errors even when the selected target also
@@ -228,5 +240,5 @@ func loadConfig(opts *cliOptions) (config.Config, runFilters, error) {
 		fmt.Fprintln(stderr, "gomutants: --checkpoint-interval ignored: --cache is off")
 	}
 
-	return cfg, runFilters{excluder: excluder, callExcluder: callExcluder}, nil
+	return cfg, runFilters{excluder: excluder, callExcluder: callExcluder, memCap: memCap}, nil
 }

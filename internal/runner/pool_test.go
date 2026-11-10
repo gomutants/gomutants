@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gomutants/gomutants/internal/config"
 	"github.com/gomutants/gomutants/internal/coverage"
 	"github.com/gomutants/gomutants/internal/mutator"
 )
@@ -201,7 +202,7 @@ func TestPoolCreateWorkersAppliesGOMAXPROCS(t *testing.T) {
 // or the toolchain's GOROOT, never reaches the per-mutant runs even
 // though the pool was given a value.
 func TestPoolCreateWorkersPropagatesExecOpts(t *testing.T) {
-	p := NewPool(2, ExecOpts{TestCPU: 3, Tags: "integration", TestFlags: []string{"-short"}, GOROOT: "/goroot"}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
+	p := NewPool(2, ExecOpts{TestCPU: 3, Tags: "integration", TestFlags: []string{"-short"}, GOROOT: "/goroot", MemoryCap: 5 << 30}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
 	workers := p.createWorkers()
 	if len(workers) == 0 {
 		t.Fatal("expected workers; createWorkers returned none")
@@ -221,6 +222,26 @@ func TestPoolCreateWorkersPropagatesExecOpts(t *testing.T) {
 		// while a wrong source would keep the length but change the value.
 		if len(w.testFlags) != 1 || w.testFlags[0] != "-short" {
 			t.Errorf("worker[%d].testFlags = %v, want [-short] (STATEMENT_REMOVE drops `w.testFlags = p.exec.TestFlags`)", i, w.testFlags)
+		}
+		if w.memCap != 5<<30 {
+			t.Errorf("worker[%d].memCap = %d, want %d from ExecOpts.MemoryCap", i, w.memCap, int64(5<<30))
+		}
+	}
+}
+
+// TestPoolCreateWorkersMemoryCap: an unset ExecOpts.MemoryCap keeps the
+// default cap, and config.NoMemoryCap turns it off.
+func TestPoolCreateWorkersMemoryCap(t *testing.T) {
+	for _, tt := range []struct {
+		set, want int64
+	}{
+		{0, config.DefaultMemoryCap},
+		{config.NoMemoryCap, config.NoMemoryCap},
+	} {
+		p := NewPool(1, ExecOpts{MemoryCap: tt.set}, TimeoutPolicy{Global: time.Second}, t.TempDir(), nil, ".", nil)
+		workers := p.createWorkers()
+		if len(workers) != 1 || workers[0].memCap != tt.want {
+			t.Errorf("ExecOpts.MemoryCap = %d: workers = %d, want one with memCap %d", tt.set, len(workers), tt.want)
 		}
 	}
 }
