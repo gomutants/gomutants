@@ -24,14 +24,15 @@ var heartbeatInterval = time.Second
 
 // Terminal handles progress output to the terminal.
 type Terminal struct {
-	w       io.Writer
-	isTTY   bool
-	mu      sync.Mutex
-	total   int
-	done    int
-	start   time.Time
-	verbose bool
-	quiet   bool
+	w             io.Writer
+	isTTY         bool
+	mu            sync.Mutex
+	total         int
+	done          int
+	progressEnded bool
+	start         time.Time
+	verbose       bool
+	quiet         bool
 
 	// hbStop signals the heartbeat goroutine (if any) to exit; hbDone
 	// closes once it has. Both are nil unless StartHeartbeat actually
@@ -43,10 +44,12 @@ type Terminal struct {
 	hbStopOnce sync.Once
 }
 
-// NewTerminal creates a terminal progress reporter.
+// NewTerminal creates a terminal progress reporter. w counts as a TTY when
+// it can Stat itself as a character device — an *os.File in production,
+// or a test double that captures what a terminal would show.
 func NewTerminal(w io.Writer, total int, verbose, quiet bool) *Terminal {
 	isTTY := false
-	if f, ok := w.(*os.File); ok {
+	if f, ok := w.(interface{ Stat() (os.FileInfo, error) }); ok {
 		if info, err := f.Stat(); err == nil {
 			isTTY = info.Mode()&os.ModeCharDevice != 0
 		}
@@ -232,11 +235,19 @@ func (t *Terminal) OnResult(m mutator.Mutant) {
 	}
 }
 
+// FinishProgress ends the TTY progress-bar line with a newline, once.
+// Call it after the last OnResult so later output starts on a fresh line;
+// Summary calls it too, for runs that never reach that point.
+func (t *Terminal) FinishProgress() {
+	if t.isTTY && !t.verbose && !t.progressEnded {
+		t.progressEnded = true
+		fmt.Fprintln(t.w)
+	}
+}
+
 // Summary prints the final summary.
 func (t *Terminal) Summary(r *Report) {
-	if t.isTTY && !t.verbose {
-		fmt.Fprintln(t.w) // Newline after progress bar.
-	}
+	t.FinishProgress()
 
 	fmt.Fprintln(t.w)
 	fmt.Fprintf(t.w, "  Killed:       %d  (%.1f%%)\n", r.MutantsKilled, pct(r.MutantsKilled, r.MutantsKilled+r.MutantsLived))
