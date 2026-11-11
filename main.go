@@ -329,10 +329,20 @@ func run(ctx context.Context, args []string) error {
 	mr.applyCache()
 
 	mr.runMutants(ctx)
+	// An interrupt leaves mutants untested, and runMutants has no error to
+	// say so with. The report of what did run is still written, but the
+	// run ends with the cancellation, as in every other phase: the
+	// threshold gates would otherwise pass or fail on a partial measurement.
+	// Read here, so an interrupt after the last verdict doesn't fail a
+	// complete run.
+	interrupted := ctx.Err()
 
 	r, err := mr.writeReports()
 	if err != nil {
 		return err
+	}
+	if interrupted != nil {
+		return interrupted
 	}
 
 	return mr.checkThresholds(r)
