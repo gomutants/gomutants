@@ -43,9 +43,22 @@ func resetRSSProbe() {
 // missing.
 type rssTable map[int]int64
 
-// groupRSSFunc returns the summed RSS, in bytes, of every process in group
-// pgid. Swappable so tests can drive the RSS monitor without touching the
-// host's process table.
+// rssScan is one scan of the whole process table. table lists every group
+// at its summed RSS. groupBytes, when set, measures one listed group more
+// closely than that: on Linux it sums its processes' Pss, which splits a
+// page shared by several processes among them, where RSS counts it once
+// per process (issue #127: a headless browser's processes share most of
+// their pages). It costs a read per process of the group, so it is made
+// only for groups a monitor asks about, once per scan.
+type rssScan struct {
+	table      rssTable
+	groupBytes func(pgid int) int64
+}
+
+// groupRSSFunc returns the memory, in bytes, that every process in group
+// pgid uses together: their Pss on Linux, their RSS elsewhere. Swappable
+// so tests can drive the RSS monitor without touching the host's process
+// table.
 var groupRSSFunc = cachedGroupRSS
 
 // rssSnapshot is the last scan of the whole process table, shared by every
@@ -56,13 +69,19 @@ var rssSnapshot struct {
 	mu    sync.Mutex
 	table rssTable
 	at    time.Time // when the scan behind table started; zero for none
+	// groupBytes is the scan's (see rssScan), and measured holds the
+	// groups it has measured, each now in table at its measure.
+	groupBytes func(pgid int) int64
+	measured   map[int]bool
 }
 
-// cachedGroupRSS reads group pgid's RSS from the shared snapshot, scanning
-// anew once it is older than half a poll interval, so all workers together
-// scan at most twice an interval; ones that arrive mid-scan wait for it.
-// A group missing from a scan that started before this call may have
-// started since, so it gets a fresh scan before it reads as unlisted.
+// cachedGroupRSS reads group pgid's memory from the shared snapshot,
+// scanning anew once it is older than half a poll interval, so all workers
+// together scan at most twice an interval; ones that arrive mid-scan wait
+// for it. A group missing from a scan that started before this call may
+// have started since, so it gets a fresh scan before it reads as unlisted.
+// A listed group is measured by the scan's groupBytes, if it has one, the
+// first time it is asked for, and reads that from then on.
 func cachedGroupRSS(pgid int) (int64, error) {
 	asked := time.Now()
 	rssSnapshot.mu.Lock()
@@ -83,6 +102,11 @@ func cachedGroupRSS(pgid int) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("group %d: %w", pgid, errGroupNotListed)
 	}
+	if rssSnapshot.groupBytes != nil && !rssSnapshot.measured[pgid] {
+		n = rssSnapshot.groupBytes(pgid)
+		rssSnapshot.table[pgid] = n
+		rssSnapshot.measured[pgid] = true
+	}
 	return n, nil
 }
 
@@ -91,11 +115,12 @@ func cachedGroupRSS(pgid int) (int64, error) {
 // reading one kept failure would add up to an outage that never happened.
 func rescanRSS() error {
 	at := time.Now()
-	table, err := rssScanFunc()
+	scan, err := rssScanFunc()
 	if err != nil {
 		return err
 	}
-	rssSnapshot.table, rssSnapshot.at = table, at
+	rssSnapshot.table, rssSnapshot.at = scan.table, at
+	rssSnapshot.groupBytes, rssSnapshot.measured = scan.groupBytes, map[int]bool{}
 	return nil
 }
 
@@ -105,9 +130,9 @@ func rescanRSS() error {
 // group is still alive before treating it as one.
 var errGroupNotListed = errors.New("no process of the group is listed")
 
-// pgroupRSSBytes returns the summed RSS of all processes in the given PGID,
-// read through groupRSSFunc from the shared scan of the process table
-// (/proc on Linux, ps elsewhere).
+// pgroupRSSBytes returns the memory all processes in the given PGID use
+// together (Pss on Linux, RSS elsewhere), read through groupRSSFunc from
+// the shared scan of the process table (/proc on Linux, ps elsewhere).
 //
 // A probe that fails reads as 0, which leaves the RSS cap unable to fire,
 // so an outage is reported rather than swallowed: a missing ps once

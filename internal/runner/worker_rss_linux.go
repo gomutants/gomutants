@@ -21,19 +21,23 @@ var rssScanFunc = scanProcTable
 // images ship no ps, and a failed exec once left the RSS cap silently off.
 // procps can't select a process group by itself anyway (see
 // worker_rss_ps.go, issue #107).
-func scanProcTable() (rssTable, error) {
+//
+// The scan also keeps each group's processes, for its groupBytes to sum
+// their Pss (see groupPss).
+func scanProcTable() (rssScan, error) {
 	dir, err := os.Open(procRoot)
 	if err != nil {
-		return nil, err
+		return rssScan{}, err
 	}
 	// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="-2 and 0 read every name as -1 does: any n <= 0 means all"
 	names, err := dir.Readdirnames(-1) // unsorted, unlike os.ReadDir
 	_ = dir.Close()
 	if err != nil {
-		return nil, err
+		return rssScan{}, err
 	}
 	page := int64(os.Getpagesize())
 	table := rssTable{}
+	procs := map[int][]procMem{}
 	// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="buffer capacity: any size well above a ~300-byte stat line reads the same"
 	buf := make([]byte, 1024) // a stat line runs ~300 bytes
 	for _, name := range names {
@@ -47,13 +51,64 @@ func scanProcTable() (rssTable, error) {
 		// process that exited mid-scan has none to read.
 		if g, rss := parseProcStat(readStat(procRoot+"/"+name+"/stat", buf)); g != 0 {
 			table[g] += int64(rss) * page
+			procs[g] = append(procs[g], procMem{pid: name, rss: int64(rss) * page})
 		}
 	}
-	return table, nil
+	return rssScan{table: table, groupBytes: func(pgid int) int64 { return groupPss(procs[pgid]) }}, nil
 }
 
-// readStat reads the stat file at path into buf and returns what it read,
-// or nothing if the process has exited.
+// procMem is one process of a scanned group: its pid, as /proc names it,
+// and its RSS in bytes, as its stat read.
+type procMem struct {
+	pid string
+	rss int64
+}
+
+// groupPss returns the memory procs use together: the sum of each one's
+// Pss, from /proc/<pid>/smaps_rollup. Pss splits a page that several
+// processes map among them, so a page a group's processes share counts
+// once in all, where their summed RSS counts it once per process (issue
+// #127). A process whose Pss can't be read counts at its RSS: the file is
+// missing before Linux 4.14 and in some sandboxes, unreadable for a
+// process that made itself non-dumpable, and empty for a zombie or one
+// that has exited since the scan. That reads high, never low, so the cap
+// can still fire, and it is no outage of the probe.
+func groupPss(procs []procMem) int64 {
+	// gomutants:disable-next-line INTEGER_INCREMENT,INTEGER_DECREMENT reason="buffer capacity: any size well above a ~1 KiB smaps_rollup reads the same"
+	buf := make([]byte, 4096) // smaps_rollup runs ~800 bytes
+	var n int64
+	for _, p := range procs {
+		if kb, ok := parsePss(readStat(procRoot+"/"+p.pid+"/smaps_rollup", buf)); ok {
+			n += kb << 10
+		} else {
+			n += p.rss
+		}
+	}
+	return n
+}
+
+// parsePss returns the value, in kB, of the "Pss:" line of a
+// /proc/<pid>/smaps_rollup, and whether it has one that parses. Only the
+// line named exactly Pss counts: Pss_Anon, Pss_File, Pss_Shmem and
+// Pss_Dirty are parts of it.
+func parsePss(rollup []byte) (kb int64, ok bool) {
+	for line := range bytes.Lines(rollup) {
+		rest, found := bytes.CutPrefix(line, []byte("Pss:"))
+		if !found {
+			continue
+		}
+		f := bytes.Fields(rest) // "1234", "kB"
+		if len(f) == 0 {
+			return 0, false
+		}
+		v, err := strconv.ParseInt(string(f[0]), 10, 64)
+		return v, err == nil
+	}
+	return 0, false
+}
+
+// readStat reads the /proc file at path (a stat, or a smaps_rollup) into
+// buf and returns what it read, or nothing if the process has exited.
 func readStat(path string, buf []byte) []byte {
 	f, err := os.Open(path)
 	if err == nil {

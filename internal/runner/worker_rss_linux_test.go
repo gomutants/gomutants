@@ -61,6 +61,51 @@ func TestParseProcStat(t *testing.T) {
 	}
 }
 
+// smapsRollup builds a /proc/<pid>/smaps_rollup body, as Linux 6.x prints
+// it, with Pss at pss kB, and the other Pss_ lines around it at other
+// values, so a match on the Pss prefix alone reads a different number.
+func smapsRollup(pss string) string {
+	return "55d4c0000000-7ffd3a5f4000 ---p 00000000 00:00 0                          [rollup]\n" +
+		"Rss:              100000 kB\n" +
+		"Pss_Dirty:          4100 kB\n" +
+		"Pss:              " + pss + " kB\n" +
+		"Pss_Anon:           4200 kB\n" +
+		"Pss_File:           4300 kB\n" +
+		"Pss_Shmem:          4400 kB\n" +
+		"Shared_Clean:      90000 kB\n" +
+		"Private_Dirty:      4000 kB\n"
+}
+
+// TestParsePss pins the smaps_rollup parse. Kills a match on "Pss" without
+// the colon (Pss_Dirty, which Linux 6.x prints before Pss, would be read),
+// the ok results flipped, the field index off by one, and a ParseInt bit
+// size short of 64.
+func TestParsePss(t *testing.T) {
+	cases := []struct {
+		name   string
+		rollup string
+		kb     int64
+		ok     bool
+	}{
+		{"real rollup", smapsRollup("12345"), 12345, true},
+		{"Pss first, no trailing newline", "Pss: 7 kB", 7, true},
+		{"no unit", "Pss: 7\n", 7, true},
+		{"top of the int64 range", "Pss: 4611686018427387904 kB\n", 1 << 62, true},
+		{"only the parts of Pss", "Pss_Dirty: 1 kB\nPss_Anon: 2 kB\n", 0, false},
+		{"Pss without a value", "Pss:\n", 0, false},
+		{"non-numeric Pss", smapsRollup("x"), 0, false},
+		{"indented Pss is not the line", "  Pss: 7 kB\n", 0, false},
+		{"empty (a zombie, or one that has exited)", "", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if kb, ok := parsePss([]byte(c.rollup)); kb != c.kb || ok != c.ok {
+				t.Errorf("parsePss(%q) = (%d, %v), want (%d, %v)", c.rollup, kb, ok, c.kb, c.ok)
+			}
+		})
+	}
+}
+
 // TestScanProcTable runs scanProcTable over a fake procfs. Kills a sum
 // that keeps only the last row of a group (REMOVE_SELF_ASSIGNMENTS) or
 // subtracts, a `/` for the page multiply, a name filter that drops pids
@@ -68,6 +113,12 @@ func TestParseProcStat(t *testing.T) {
 // would count a group twice), a table that keeps pgrp 0, and a scan that
 // hides an unreadable or unlistable /proc (RETURN_ERROR_NIL, BRANCH_IF),
 // which would leave the RSS cap silently off.
+//
+// Its groupBytes sums each process's Pss, in bytes, or its RSS where Pss
+// can't be read: kills the kB-to-bytes shift dropped or reversed, the
+// fallback dropped (a process without Pss would count 0, which can keep a
+// runaway under the cap), a sum that keeps only one process, the processes
+// kept under the wrong group, and Pss read into the listing as well.
 func TestScanProcTable(t *testing.T) {
 	orig := procRoot
 	t.Cleanup(func() { procRoot = orig })
@@ -84,8 +135,10 @@ func TestScanProcTable(t *testing.T) {
 		}
 	}
 	write("12/stat", procStatLine("go", 7, 100))
-	write("34/stat", procStatLine("pkg.test", 7, 50))
+	write("12/smaps_rollup", smapsRollup("40"))
+	write("34/stat", procStatLine("pkg.test", 7, 50)) // no smaps_rollup
 	write("56/stat", procStatLine("other", 8, 1000))
+	write("56/smaps_rollup", smapsRollup("x"))
 	// A zombie leader: 0 pages, but its group is listed.
 	write("90/stat", procStatLine("zombie", 10, 0))
 	// A kernel thread: pgrp 0, no group of ours.
@@ -102,22 +155,27 @@ func TestScanProcTable(t *testing.T) {
 	got, err := scanProcTable()
 	page := int64(os.Getpagesize())
 	want := rssTable{7: 150 * page, 8: 1000 * page, 10: 0}
-	if err != nil || !maps.Equal(got, want) {
-		t.Errorf("scanProcTable() = (%v, %v), want (%v, nil)", got, err, want)
+	if err != nil || !maps.Equal(got.table, want) {
+		t.Fatalf("scanProcTable() = (%v, %v), want (%v, nil)", got.table, err, want)
+	}
+	for pgid, want := range map[int]int64{7: 40<<10 + 50*page, 8: 1000 * page, 10: 0} {
+		if n := got.groupBytes(pgid); n != want {
+			t.Errorf("groupBytes(%d) = %d, want %d", pgid, n, want)
+		}
 	}
 
 	// A procfs that opens but can't be listed is reported too.
 	procRoot = filepath.Join(root, "cpuinfo")
-	if got, err := scanProcTable(); !errors.Is(err, syscall.ENOTDIR) || got != nil {
-		t.Errorf("scanProcTable on a file = (%v, %v), want (nil, ENOTDIR)", got, err)
+	if got, err := scanProcTable(); !errors.Is(err, syscall.ENOTDIR) || got.table != nil {
+		t.Errorf("scanProcTable on a file = (%v, %v), want (nil, ENOTDIR)", got.table, err)
 	}
 
 	// An unreadable procfs is reported as itself, not as an empty table:
 	// pgroupRSSBytes stays silent about an unlisted group that has exited,
 	// but a probe that can't read /proc must warn regardless.
 	procRoot = filepath.Join(root, "missing")
-	if got, err := scanProcTable(); !errors.Is(err, fs.ErrNotExist) || got != nil {
-		t.Errorf("scanProcTable with no procfs = (%v, %v), want (nil, ErrNotExist)", got, err)
+	if got, err := scanProcTable(); !errors.Is(err, fs.ErrNotExist) || got.table != nil {
+		t.Errorf("scanProcTable with no procfs = (%v, %v), want (nil, ErrNotExist)", got.table, err)
 	}
 }
 
@@ -156,12 +214,16 @@ func TestSharedMapHelper(t *testing.T) {
 
 // TestScanProcTableSharedPages reproduces issue #127: a group whose
 // processes share pages, as headless Chromium's zygote-forked processes
-// do, is measured at each shared page once per process that maps it.
+// do, was measured at each shared page once per process that maps it.
 // Here sharedMapProcs processes of one group map the same sharedMapMiB
 // file, so its real use is one copy of the file plus each process's own
-// pages, while summed RSS counts the file sharedMapProcs times: 8 x 64
-// MiB reads as over 512 MiB. The bound leaves each process 16 MiB of its
-// own, well above a test binary's private memory.
+// pages, while summed RSS counts the file sharedMapProcs times.
+//
+// The group's measure is checked against its summed RSS from the same
+// scan, not a fixed bound: each helper's own memory varies (a -race
+// binary has some 25 MiB of its own), but the sharedMapProcs-1 extra
+// copies of the file are what summed RSS adds, and the measure must drop
+// at least three quarters of them.
 func TestScanProcTableSharedPages(t *testing.T) {
 	const sharedMapProcs, sharedMapMiB = 8, 64
 	path := filepath.Join(t.TempDir(), "shared.bin")
@@ -204,13 +266,18 @@ func TestScanProcTableSharedPages(t *testing.T) {
 		}
 	}
 
-	table, err := scanProcTable()
+	scan, err := scanProcTable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := table[pgid] >> 20
-	if limit := int64(sharedMapMiB + 16*sharedMapProcs); got > limit {
-		t.Errorf("scanProcTable() reads %d processes sharing one %d MiB mapping at %d MiB, want at most %d MiB: "+
-			"shared pages are counted once per process (#127)", sharedMapProcs, sharedMapMiB, got, limit)
+	rss, got := scan.table[pgid]>>20, scan.groupBytes(pgid)>>20
+	const extraCopies = (sharedMapProcs - 1) * sharedMapMiB
+	if rss-got < extraCopies*3/4 {
+		t.Errorf("%d processes sharing one %d MiB mapping read %d MiB, against %d MiB of summed RSS, want at least %d MiB less: "+
+			"shared pages are counted once per process (#127)", sharedMapProcs, sharedMapMiB, got, rss, extraCopies*3/4)
+	}
+	// The group is still measured at all: one copy of the file is in it.
+	if got < sharedMapMiB {
+		t.Errorf("%d processes mapping a %d MiB file read %d MiB, want at least that", sharedMapProcs, sharedMapMiB, got)
 	}
 }
