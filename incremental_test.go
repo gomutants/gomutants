@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -349,8 +350,8 @@ func TestIncrementalCacheResumesAfterMidRunKill(t *testing.T) {
 	}
 	err := run(ctx, args)
 	cacheSaveFunc = origSave
-	if err != nil {
-		t.Fatalf("interrupted run: %v", err)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted run = %v, want the cancellation", err)
 	}
 
 	partial := loadCacheFile(t, cachePath)

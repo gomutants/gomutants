@@ -1863,6 +1863,53 @@ func TestRunBuildTestMapInterrupted(t *testing.T) {
 	}
 }
 
+// TestRunMutantsInterrupted: an interrupt during the mutant phase ends the
+// run with the cancellation, as in every other phase, once the report of
+// what was tested is written. A nil return would exit 0, with the threshold
+// gates evaluated over only the mutants that ran.
+func TestRunMutantsInterrupted(t *testing.T) {
+	dir := setupTinyProject(t)
+	orig, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(orig)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	origBuild := buildTestMapFunc
+	defer func() { buildTestMapFunc = origBuild }()
+	// The interrupt lands as the map is done, so no worker starts a mutant.
+	buildTestMapFunc = func(context.Context, string, []string, coverage.BuildOptions) (*coverage.TestMap, error) {
+		cancel()
+		return coverage.NewTestMapForTesting(nil, nil), nil
+	}
+
+	var out, errBuf bytes.Buffer
+	origStdout := stdout
+	origStderr := stderr
+	stdout = &out
+	stderr = &errBuf
+	defer func() {
+		stdout = origStdout
+		stderr = origStderr
+	}()
+
+	reportPath := filepath.Join(dir, "report.json")
+	err := run(ctx, []string{
+		"--only", "ARITHMETIC_BASE",
+		"-w", "1",
+		"-o", reportPath,
+		"testmod",
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("run = %v, want the cancellation", err)
+	}
+	r := loadReport(t, reportPath)
+	if r.MutantsTotal == 0 || r.MutantsKilled+r.MutantsLived != 0 {
+		t.Errorf("report: %d mutants, %d killed, %d lived; want the untested mutants reported and none with a verdict",
+			r.MutantsTotal, r.MutantsKilled, r.MutantsLived)
+	}
+}
+
 // TestRunBuildTestMapGetsTestTimeout pins that the per-test coverage runs
 // are bounded by the suite ceiling (baseline × coefficient). A bare test
 // binary has no timeout of its own, so dropping this would let a test that
