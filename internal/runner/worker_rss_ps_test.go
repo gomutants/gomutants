@@ -6,6 +6,7 @@ import (
 	"errors"
 	"maps"
 	"os/exec"
+	"syscall"
 	"testing"
 )
 
@@ -50,7 +51,19 @@ func TestScanPsTableExecFails(t *testing.T) {
 	t.Cleanup(func() { psCommand = orig })
 	psCommand = "gomutants-no-such-ps"
 
-	if got, err := scanPsTable(); !errors.Is(err, exec.ErrNotFound) || got != nil {
-		t.Errorf("scanPsTable with no ps = (%v, %v), want (nil, exec.ErrNotFound)", got, err)
+	if got, err := scanPsTable(); !errors.Is(err, exec.ErrNotFound) || got.table != nil {
+		t.Errorf("scanPsTable with no ps = (%v, %v), want (nil, exec.ErrNotFound)", got.table, err)
+	}
+}
+
+// TestScanPsTableRealPs runs the real ps: it lists gomutants' own group,
+// and has no groupBytes, as ps has no Pss to measure a group by.
+func TestScanPsTableRealPs(t *testing.T) {
+	got, err := scanPsTable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got.table[syscall.Getpgrp()]; !ok || got.groupBytes != nil {
+		t.Errorf("scanPsTable() lists own group %v, groupBytes set %v; want listed, unset", ok, got.groupBytes != nil)
 	}
 }

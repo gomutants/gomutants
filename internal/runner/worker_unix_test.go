@@ -132,12 +132,15 @@ func probeThroughOutage(t *testing.T, pgid int) (stderr string, got []int64) {
 
 // scanStub stands in for the process-table scan under cachedGroupRSS: it
 // counts scans and returns a scripted table or error, after an optional
-// delay.
+// delay. With measure set, the scan has a groupBytes that returns it for
+// a group and counts each call by group.
 type scanStub struct {
-	scans atomic.Int32
-	table rssTable
-	err   error
-	delay time.Duration
+	scans    atomic.Int32
+	table    rssTable
+	err      error
+	delay    time.Duration
+	measure  map[int]int64
+	measures map[int]int
 }
 
 // stubScan installs a scanStub that returns table, starting from a clean
@@ -148,15 +151,36 @@ func stubScan(t *testing.T, table rssTable) *scanStub {
 	s := &scanStub{table: table}
 	orig := rssScanFunc
 	t.Cleanup(func() { rssScanFunc = orig })
-	rssScanFunc = func() (rssTable, error) {
+	rssScanFunc = func() (rssScan, error) {
 		s.scans.Add(1)
 		time.Sleep(s.delay)
 		if s.err != nil {
-			return nil, s.err
+			return rssScan{}, s.err
 		}
-		return maps.Clone(s.table), nil
+		scan := rssScan{table: maps.Clone(s.table)}
+		if s.measure != nil {
+			scan.groupBytes = func(pgid int) int64 {
+				s.measures[pgid]++
+				return s.measure[pgid]
+			}
+		}
+		return scan, nil
 	}
 	return s
+}
+
+// measureBy gives the stub's scans a groupBytes that reads each group of
+// measure at its value.
+func (s *scanStub) measureBy(measure map[int]int64) {
+	s.measure, s.measures = measure, map[int]int{}
+}
+
+// wantMeasures asserts how many times groupBytes has measured each group.
+func (s *scanStub) wantMeasures(t *testing.T, want map[int]int) {
+	t.Helper()
+	if !maps.Equal(s.measures, want) {
+		t.Fatalf("groupBytes calls by group = %v, want %v", s.measures, want)
+	}
 }
 
 // lookup asserts that cachedGroupRSS reads want for pgid.
@@ -255,6 +279,38 @@ func TestCachedGroupRSSResetDropsSnapshot(t *testing.T) {
 	resetRSSProbe()
 	s.lookup(t, 7, 1)
 	s.wantScans(t, 2)
+}
+
+// TestCachedGroupRSSMeasuresAskedGroups: a scan with a groupBytes (Linux's
+// smaps_rollup) has each listed group read at its measure rather than its summed
+// RSS, measured once per scan however often it is asked for, and again
+// after a rescan; a group nobody asks for is never measured. Kills the
+// measure dropped or its result not returned, the memo not kept (a second
+// call per scan, each a read per process of the group) or not reset by
+// a rescan (a stale measure for every later poll), and its nil check
+// negated (a panic on ps's scans, which have none).
+func TestCachedGroupRSSMeasuresAskedGroups(t *testing.T) {
+	s := stubScan(t, rssTable{7: 900, 8: 500})
+	s.measureBy(map[int]int64{7: 300, 8: 200})
+	s.lookup(t, 7, 300)
+	s.lookup(t, 7, 300)
+	s.wantMeasures(t, map[int]int{7: 1})
+	ageSnapshot(0.75)
+	s.lookup(t, 7, 300)
+	s.wantScans(t, 2)
+	s.wantMeasures(t, map[int]int{7: 2})
+}
+
+// TestCachedGroupRSSMeasuresNoUnlistedGroup: a group missing from the scan
+// is unlisted, and isn't measured, as it has no processes to measure.
+// Kills the measure moved before the listing check.
+func TestCachedGroupRSSMeasuresNoUnlistedGroup(t *testing.T) {
+	s := stubScan(t, rssTable{7: 900})
+	s.measureBy(map[int]int64{9: 300})
+	if n, err := cachedGroupRSS(9); !errors.Is(err, errGroupNotListed) || n != 0 {
+		t.Fatalf("cachedGroupRSS(9) = (%d, %v), want (0, errGroupNotListed)", n, err)
+	}
+	s.wantMeasures(t, map[int]int{})
 }
 
 // TestCachedGroupRSSConcurrentPollers: pollers that arrive mid-scan wait
