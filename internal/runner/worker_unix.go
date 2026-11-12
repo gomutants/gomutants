@@ -45,10 +45,10 @@ type rssTable map[int]int64
 
 // rssScan is one scan of the whole process table. table lists every group
 // at its summed RSS. groupBytes, when set, measures one listed group more
-// closely than that: on Linux it sums its processes' Pss, which splits a
-// page shared by several processes among them, where RSS counts it once
-// per process (issue #127: a headless browser's processes share most of
-// their pages). It costs a read per process of the group, so it is made
+// closely than that: on Linux it reads their smaps_rollup, which counts a
+// page several of them share once, where RSS counts it once per process
+// (issue #127: a headless browser's processes share most of their pages;
+// see groupMem). It costs a read per process of the group, so it is made
 // only for groups a monitor asks about, once per scan.
 type rssScan struct {
 	table      rssTable
@@ -56,9 +56,9 @@ type rssScan struct {
 }
 
 // groupRSSFunc returns the memory, in bytes, that every process in group
-// pgid uses together: their Pss on Linux, their RSS elsewhere. Swappable
-// so tests can drive the RSS monitor without touching the host's process
-// table.
+// pgid uses together: by their smaps_rollup on Linux, their RSS elsewhere.
+// Swappable so tests can drive the RSS monitor without touching the
+// host's process table.
 var groupRSSFunc = cachedGroupRSS
 
 // rssSnapshot is the last scan of the whole process table, shared by every
@@ -131,8 +131,9 @@ func rescanRSS() error {
 var errGroupNotListed = errors.New("no process of the group is listed")
 
 // pgroupRSSBytes returns the memory all processes in the given PGID use
-// together (Pss on Linux, RSS elsewhere), read through groupRSSFunc from
-// the shared scan of the process table (/proc on Linux, ps elsewhere).
+// together (by smaps_rollup on Linux, RSS elsewhere), read through
+// groupRSSFunc from the shared scan of the process table (/proc on Linux,
+// ps elsewhere).
 //
 // A probe that fails reads as 0, which leaves the RSS cap unable to fire,
 // so an outage is reported rather than swallowed: a missing ps once

@@ -282,7 +282,7 @@ func TestCachedGroupRSSResetDropsSnapshot(t *testing.T) {
 }
 
 // TestCachedGroupRSSMeasuresAskedGroups: a scan with a groupBytes (Linux's
-// Pss) has each listed group read at its measure rather than its summed
+// smaps_rollup) has each listed group read at its measure rather than its summed
 // RSS, measured once per scan however often it is asked for, and again
 // after a rescan; a group nobody asks for is never measured. Kills the
 // measure dropped or its result not returned, the memo not kept (a second
