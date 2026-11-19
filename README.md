@@ -398,7 +398,7 @@ If you already publish to the [Stryker Dashboard](https://stryker-mutator.io/doc
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Success |
-| `1` | Runtime, build, or target error |
+| `1` | Runtime, build, or target error, or an interrupted run (the report of what ran is still written; the thresholds are not evaluated) |
 | `2` | Usage or configuration error (unknown/invalid flags, conflicting options, invalid config) |
 | `10` | Below `--threshold-efficacy` (gremlins-compat) |
 | `11` | Below `--threshold-mcover` (gremlins-compat) |
