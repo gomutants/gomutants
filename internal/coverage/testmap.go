@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/gomutants/gomutants/internal/proctree"
@@ -35,7 +36,7 @@ var (
 	parseFileFunc         = ParseFile
 	compileTestBinaryFunc = compileTestBinary
 	runCompiledTestFunc   = runCompiledTest
-	groupPassesFunc       = groupPasses
+	runGroupFunc          = runGroup
 	statFileFunc          = os.Stat
 )
 
@@ -501,7 +502,35 @@ func (tm *TestMap) dropGroups(failed []testGroup) {
 	}
 }
 
-// checkGroups runs each group once against its package's compiled binary,
+// groupResult is how one run of a group of tests together ended.
+type groupResult int
+
+const (
+	groupPassed groupResult = iota
+	groupFailed
+	// groupOutOfPorts is a failed run whose output names a host out of
+	// ports (see outOfPortsErrnos). It says nothing about whether the
+	// tests break each other, so the group is run again (see checkGroups).
+	groupOutOfPorts
+)
+
+// outOfPortsErrnos are what a test gets when every ephemeral port is held
+// in TIME_WAIT by the group runs before it: a listen or a dial fails with
+// EADDRNOTAVAIL, or on macOS sometimes EAGAIN. Their messages are matched
+// as the host's Go runtime spells them, which the test binary, built for
+// the same host, prints. The match only earns a group another run, never
+// a pass, so a test that prints one of them itself costs a retry, not a
+// false kill.
+var outOfPortsErrnos = []syscall.Errno{syscall.EADDRNOTAVAIL, syscall.EAGAIN}
+
+// groupRetryWaits are the pauses before each re-run of the groups that
+// ran out of ports, each run at half the concurrency of the one before.
+// Together they outlast TIME_WAIT (60s on Linux, 30s by default on
+// macOS), so the last re-run gets the ports the first pass held. A var so
+// tests can shorten them.
+var groupRetryWaits = []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second}
+
+// checkGroups runs each group against its package's compiled binary,
 // across `workers` goroutines, and returns those that failed or timed out,
 // sorted. Each of their tests passed alone, so typically one leaves state
 // behind that breaks another, and a test the full suite runs in between
@@ -509,39 +538,112 @@ func (tm *TestMap) dropGroups(failed []testGroup) {
 // the mutant, a false kill. Every group's package has a binary: the map
 // indexes only tests that ran against one. Once ctx is cancelled the
 // remaining runs fail to start, and the caller reports the cancellation.
+//
+// A group that fails for lack of ports is run again after each of
+// groupRetryWaits, at half the workers each time, and fails only if it
+// is still out of ports after the last.
 func checkGroups(ctx context.Context, groups []testGroup, pkgBins map[string]*compiledPkg, timeout time.Duration, workers int) []testGroup {
+	var failed []testGroup
+	for round := 0; ; round++ {
+		roundFailed, outOfPorts := runGroups(ctx, groups, pkgBins, timeout, workers)
+		failed = append(failed, roundFailed...)
+		if len(outOfPorts) == 0 || round == len(groupRetryWaits) || !sleepCtx(ctx, groupRetryWaits[round]) {
+			failed = append(failed, outOfPorts...)
+			break
+		}
+		groups, workers = outOfPorts, max(1, workers/2)
+	}
+	slices.SortFunc(failed, compareGroups)
+	return failed
+}
+
+// runGroups runs each group once across `workers` goroutines, and returns
+// those that failed and those that ran out of ports.
+func runGroups(ctx context.Context, groups []testGroup, pkgBins map[string]*compiledPkg, timeout time.Duration, workers int) (failed, outOfPorts []testGroup) {
 	var (
-		failed []testGroup
-		mu     sync.Mutex
-		wg     sync.WaitGroup
-		sem    = make(chan struct{}, workers)
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, workers)
 	)
 	for _, g := range groups {
 		sem <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-sem }()
-			if groupPassesFunc(ctx, pkgBins[g.pkg], g.tests, timeout) {
-				return
-			}
+			result := runGroupFunc(ctx, pkgBins[g.pkg], g.tests, timeout)
 			mu.Lock()
 			defer mu.Unlock()
-			failed = append(failed, g)
+			switch result {
+			case groupFailed:
+				failed = append(failed, g)
+			case groupOutOfPorts:
+				outOfPorts = append(outOfPorts, g)
+			}
 		})
 	}
 	wg.Wait()
-	slices.SortFunc(failed, compareGroups)
-	return failed
+	return failed, outOfPorts
 }
 
-// groupPasses runs tests together, once, against cp's binary from its
-// package directory, and reports whether they all passed within timeout.
-func groupPasses(ctx context.Context, cp *compiledPkg, tests []string, timeout time.Duration) bool {
+// sleepCtx waits d, and reports false if ctx ended first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// runGroup runs tests together, once, against cp's binary from its
+// package directory, and reports whether they all passed within timeout,
+// and if not, whether the host ran out of ports.
+func runGroup(ctx context.Context, cp *compiledPkg, tests []string, timeout time.Duration) groupResult {
 	ctx, cancel := withTestTimeout(ctx, timeout)
 	defer cancel()
 	// Ours go first: a positional argument among testArgs (after -args)
 	// ends the binary's flag parsing.
 	args := append([]string{"-test.run=" + RunPattern(tests)}, cp.testArgs...)
-	return testBinaryCmd(ctx, cp, args).Run() == nil
+	cmd := testBinaryCmd(ctx, cp, args)
+	out := &outOfPortsWriter{}
+	cmd.Stdout, cmd.Stderr = out, out
+	// ErrWaitDelay means the binary passed but a process it left behind
+	// still held the output open.
+	err := cmd.Run()
+	switch {
+	case err == nil || errors.Is(err, exec.ErrWaitDelay):
+		return groupPassed
+	case out.seen:
+		return groupOutOfPorts
+	}
+	return groupFailed
+}
+
+// outOfPortsWriter discards what is written to it, noting whether it saw
+// the message of one of outOfPortsErrnos. It keeps the end of each write,
+// so a message split across two writes is seen too.
+type outOfPortsWriter struct {
+	tail []byte
+	seen bool
+}
+
+func (w *outOfPortsWriter) Write(p []byte) (int, error) {
+	if w.seen {
+		return len(p), nil
+	}
+	buf := append(w.tail, p...)
+	longest := 0
+	for _, errno := range outOfPortsErrnos {
+		msg := errno.Error()
+		if bytes.Contains(buf, []byte(msg)) {
+			w.seen = true
+			return len(p), nil
+		}
+		longest = max(longest, len(msg))
+	}
+	w.tail = append(w.tail[:0], buf[len(buf)-min(len(buf), longest-1):]...)
+	return len(p), nil
 }
 
 // processWork processes test entries from the work channel.

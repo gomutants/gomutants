@@ -1176,12 +1176,8 @@ func TestB(t *testing.T) {
 // break each other, stays routed, without a warning. Dropping it makes
 // every mutant on its lines run the whole suite.
 func TestBuildTestMapKeepsGroupFailingForPorts(t *testing.T) {
-	if ln, err := net.Listen("tcp", "192.0.2.1:0"); !errors.Is(err, syscall.EADDRNOTAVAIL) {
-		if err == nil {
-			ln.Close()
-		}
-		t.Skipf("listening on 192.0.2.1: %v, want EADDRNOTAVAIL to stand in for a host out of ports", err)
-	}
+	skipUnlessOutOfPortsFakeable(t)
+	setGroupRetryWaits(t, time.Millisecond)
 	dir := writeModule(t, portsModule)
 
 	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 2})
@@ -1198,38 +1194,65 @@ func TestBuildTestMapKeepsGroupFailingForPorts(t *testing.T) {
 	}
 }
 
-// TestGroupPasses runs groupModule's tests together in source order, with
+// skipUnlessOutOfPortsFakeable skips the test unless listening on
+// 192.0.2.1 fails with EADDRNOTAVAIL, which portsModule fakes a host out
+// of ports with.
+func skipUnlessOutOfPortsFakeable(t *testing.T) {
+	t.Helper()
+	if ln, err := net.Listen("tcp", "192.0.2.1:0"); !errors.Is(err, syscall.EADDRNOTAVAIL) {
+		if err == nil {
+			ln.Close()
+		}
+		t.Skipf("listening on 192.0.2.1: %v, want EADDRNOTAVAIL to stand in for a host out of ports", err)
+	}
+}
+
+// TestRunGroup runs groupModule's tests together in source order, with
 // the binary's own arguments.
-func TestGroupPasses(t *testing.T) {
+func TestRunGroup(t *testing.T) {
 	cp := compileFixture(t, writeModule(t, groupModule), "groupmod")
 	for _, tc := range []struct {
 		tests []string
 		args  []string
-		want  bool
+		want  groupResult
 	}{
-		{[]string{"TestBreak", "TestUse"}, nil, false},
-		{[]string{"TestBreak", "TestReset", "TestUse"}, nil, true},
-		{[]string{"TestBreak", "TestMin"}, nil, true},
-		{[]string{"TestMin", "TestNeedsShort"}, nil, false},
-		{[]string{"TestMin", "TestNeedsShort"}, []string{"-test.short"}, true},
+		{[]string{"TestBreak", "TestUse"}, nil, groupFailed},
+		{[]string{"TestBreak", "TestReset", "TestUse"}, nil, groupPassed},
+		{[]string{"TestBreak", "TestMin"}, nil, groupPassed},
+		{[]string{"TestMin", "TestNeedsShort"}, nil, groupFailed},
+		{[]string{"TestMin", "TestNeedsShort"}, []string{"-test.short"}, groupPassed},
 	} {
 		cp.testArgs = tc.args
-		if got := groupPasses(context.Background(), cp, tc.tests, 0); got != tc.want {
-			t.Errorf("groupPasses(%v, args %v) = %v, want %v", tc.tests, tc.args, got, tc.want)
+		if got := runGroup(context.Background(), cp, tc.tests, 0); got != tc.want {
+			t.Errorf("runGroup(%v, args %v) = %v, want %v", tc.tests, tc.args, got, tc.want)
 		}
 	}
 }
 
-// TestGroupPassesTimesOut: a group that hangs together fails once its
+// TestRunGroupOutOfPorts: a group that fails for lack of ports says so,
+// and passes once the ports are back.
+func TestRunGroupOutOfPorts(t *testing.T) {
+	skipUnlessOutOfPortsFakeable(t)
+	cp := compileFixture(t, writeModule(t, portsModule), "portsmod")
+	tests := []string{"TestA", "TestB"}
+	if got := runGroup(context.Background(), cp, tests, 0); got != groupOutOfPorts {
+		t.Errorf("first runGroup = %v, want groupOutOfPorts", got)
+	}
+	if got := runGroup(context.Background(), cp, tests, 0); got != groupPassed {
+		t.Errorf("second runGroup = %v, want groupPassed", got)
+	}
+}
+
+// TestRunGroupTimesOut: a group that hangs together fails once its
 // timeout runs out.
-func TestGroupPassesTimesOut(t *testing.T) {
+func TestRunGroupTimesOut(t *testing.T) {
 	cp := compileFixture(t, writeModule(t, groupModule), "groupmod")
 	start := time.Now()
-	if groupPasses(context.Background(), cp, []string{"TestBreak", "TestStall"}, 300*time.Millisecond) {
-		t.Error("groupPasses of a hanging group = true, want false")
+	if got := runGroup(context.Background(), cp, []string{"TestBreak", "TestStall"}, 300*time.Millisecond); got != groupFailed {
+		t.Errorf("runGroup of a hanging group = %v, want groupFailed", got)
 	}
 	if took := time.Since(start); took > 10*time.Second {
-		t.Errorf("groupPasses took %s, want it cut off near its 300ms timeout", took)
+		t.Errorf("runGroup took %s, want it cut off near its 300ms timeout", took)
 	}
 }
 

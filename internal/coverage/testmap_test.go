@@ -1032,9 +1032,9 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 	origList := listTestsFunc
 	origRun := runCompiledTestFunc
 	origDeps := testDepsFunc
-	origGroup := groupPassesFunc
+	origGroup := runGroupFunc
 	t.Cleanup(func() {
-		groupPassesFunc = origGroup
+		runGroupFunc = origGroup
 		compileTestBinaryFunc = origCompile
 		resolvePackagesFunc = origResolve
 		listTestsFunc = origList
@@ -1044,8 +1044,8 @@ func stubBuildTestMapDeps(t *testing.T, tests []testEntry, resolved []resolvedPk
 	testDepsFunc = func(context.Context, string, BuildOptions, []string) (map[string]map[string]bool, error) {
 		return nil, errors.New("deps not stubbed")
 	}
-	groupPassesFunc = func(context.Context, *compiledPkg, []string, time.Duration) bool {
-		return true
+	runGroupFunc = func(context.Context, *compiledPkg, []string, time.Duration) groupResult {
+		return groupPassed
 	}
 
 	resolvePackagesFunc = func(_ context.Context, _ string, _ []string, _ string) ([]resolvedPkg, error) {

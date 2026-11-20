@@ -5,7 +5,9 @@ import (
 	"errors"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -110,14 +112,14 @@ func TestDropGroups(t *testing.T) {
 // with the timeout, at most `workers` at a time, and the failed groups
 // come back sorted whatever order the runs finish in.
 func TestCheckGroups(t *testing.T) {
-	orig := groupPassesFunc
-	t.Cleanup(func() { groupPassesFunc = orig })
+	orig := runGroupFunc
+	t.Cleanup(func() { runGroupFunc = orig })
 	var (
 		mu             sync.Mutex
 		ran            []string
 		inFlight, peak int
 	)
-	groupPassesFunc = func(_ context.Context, cp *compiledPkg, tests []string, timeout time.Duration) bool {
+	runGroupFunc = func(_ context.Context, cp *compiledPkg, tests []string, timeout time.Duration) groupResult {
 		mu.Lock()
 		inFlight++
 		peak = max(peak, inFlight)
@@ -130,7 +132,10 @@ func TestCheckGroups(t *testing.T) {
 		defer mu.Unlock()
 		inFlight--
 		ran = append(ran, testGroup{pkg: cp.importPath, tests: tests}.String())
-		return !slices.Contains(tests, "TestBad")
+		if slices.Contains(tests, "TestBad") {
+			return groupFailed
+		}
+		return groupPassed
 	}
 	bins := map[string]*compiledPkg{"p": {importPath: "p"}, "q": {importPath: "q"}}
 	groups := []testGroup{
@@ -153,6 +158,118 @@ func TestCheckGroups(t *testing.T) {
 	}
 }
 
+// setGroupRetryWaits sets groupRetryWaits for the test, restored on cleanup.
+func setGroupRetryWaits(t *testing.T, waits ...time.Duration) {
+	t.Helper()
+	orig := groupRetryWaits
+	t.Cleanup(func() { groupRetryWaits = orig })
+	groupRetryWaits = waits
+}
+
+// TestCheckGroupsRetriesOutOfPorts: a group out of ports runs again, at
+// half the workers each time, until it passes or the waits run out; a
+// group that fails is final at once.
+func TestCheckGroupsRetriesOutOfPorts(t *testing.T) {
+	orig := runGroupFunc
+	t.Cleanup(func() { runGroupFunc = orig })
+	setGroupRetryWaits(t, 0, 0, 0)
+	var (
+		mu       sync.Mutex
+		runs     = map[string]int{}
+		inFlight = map[int]int{} // by the run's attempt
+		peak     = map[int]int{}
+	)
+	recovers := testGroup{pkg: "p", tests: []string{"TestA", "TestB"}}
+	never := testGroup{pkg: "p", tests: []string{"TestC", "TestD"}}
+	breaks := testGroup{pkg: "p", tests: []string{"TestE", "TestF"}}
+	runGroupFunc = func(_ context.Context, cp *compiledPkg, tests []string, _ time.Duration) groupResult {
+		g := testGroup{pkg: cp.importPath, tests: tests}.String()
+		mu.Lock()
+		runs[g]++
+		attempt := runs[g]
+		inFlight[attempt]++
+		peak[attempt] = max(peak[attempt], inFlight[attempt])
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		inFlight[attempt]--
+		mu.Unlock()
+		switch {
+		case g == breaks.String():
+			return groupFailed
+		case g == recovers.String() && attempt == 3:
+			return groupPassed
+		}
+		return groupOutOfPorts
+	}
+	bins := map[string]*compiledPkg{"p": {importPath: "p"}}
+	failed := checkGroups(context.Background(), []testGroup{recovers, never, breaks}, bins, 0, 4)
+
+	if want := []testGroup{never, breaks}; !equalGroups(failed, want) {
+		t.Errorf("failed = %v, want %v", failed, want)
+	}
+	want := map[string]int{recovers.String(): 3, never.String(): 4, breaks.String(): 1}
+	if !maps.Equal(runs, want) {
+		t.Errorf("runs = %v, want %v", runs, want)
+	}
+	if want := map[int]int{1: 3, 2: 2, 3: 1, 4: 1}; !maps.Equal(peak, want) {
+		t.Errorf("groups at once by attempt = %v, want %v: all 3 on 4 workers, then 2, then 1", peak, want)
+	}
+}
+
+// TestCheckGroupsCancelledWhileWaiting: a cancel during the wait before a
+// re-run ends the check at once.
+func TestCheckGroupsCancelledWhileWaiting(t *testing.T) {
+	orig := runGroupFunc
+	t.Cleanup(func() { runGroupFunc = orig })
+	setGroupRetryWaits(t, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	runs := 0
+	runGroupFunc = func(context.Context, *compiledPkg, []string, time.Duration) groupResult {
+		runs++
+		time.AfterFunc(10*time.Millisecond, cancel)
+		return groupOutOfPorts
+	}
+	g := testGroup{pkg: "p", tests: []string{"TestA", "TestB"}}
+	runWithDeadline(t, 10*time.Second, func() {
+		checkGroups(ctx, []testGroup{g}, map[string]*compiledPkg{"p": {importPath: "p"}}, 0, 1)
+	})
+	if runs != 1 {
+		t.Errorf("group ran %d times, want once: no re-run after the cancel", runs)
+	}
+}
+
+// TestOutOfPortsWriter sees an out-of-ports message whole, split across
+// writes, or after other output, and nothing in output without one.
+func TestOutOfPortsWriter(t *testing.T) {
+	addr := syscall.EADDRNOTAVAIL.Error()
+	again := syscall.EAGAIN.Error()
+	for _, tc := range []struct {
+		name   string
+		writes []string
+		want   bool
+	}{
+		{"none", []string{"--- FAIL: TestA\n", "connection refused\n"}, false},
+		{"whole", []string{"bind: " + addr + "\n"}, true},
+		{"split", []string{"ok\nbind: " + addr[:5], addr[5:] + "\n"}, true},
+		{"split in three", []string{addr[:3], addr[3:6], addr[6:]}, true},
+		{"after other writes", []string{strings.Repeat("x", 100), "connect: " + again}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := &outOfPortsWriter{}
+			for _, s := range tc.writes {
+				if n, err := w.Write([]byte(s)); n != len(s) || err != nil {
+					t.Fatalf("Write(%q) = (%d, %v), want (%d, nil)", s, n, err, len(s))
+				}
+			}
+			if w.seen != tc.want {
+				t.Errorf("seen = %v, want %v", w.seen, tc.want)
+			}
+		})
+	}
+}
+
 // stubGroupBuild stubs BuildTestMap so that TestA and TestB both cover
 // p/f.go:3 and pass alone, and every group run together passes or fails
 // as `passes` says. It returns the groups run, as strings.
@@ -166,11 +283,14 @@ func stubGroupBuild(t *testing.T, passes bool) *[]string {
 	}
 	var mu sync.Mutex
 	ran := &[]string{}
-	groupPassesFunc = func(_ context.Context, cp *compiledPkg, tests []string, _ time.Duration) bool {
+	runGroupFunc = func(_ context.Context, cp *compiledPkg, tests []string, _ time.Duration) groupResult {
 		mu.Lock()
 		defer mu.Unlock()
 		*ran = append(*ran, testGroup{pkg: cp.importPath, tests: tests}.String())
-		return passes
+		if passes {
+			return groupPassed
+		}
+		return groupFailed
 	}
 	return ran
 }
@@ -240,9 +360,9 @@ func TestBuildTestMapCancelledDuringGroupCheck(t *testing.T) {
 	stubGroupBuild(t, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	groupPassesFunc = func(context.Context, *compiledPkg, []string, time.Duration) bool {
+	runGroupFunc = func(context.Context, *compiledPkg, []string, time.Duration) groupResult {
 		cancel()
-		return false
+		return groupFailed
 	}
 	tm, err := BuildTestMap(ctx, t.TempDir(), []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 1})
 	if !errors.Is(err, context.Canceled) || tm != nil {
