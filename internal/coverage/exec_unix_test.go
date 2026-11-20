@@ -152,7 +152,8 @@ func TestG(t *testing.T) { F() }
 // TestRunsSurviveLeftoverOutput: a binary that succeeds but leaves a
 // process holding its output open still lists fine once proctree.DrainDelay
 // gives up on that output — the binary's own is complete — and runs fine,
-// as a per-test run reads no output.
+// as a per-test run reads no output, and a group run reads what the binary
+// wrote before it exited.
 func TestRunsSurviveLeftoverOutput(t *testing.T) {
 	orig := proctree.DrainDelay
 	t.Cleanup(func() { proctree.DrainDelay = orig })
@@ -175,5 +176,8 @@ func TestRunsSurviveLeftoverOutput(t *testing.T) {
 	}
 	if blocks, _, err := runCompiledTest(context.Background(), cp, "TestF", filepath.Join(t.TempDir(), "f.cov"), 0); err != nil || len(blocks) == 0 {
 		t.Errorf("runCompiledTest = (%d blocks, %v), want TestF's coverage", len(blocks), err)
+	}
+	if got := runGroup(context.Background(), cp, []string{"TestF", "TestG"}, 0); got != groupPassed {
+		t.Errorf("runGroup = %v, want groupPassed", got)
 	}
 }

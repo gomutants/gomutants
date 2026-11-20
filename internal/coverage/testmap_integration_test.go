@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io/fs"
 	"maps"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -1128,38 +1130,129 @@ func TestBuildTestMapDropsTestsFailingTogether(t *testing.T) {
 	}
 }
 
-// TestGroupPasses runs groupModule's tests together in source order, with
+// portsModule's TestA and TestB both cover F's condition (lib.go:4) and
+// pass alone. Run together, TestB fails once the way httptest does when
+// the host's ephemeral ports are all in TIME_WAIT: listening returns
+// EADDRNOTAVAIL (192.0.2.1, an address no host holds, gets the same
+// error). It leaves a marker as it fails, standing in for the ports
+// draining, so any later run of the group passes.
+var portsModule = map[string]string{
+	"go.mod": "module portsmod\n\ngo 1.26\n",
+	"lib.go": "package portsmod\n\nfunc F(n int) int {\n\tif n > 0 {\n\t\treturn n\n\t}\n\treturn 0\n}\n",
+	"lib_test.go": `package portsmod
+
+import (
+	"net"
+	"os"
+	"testing"
+)
+
+var aRan bool
+
+func TestA(t *testing.T) {
+	aRan = true
+	F(1)
+}
+
+func TestB(t *testing.T) {
+	F(2)
+	if !aRan {
+		return
+	}
+	if _, err := os.Stat("drained"); err == nil {
+		return
+	}
+	if err := os.WriteFile("drained", nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := net.Listen("tcp", "192.0.2.1:0")
+	panic("httptest: failed to listen on a port: " + err.Error())
+}
+`,
+}
+
+// TestBuildTestMapKeepsGroupFailingForPorts (#125): a group that fails
+// together only because the host ran out of ports, not because its tests
+// break each other, stays routed, without a warning. Dropping it makes
+// every mutant on its lines run the whole suite.
+func TestBuildTestMapKeepsGroupFailingForPorts(t *testing.T) {
+	skipUnlessOutOfPortsFakeable(t)
+	setGroupRetryWaits(t, time.Millisecond)
+	dir := writeModule(t, portsModule)
+
+	tm, err := BuildTestMap(context.Background(), dir, []string{"./..."}, BuildOptions{TmpDir: t.TempDir(), Workers: 2})
+	if err != nil {
+		t.Fatalf("BuildTestMap: %v", err)
+	}
+	tests := tm.TestsFor("portsmod/lib.go", 4)
+	slices.Sort(tests)
+	if !slices.Equal(tests, []string{"TestA", "TestB"}) {
+		t.Errorf("TestsFor(lib.go:4) = %v, want [TestA TestB]", tests)
+	}
+	if w := tm.Warnings(); len(w) != 0 {
+		t.Errorf("Warnings() = %q, want none", w)
+	}
+}
+
+// skipUnlessOutOfPortsFakeable skips the test unless listening on
+// 192.0.2.1 fails with EADDRNOTAVAIL, which portsModule fakes a host out
+// of ports with.
+func skipUnlessOutOfPortsFakeable(t *testing.T) {
+	t.Helper()
+	if ln, err := net.Listen("tcp", "192.0.2.1:0"); !errors.Is(err, syscall.EADDRNOTAVAIL) {
+		if err == nil {
+			ln.Close()
+		}
+		t.Skipf("listening on 192.0.2.1: %v, want EADDRNOTAVAIL to stand in for a host out of ports", err)
+	}
+}
+
+// TestRunGroup runs groupModule's tests together in source order, with
 // the binary's own arguments.
-func TestGroupPasses(t *testing.T) {
+func TestRunGroup(t *testing.T) {
 	cp := compileFixture(t, writeModule(t, groupModule), "groupmod")
 	for _, tc := range []struct {
 		tests []string
 		args  []string
-		want  bool
+		want  groupResult
 	}{
-		{[]string{"TestBreak", "TestUse"}, nil, false},
-		{[]string{"TestBreak", "TestReset", "TestUse"}, nil, true},
-		{[]string{"TestBreak", "TestMin"}, nil, true},
-		{[]string{"TestMin", "TestNeedsShort"}, nil, false},
-		{[]string{"TestMin", "TestNeedsShort"}, []string{"-test.short"}, true},
+		{[]string{"TestBreak", "TestUse"}, nil, groupFailed},
+		{[]string{"TestBreak", "TestReset", "TestUse"}, nil, groupPassed},
+		{[]string{"TestBreak", "TestMin"}, nil, groupPassed},
+		{[]string{"TestMin", "TestNeedsShort"}, nil, groupFailed},
+		{[]string{"TestMin", "TestNeedsShort"}, []string{"-test.short"}, groupPassed},
 	} {
 		cp.testArgs = tc.args
-		if got := groupPasses(context.Background(), cp, tc.tests, 0); got != tc.want {
-			t.Errorf("groupPasses(%v, args %v) = %v, want %v", tc.tests, tc.args, got, tc.want)
+		if got := runGroup(context.Background(), cp, tc.tests, 0); got != tc.want {
+			t.Errorf("runGroup(%v, args %v) = %v, want %v", tc.tests, tc.args, got, tc.want)
 		}
 	}
 }
 
-// TestGroupPassesTimesOut: a group that hangs together fails once its
+// TestRunGroupOutOfPorts: a group that fails for lack of ports says so,
+// and passes once the ports are back.
+func TestRunGroupOutOfPorts(t *testing.T) {
+	skipUnlessOutOfPortsFakeable(t)
+	cp := compileFixture(t, writeModule(t, portsModule), "portsmod")
+	tests := []string{"TestA", "TestB"}
+	if got := runGroup(context.Background(), cp, tests, 0); got != groupOutOfPorts {
+		t.Errorf("first runGroup = %v, want groupOutOfPorts", got)
+	}
+	if got := runGroup(context.Background(), cp, tests, 0); got != groupPassed {
+		t.Errorf("second runGroup = %v, want groupPassed", got)
+	}
+}
+
+// TestRunGroupTimesOut: a group that hangs together fails once its
 // timeout runs out.
-func TestGroupPassesTimesOut(t *testing.T) {
+func TestRunGroupTimesOut(t *testing.T) {
 	cp := compileFixture(t, writeModule(t, groupModule), "groupmod")
 	start := time.Now()
-	if groupPasses(context.Background(), cp, []string{"TestBreak", "TestStall"}, 300*time.Millisecond) {
-		t.Error("groupPasses of a hanging group = true, want false")
+	if got := runGroup(context.Background(), cp, []string{"TestBreak", "TestStall"}, 300*time.Millisecond); got != groupFailed {
+		t.Errorf("runGroup of a hanging group = %v, want groupFailed", got)
 	}
 	if took := time.Since(start); took > 10*time.Second {
-		t.Errorf("groupPasses took %s, want it cut off near its 300ms timeout", took)
+		t.Errorf("runGroup took %s, want it cut off near its 300ms timeout", took)
 	}
 }
 
