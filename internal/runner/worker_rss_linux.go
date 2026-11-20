@@ -67,20 +67,34 @@ type procMem struct {
 // groupMem returns the memory procs use together, from each one's
 // /proc/<pid>/smaps_rollup, counting a page they share once, where their
 // summed RSS counts it once per process (issue #127: a headless browser's
-// processes share most of their pages). It splits no page with another
-// group, so what other workers' mutants run at the same time doesn't
-// change it:
+// processes share most of their pages). It splits no file-backed page with
+// another group, so what other workers' mutants run at the same time
+// doesn't change how it counts their binaries and libraries:
 //   - Anonymous memory (heaps, stacks) counts at its Pss, which splits a
 //     page several processes map among them. Only fork shares an anonymous
-//     page, so its sharers are all in the group, and their shares add up
-//     to the page once.
-//   - File-backed and shmem pages (binaries, libraries, mapped files)
+//     page, between a process and a child it forked, until one of them
+//     writes it, so its sharers are mostly in the group and their shares
+//     add up to the page once. A child that leaves the group (setsid,
+//     setpgid) without exec still holds its share, which the group then
+//     doesn't count.
+//   - File-backed and shmem pages (binaries, libraries, mapped files) that
+//     no other process maps count in full, process by process: its
+//     Private_Clean and Private_Dirty less its Anonymous. That is exact
+//     while none of its anonymous pages is shared, and reads low by the
+//     shared ones otherwise (a browser's forked renderer), never high.
+//   - The rest, the file-backed and shmem pages other processes map too,
 //     count as the largest process maps them. Their Pss would be split
 //     with every process on the host that maps the same file, another
 //     group's too, so a group would read less while another worker's
 //     mutant maps its binaries and more once that exits. The largest
 //     process maps most of what its group shares (a headless browser's
-//     binary and libraries), and misses what other processes alone map.
+//     binary and libraries). What a few other processes share among
+//     themselves alone is missed: two processes sharing one file and two
+//     others another count as the pair that maps more. So is a file a
+//     process maps alone in its group once another group maps it too.
+//
+// The measure is never below the largest process's file-backed pages plus
+// every process's Pss_Anon, nor above the group's summed RSS.
 //
 // A process whose smaps_rollup can't be read counts at its RSS: the file
 // is missing before Linux 4.14 and in some sandboxes, has no Pss_Anon
@@ -98,22 +112,25 @@ func groupMem(procs []procMem) int64 {
 			own += p.rss
 			continue
 		}
-		own += m.pssAnon
-		mapped = max(mapped, m.rss-m.anon)
+		// The file-backed and shmem pages no other process maps.
+		alone := max(m.privateClean+m.privateDirty-m.anon, 0)
+		own += m.pssAnon + alone
+		mapped = max(mapped, m.rss-m.anon-alone)
 	}
 	return own + mapped
 }
 
 // rollupMem is what groupMem reads of a smaps_rollup, in bytes: Rss, the
-// Anonymous part of it, and that part's Pss.
+// Anonymous part of it, that part's Pss, and the Private_Clean and
+// Private_Dirty parts of Rss, the pages no other process maps.
 type rollupMem struct {
-	rss, anon, pssAnon int64
+	rss, anon, pssAnon, privateClean, privateDirty int64
 }
 
-// parseRollup returns the Rss, Anonymous and Pss_Anon lines of a
-// /proc/<pid>/smaps_rollup, in bytes, and whether it has each of them, with
-// a value that parses. A line counts by its whole name: Pss is not
-// Pss_Anon, nor AnonHugePages Anonymous.
+// parseRollup returns the Rss, Anonymous, Pss_Anon, Private_Clean and
+// Private_Dirty lines of a /proc/<pid>/smaps_rollup, in bytes, and whether
+// it has each of them, with a value that parses. A line counts by its whole
+// name: Pss is not Pss_Anon, nor AnonHugePages Anonymous.
 func parseRollup(rollup []byte) (m rollupMem, ok bool) {
 	var seen int // a bit per field
 	for line := range bytes.Lines(rollup) {
@@ -127,6 +144,10 @@ func parseRollup(rollup []byte) (m rollupMem, ok bool) {
 			dst, bit = &m.anon, 2
 		case "Pss_Anon":
 			dst, bit = &m.pssAnon, 4
+		case "Private_Clean":
+			dst, bit = &m.privateClean, 8
+		case "Private_Dirty":
+			dst, bit = &m.privateDirty, 16
 		default:
 			continue
 		}
@@ -141,7 +162,7 @@ func parseRollup(rollup []byte) (m rollupMem, ok bool) {
 		*dst = int64(kb) << 10
 		seen |= bit
 	}
-	if seen != 7 {
+	if seen != 31 {
 		return rollupMem{}, false
 	}
 	return m, true
