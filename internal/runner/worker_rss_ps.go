@@ -28,12 +28,15 @@ var rssScanFunc = scanPsTable
 // mutant was left to the kernel OOM-killer (issue #107). Linux now reads
 // /proc instead (worker_rss_linux.go); listing every group here keeps the
 // other Unixes off `-g` too, and one listing serves every worker.
-func scanPsTable() (rssTable, error) {
+//
+// ps has no Pss, so a group is read at its summed RSS, with no groupBytes:
+// a page its processes share counts once per process (see rssScan).
+func scanPsTable() (rssScan, error) {
 	out, err := exec.Command(psCommand, "-A", "-o", "pgid=,rss=").Output()
 	if err != nil {
-		return nil, err
+		return rssScan{}, err
 	}
-	return parsePsTable(out), nil
+	return rssScan{table: parsePsTable(out)}, nil
 }
 
 // parsePsTable sums, in bytes, the RSS of each group in `ps -A -o
