@@ -613,6 +613,7 @@ func runGroup(ctx context.Context, cp *compiledPkg, tests []string, timeout time
 	err := cmd.Run()
 	switch {
 	case err == nil || errors.Is(err, exec.ErrWaitDelay):
+		// gomutants:disable-next-line RETURN_ZERO reason="groupPassed is groupResult's zero value, so returning the zero value is observably identical"
 		return groupPassed
 	case out.seen:
 		return groupOutOfPorts
@@ -621,28 +622,23 @@ func runGroup(ctx context.Context, cp *compiledPkg, tests []string, timeout time
 }
 
 // outOfPortsWriter discards what is written to it, noting whether it saw
-// the message of one of outOfPortsErrnos. It keeps the end of each write,
-// so a message split across two writes is seen too.
+// the message of one of outOfPortsErrnos. It keeps as many bytes from the
+// end of each write as the longest message, so a message split across
+// writes is whole in the next scan.
 type outOfPortsWriter struct {
 	tail []byte
 	seen bool
 }
 
 func (w *outOfPortsWriter) Write(p []byte) (int, error) {
-	if w.seen {
-		return len(p), nil
-	}
 	buf := append(w.tail, p...)
-	longest := 0
+	var longest int
 	for _, errno := range outOfPortsErrnos {
 		msg := errno.Error()
-		if bytes.Contains(buf, []byte(msg)) {
-			w.seen = true
-			return len(p), nil
-		}
+		w.seen = w.seen || bytes.Contains(buf, []byte(msg))
 		longest = max(longest, len(msg))
 	}
-	w.tail = append(w.tail[:0], buf[len(buf)-min(len(buf), longest-1):]...)
+	w.tail = append(w.tail[:0], buf[len(buf)-min(len(buf), longest):]...)
 	return len(p), nil
 }
 

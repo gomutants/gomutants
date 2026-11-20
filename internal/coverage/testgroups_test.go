@@ -255,6 +255,7 @@ func TestOutOfPortsWriter(t *testing.T) {
 		{"split", []string{"ok\nbind: " + addr[:5], addr[5:] + "\n"}, true},
 		{"split in three", []string{addr[:3], addr[3:6], addr[6:]}, true},
 		{"after other writes", []string{strings.Repeat("x", 100), "connect: " + again}, true},
+		{"then more output", []string{"bind: " + addr, "\nFAIL\n"}, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &outOfPortsWriter{}
@@ -267,6 +268,31 @@ func TestOutOfPortsWriter(t *testing.T) {
 				t.Errorf("seen = %v, want %v", w.seen, tc.want)
 			}
 		})
+	}
+}
+
+// TestOutOfPortsWriterSplitAnywhere sees each message split across two
+// writes at every point, after more output than a message is long.
+func TestOutOfPortsWriterSplitAnywhere(t *testing.T) {
+	for _, errno := range outOfPortsErrnos {
+		msg := strings.Repeat("x", 100) + errno.Error()
+		for i := 1; i < len(msg); i++ {
+			w := &outOfPortsWriter{}
+			w.Write([]byte(msg[:i]))
+			w.Write([]byte(msg[i:]))
+			if !w.seen {
+				t.Errorf("%q split before byte %d: not seen", errno.Error(), i)
+			}
+		}
+	}
+}
+
+// TestGroupRetryWaits pins the documented waits before each re-run of the
+// groups out of ports.
+func TestGroupRetryWaits(t *testing.T) {
+	want := []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 40 * time.Second}
+	if !slices.Equal(groupRetryWaits, want) {
+		t.Errorf("groupRetryWaits = %v, want %v", groupRetryWaits, want)
 	}
 }
 
